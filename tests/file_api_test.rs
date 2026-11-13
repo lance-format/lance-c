@@ -16,7 +16,8 @@ use arrow::record_batch::RecordBatchReader;
 use arrow_array::builder::{Int32Builder, ListBuilder};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, Int8Array, Int32Array,
-    RecordBatch, RecordBatchOptions, StringArray, StructArray, UInt32Array,
+    RecordBatch, RecordBatchOptions, StringArray, StructArray, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::{StreamExt, TryStreamExt};
@@ -3214,4 +3215,300 @@ fn early_stream_release_and_reader_close_are_safe() {
     }
     let release = stream.release.take().unwrap();
     unsafe { release(&mut stream) };
+}
+
+/// Raw file written by the released Lance 14.0.2 writer; see
+/// `test_data/v14.0.2/blob_v2_raw_reader/PROVENANCE.md`.
+const BLOB_V2_RAW_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/test_data/v14.0.2/blob_v2_raw_reader/blob_v2_raw.lance"
+);
+
+/// Stable Blob v2 descriptor child order, as defined by lance-core.
+const BLOB_V2_DESCRIPTOR_CHILDREN: [&str; 5] = ["kind", "position", "size", "blob_id", "blob_uri"];
+
+fn descriptor_child_names(field: &Field) -> Vec<&str> {
+    match field.data_type() {
+        DataType::Struct(children) => children.iter().map(|child| child.name().as_str()).collect(),
+        other => panic!(
+            "Blob descriptor {} is not a struct but {other:?}",
+            field.name()
+        ),
+    }
+}
+
+fn assert_blob_descriptor_field(field: &Field) {
+    assert!(
+        field.is_nullable(),
+        "Blob descriptor {} must stay nullable",
+        field.name()
+    );
+    assert_eq!(
+        descriptor_child_names(field),
+        BLOB_V2_DESCRIPTOR_CHILDREN,
+        "descriptor children of {}",
+        field.name()
+    );
+}
+
+fn exported_metadata_schema(metadata: *const LanceFileMetadata) -> Schema {
+    let mut exported = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe { lance_file_metadata_get_schema(metadata, &mut exported) },
+        0,
+        "lance_file_metadata_get_schema failed: {}",
+        take_error().1
+    );
+    Schema::try_from(&exported).unwrap()
+}
+
+fn struct_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StructArray {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("missing column {name}"))
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap_or_else(|| panic!("column {name} is not a struct"))
+}
+
+fn descriptor_child<'a>(descriptor: &'a StructArray, name: &str) -> &'a ArrayRef {
+    descriptor
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("missing descriptor child {name}"))
+}
+
+fn descriptor_u64_child<'a>(descriptor: &'a StructArray, name: &str) -> &'a UInt64Array {
+    descriptor_child(descriptor, name)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap_or_else(|| panic!("descriptor child {name} is not UInt64"))
+}
+
+/// Assert one Blob v2 descriptor struct against fixture-defined values. Rows
+/// whose Blob struct is null only have their null flag pinned here; the full
+/// batch comparison against the native reader covers the exact child state of
+/// null rows.
+fn assert_blob_descriptor_values(
+    descriptor: &StructArray,
+    nulls: [bool; 3],
+    positions: [Option<u64>; 3],
+    sizes: [Option<u64>; 3],
+) {
+    assert_eq!(descriptor.len(), 3);
+    let kinds = descriptor_child(descriptor, "kind")
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    let blob_ids = descriptor_child(descriptor, "blob_id")
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    let position_values = descriptor_u64_child(descriptor, "position");
+    let size_values = descriptor_u64_child(descriptor, "size");
+    for row in 0..3 {
+        assert_eq!(
+            descriptor.is_null(row),
+            nulls[row],
+            "null mismatch row {row}"
+        );
+        if nulls[row] {
+            continue;
+        }
+        assert_eq!(
+            position_values.value(row),
+            positions[row].expect("non-null row must define a position"),
+            "descriptor position row {row}"
+        );
+        assert_eq!(
+            size_values.value(row),
+            sizes[row].expect("non-null row must define a size"),
+            "descriptor size row {row}"
+        );
+        // The released writer stores descriptor kind/blob_id 0 for Blob v2
+        // payloads.
+        assert_eq!(kinds.value(row), 0, "descriptor kind row {row}");
+        assert_eq!(blob_ids.value(row), 0, "descriptor blob_id row {row}");
+    }
+}
+
+#[test]
+fn released_blob_v2_raw_file_reads_descriptor_children_through_c_api() {
+    let uri = BLOB_V2_RAW_FIXTURE;
+    let reader = open_c_reader(uri, None);
+
+    let mut num_rows = 0u64;
+    assert_eq!(
+        unsafe { lance_file_reader_num_rows(reader, &mut num_rows) },
+        0
+    );
+    assert_eq!(num_rows, 3);
+
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_file_reader_get_metadata(reader, &mut metadata) },
+        0
+    );
+    let mut info = std::mem::zeroed::<LanceFileMetadataInfo>();
+    assert_eq!(
+        unsafe { lance_file_metadata_get_info(metadata, &mut info) },
+        0
+    );
+    assert_eq!(info.num_rows, 3);
+    assert_eq!(info.num_columns, 4);
+    assert_eq!(info.format_version, format_version(LanceFileVersion::V2_2));
+
+    let schema = exported_metadata_schema(metadata);
+    unsafe {
+        lance_file_metadata_close(metadata);
+        lance_file_reader_close(reader);
+    }
+
+    // The decoded footer schema must be exactly what the native raw reader sees.
+    let native = native_reader(uri);
+    let native_schema = native.schema();
+    assert_eq!(schema.fields(), native_schema.fields());
+    assert_eq!(schema.metadata(), native_schema.metadata());
+
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, ["id", "blob_a", "blob_b", "info"]);
+    assert_blob_descriptor_field(schema.field_with_name("blob_a").unwrap());
+    assert_blob_descriptor_field(schema.field_with_name("blob_b").unwrap());
+    let info_field = schema.field_with_name("info").unwrap();
+    let DataType::Struct(info_children) = info_field.data_type() else {
+        panic!("info is not a struct");
+    };
+    assert_eq!(info_children.len(), 1);
+    let payload = &info_children[0];
+    assert_eq!(payload.name(), "payload");
+    assert_blob_descriptor_field(payload);
+
+    let (default_schema, batches) = read_all_c(uri, None);
+    assert_eq!(default_schema.fields(), schema.fields());
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    assert_batches_match_ignoring_root_metadata(&batches, &native_batches(&native));
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_columns(), 4);
+
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids, &Int32Array::from(vec![10, 20, 30]));
+
+    let blob_a = struct_column(batch, "blob_a");
+    assert_blob_descriptor_values(
+        blob_a,
+        [false, true, false],
+        [Some(0), None, Some(64)],
+        [Some(5), None, Some(0)],
+    );
+    assert!(blob_a.is_valid(2), "empty payload row must not be null");
+    assert_eq!(
+        descriptor_u64_child(blob_a, "size").value(2),
+        0,
+        "empty payload must decode as zero-length descriptor"
+    );
+
+    let blob_b = struct_column(batch, "blob_b");
+    assert_blob_descriptor_values(
+        blob_b,
+        [false, false, true],
+        [Some(64), Some(128), None],
+        [Some(3), Some(5), None],
+    );
+    let info_array = struct_column(batch, "info");
+    assert!(info_array.is_valid(0) && info_array.is_valid(2));
+    let payload = info_array
+        .column_by_name("payload")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_blob_descriptor_values(
+        payload,
+        [false, true, false],
+        [Some(192), None, Some(256)],
+        [Some(8), None, Some(8)],
+    );
+
+    // Explicit projection over a top-level and a nested Blob column.
+    let projection = [c_string("blob_b"), c_string("info.payload")];
+    let column_ptrs: Vec<*const c_char> = projection.iter().map(|c| c.as_ptr()).collect();
+    let options = LanceFileReaderOptions {
+        has_columns: 1,
+        columns: column_ptrs.as_ptr(),
+        column_count: column_ptrs.len(),
+        ..Default::default()
+    };
+    let (projected_schema, projected) = read_all_c(uri, Some(&options));
+    let projected_names: Vec<&str> = projected_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(projected_names, ["blob_b", "info"]);
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].column(0).to_data(), batch.column(2).to_data());
+    assert_eq!(projected[0].column(1).to_data(), batch.column(3).to_data());
+
+    let projection = [c_string("id"), c_string("blob_a")];
+    let column_ptrs: Vec<*const c_char> = projection.iter().map(|c| c.as_ptr()).collect();
+    let options = LanceFileReaderOptions {
+        has_columns: 1,
+        columns: column_ptrs.as_ptr(),
+        column_count: column_ptrs.len(),
+        ..Default::default()
+    };
+    let (projected_schema, projected) = read_all_c(uri, Some(&options));
+    assert_eq!(projected_schema.fields().len(), 2);
+    assert_eq!(projected[0].column(0).to_data(), batch.column(0).to_data());
+    assert_eq!(projected[0].column(1).to_data(), batch.column(1).to_data());
+}
+
+#[test]
+fn released_blob_v2_raw_file_reader_handles_survive_close() {
+    let uri = BLOB_V2_RAW_FIXTURE;
+    let reader = open_c_reader(uri, None);
+
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_file_reader_get_metadata(reader, &mut metadata) },
+        0
+    );
+    let mut statistics = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_file_reader_get_statistics(reader, &mut statistics) },
+        0
+    );
+    let mut stream = arrow::ffi_stream::FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_file_reader_read_all(reader, 2, 2, &mut stream) },
+        0
+    );
+    unsafe { lance_file_reader_close(reader) };
+
+    // Metadata and statistics are owned snapshots and stay usable.
+    let mut info = std::mem::zeroed::<LanceFileMetadataInfo>();
+    assert_eq!(
+        unsafe { lance_file_metadata_get_info(metadata, &mut info) },
+        0,
+        "metadata must outlive the reader: {}",
+        take_error().1
+    );
+    assert_eq!(info.num_rows, 3);
+    let schema = exported_metadata_schema(metadata);
+    assert_eq!(schema.fields().len(), 4);
+    unsafe {
+        lance_file_metadata_close(metadata);
+        lance_file_statistics_close(statistics);
+    }
+
+    // The exported stream owns its own reader.
+    let stream = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batches: Vec<RecordBatch> = stream.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    assert_eq!(batches.len(), 2);
 }

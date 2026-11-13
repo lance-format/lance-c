@@ -256,6 +256,200 @@ static int provider_fetch(
     return 0;
 }
 
+static const char *const blob_v2_descriptor_children[] = {
+    "kind", "position", "size", "blob_id", "blob_uri"};
+
+static int verify_blob_v2_descriptor_schema(
+    const ArrowSchema *field,
+    const char *label) {
+    if (!field || !field->format || strcmp(field->format, "+s") != 0) {
+        fprintf(stderr, "BLOB %s is not a struct\n", label);
+        return 0;
+    }
+    if (field->n_children != 5) {
+        fprintf(stderr, "BLOB %s children=%lld\n", label,
+                (long long)field->n_children);
+        return 0;
+    }
+    for (int64_t index = 0; index < field->n_children; index++) {
+        const ArrowSchema *child = field->children[index];
+        if (!child->name ||
+            strcmp(child->name, blob_v2_descriptor_children[index]) != 0) {
+            fprintf(stderr, "BLOB %s child[%lld]=%s expected=%s\n", label,
+                    (long long)index, child->name ? child->name : "null",
+                    blob_v2_descriptor_children[index]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int struct_is_valid(const ArrowArray *array, int64_t row) {
+    const uint8_t *validity = (const uint8_t *)array->buffers[0];
+    return validity == NULL || ((validity[row / 8] >> (row % 8)) & 1) != 0;
+}
+
+static int64_t descriptor_size_at(const ArrowArray *descriptor, int64_t row) {
+    const ArrowArray *size = descriptor->children[2];
+    const int64_t *values = (const int64_t *)size->buffers[1];
+    return values[row];
+}
+
+/// Read the released Lance 14.0.2 Blob v2 raw file through the public C file
+/// reader. The 14.0.2 writer stored Blob v2 descriptor children as footer root
+/// fields, so a reader that does not reattach them exposes childless Blob
+/// structs (or fails to project the file at all).
+static int verify_released_blob_v2_raw_file(const char *base_dir) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/blob_v2_raw_reader/blob_v2_raw.lance",
+             base_dir);
+    LanceFileReader *reader = NULL;
+    if (lance_file_reader_open(path, NULL, NULL, NULL, NULL, &reader) != 0 ||
+        reader == NULL) {
+        fprintf(stderr, "BLOB open failed\n");
+        return 0;
+    }
+
+    int ok = 1;
+    uint64_t num_rows = 0;
+    ok = lance_file_reader_num_rows(reader, &num_rows) == 0 && num_rows == 3;
+    LanceFileMetadata *metadata = NULL;
+    LanceFileMetadataInfo info = {0};
+    if (ok) ok = lance_file_reader_get_metadata(reader, &metadata) == 0;
+    if (ok) ok = lance_file_metadata_get_info(metadata, &info) == 0;
+    if (ok) {
+        ok = info.num_rows == 3 && info.num_columns == 4 &&
+             info.format_version == LANCE_FILE_FORMAT_V2_2;
+    }
+    ArrowSchema schema = {0};
+    if (ok) ok = lance_file_metadata_get_schema(metadata, &schema) == 0;
+    if (ok) {
+        ok = schema.n_children == 4 &&
+             strcmp(schema.children[0]->name, "id") == 0 &&
+             strcmp(schema.children[2]->name, "blob_b") == 0 &&
+             strcmp(schema.children[3]->name, "info") == 0;
+    }
+    if (ok) {
+        ok = verify_blob_v2_descriptor_schema(schema.children[1], "blob_a") &&
+             verify_blob_v2_descriptor_schema(schema.children[2], "blob_b");
+    }
+    if (ok) {
+        const ArrowSchema *info_field = schema.children[3];
+        ok = info_field->n_children == 1 && info_field->children[0]->name &&
+             strcmp(info_field->children[0]->name, "payload") == 0 &&
+             verify_blob_v2_descriptor_schema(info_field->children[0],
+                                              "info.payload");
+    }
+
+    ArrowArrayStream stream = {0};
+    ArrowArray batch = {0};
+    int32_t ids[3] = {0};
+    int rows = 0;
+    if (ok) ok = lance_file_reader_read_all(reader, 2, 2, &stream) == 0;
+    if (ok) {
+        ArrowSchema stream_schema = {0};
+        ok = stream.get_schema(&stream, &stream_schema) == 0 &&
+             strcmp(stream_schema.format, "+s") == 0 &&
+             stream_schema.n_children == 4;
+        if (stream_schema.release) stream_schema.release(&stream_schema);
+    }
+    while (ok && stream.get_next(&stream, &batch) == 0) {
+        if (!batch.release) break;
+        ok = batch.n_children == 4;
+        if (ok) {
+            const ArrowArray *id = batch.children[0];
+            const int32_t *values = (const int32_t *)id->buffers[1];
+            for (int64_t row = 0; row < batch.length && rows + row < 3; row++) {
+                ids[rows + row] = values[row];
+            }
+        }
+        if (ok && rows == 0) {
+            const ArrowArray *blob_a = batch.children[1];
+            const ArrowArray *blob_b = batch.children[2];
+            const ArrowArray *payload = batch.children[3]->children[0];
+            ok = struct_is_valid(blob_a, 0) && !struct_is_valid(blob_a, 1) &&
+                 struct_is_valid(blob_a, 2) &&
+                 descriptor_size_at(blob_a, 2) == 0 &&
+                 struct_is_valid(blob_b, 0) && struct_is_valid(blob_b, 1) &&
+                 !struct_is_valid(blob_b, 2) && struct_is_valid(payload, 0) &&
+                 !struct_is_valid(payload, 1) && struct_is_valid(payload, 2);
+            if (!ok) fprintf(stderr, "BLOB null and empty rows mismatch\n");
+        }
+        rows += (int)batch.length;
+        batch.release(&batch);
+        memset(&batch, 0, sizeof(batch));
+    }
+    ok = ok && rows == 3 && ids[0] == 10 && ids[1] == 20 && ids[2] == 30;
+    if (!ok) fprintf(stderr, "BLOB default readback failed\n");
+    if (stream.release) stream.release(&stream);
+
+    if (ok) {
+        const char *columns[] = {"blob_b", "info.payload"};
+        LanceFileReaderOptions read_options = {0};
+        read_options.has_columns = 1;
+        read_options.columns = columns;
+        read_options.column_count = 2;
+        LanceFileReader *projected = NULL;
+        ok = lance_file_reader_open(path, NULL, &read_options, NULL, NULL,
+                                    &projected) == 0 &&
+             projected != NULL;
+        if (ok) {
+            ArrowArrayStream projected_stream = {0};
+            ok = lance_file_reader_read_all(projected, 3, 2,
+                                            &projected_stream) == 0;
+            if (ok) {
+                ArrowSchema projected_schema = {0};
+                ok = projected_stream.get_schema(&projected_stream,
+                                                 &projected_schema) == 0 &&
+                     strcmp(projected_schema.format, "+s") == 0 &&
+                     projected_schema.n_children == 2 &&
+                     strcmp(projected_schema.children[0]->name, "blob_b") == 0 &&
+                     strcmp(projected_schema.children[1]->name, "info") == 0 &&
+                     projected_schema.children[1]->n_children == 1 &&
+                     verify_blob_v2_descriptor_schema(
+                         projected_schema.children[1]->children[0],
+                         "projected info.payload");
+                if (projected_schema.release) {
+                    projected_schema.release(&projected_schema);
+                }
+            }
+            if (ok) {
+                int projected_rows = 0;
+                ArrowArray projected_batch = {0};
+                while (projected_stream.get_next(&projected_stream,
+                                                 &projected_batch) == 0) {
+                    if (!projected_batch.release) break;
+                    ok = projected_batch.n_children == 2 &&
+                         struct_is_valid(projected_batch.children[0], 2) &&
+                         descriptor_size_at(projected_batch.children[0], 2) == 0;
+                    projected_rows += (int)projected_batch.length;
+                    projected_batch.release(&projected_batch);
+                    memset(&projected_batch, 0, sizeof(projected_batch));
+                    if (!ok) break;
+                }
+                ok = ok && projected_rows == 3;
+            }
+            if (!ok) fprintf(stderr, "BLOB projection readback failed\n");
+            if (projected_stream.release) {
+                projected_stream.release(&projected_stream);
+            }
+            lance_file_reader_close(projected);
+        }
+    }
+
+    lance_file_reader_close(reader);
+    // The metadata snapshot is owned and must outlive the reader.
+    if (ok) {
+        LanceFileMetadataInfo after = {0};
+        ok = lance_file_metadata_get_info(metadata, &after) == 0 &&
+             after.num_rows == 3;
+        if (!ok) fprintf(stderr, "BLOB metadata did not outlive reader\n");
+    }
+    if (schema.release) schema.release(&schema);
+    if (metadata) lance_file_metadata_close(metadata);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     char base_uri[4096];
@@ -661,6 +855,9 @@ int main(int argc, char **argv) {
         if (prepared_schema.release) prepared_schema.release(&prepared_schema);
         lance_packed_blob_writer_close(dynamic_writer);
     }
+
+    CHECK(verify_released_blob_v2_raw_file(argv[1]),
+          "released 14.0.2 Blob v2 raw file");
 
     lance_file_session_close(session);
     lance_storage_options_accessor_close(storage);

@@ -55984,3 +55984,153 @@ fn test_fragment_create_preserves_native_schema_identity() {
         lance_dataset_close(dataset);
     }
 }
+
+/// Shallow clones are published through the public Clone operation and the
+/// ordinary transaction commit. The source and target live in separate local
+/// store roots, so this pins that the returned handle reads source fragments
+/// through the cloned manifest's base path, that a later source append stays
+/// invisible to the pinned clone, that a reopened target still reads the shared
+/// data, and that a chained shallow clone keeps the original base path.
+#[test]
+fn shallow_clone_across_separate_local_stores_shares_source_data_through_c_api() {
+    fn scan_ids(dataset: *const LanceDataset) -> Vec<i32> {
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null(), "{}", take_last_error_message());
+        let (_, batches) = collect_scanner(scanner);
+        unsafe { lance_scanner_close(scanner) };
+        let mut ids = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend(column.values().iter().copied());
+        }
+        ids
+    }
+
+    fn base_paths_json(dataset: *const LanceDataset) -> String {
+        let raw = unsafe { lance_dataset_base_paths_json(dataset) };
+        assert!(!raw.is_null(), "{}", take_last_error_message());
+        let json = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+        unsafe { lance_free_string(raw) };
+        json
+    }
+
+    fn commit_shallow_clone(target_uri: &str, source_uri: &str, version: u64) -> *mut LanceDataset {
+        let ref_path = c_str(source_uri);
+        let operation = unsafe {
+            lance_operation_clone_new(true, ptr::null(), version, ref_path.as_ptr(), ptr::null())
+        };
+        assert!(!operation.is_null(), "{}", take_last_error_message());
+        let transaction = unsafe { lance_transaction_new(version, operation, ptr::null()) };
+        let dataset = commit_native_transaction(target_uri, transaction, ptr::null());
+        unsafe {
+            lance_operation_close(operation);
+            lance_transaction_close(transaction);
+        }
+        dataset
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_str().unwrap().to_string();
+    std::fs::create_dir_all(format!("{base}/clone_source")).unwrap();
+    let source_uri = format!("{base}/clone_source/source.lance");
+
+    let created = write_uncommitted_for_batch(
+        &source_uri,
+        &write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        LanceWriteMode::Create,
+        ptr::null(),
+    );
+    let source_v1 = commit_native_transaction(&source_uri, created, ptr::null());
+    let v1_fragments = native_typed_fragment_ids(source_v1);
+    assert_eq!(unsafe { lance_dataset_version(source_v1) }, 1);
+    unsafe { lance_dataset_close(source_v1) };
+
+    let appended = write_uncommitted_for_batch(
+        &source_uri,
+        &write_batch(vec![4, 5, 6], vec![4.0, 5.0, 6.0]),
+        LanceWriteMode::Append,
+        ptr::null(),
+    );
+    let source_v2 = commit_native_transaction(&source_uri, appended, ptr::null());
+    assert_eq!(unsafe { lance_dataset_version(source_v2) }, 2);
+    unsafe { lance_dataset_close(source_v2) };
+
+    // 1. Publish a shallow clone at source version 1 into a different store root.
+    let clone_uri = format!("{base}/clone_target/target.lance");
+    let cloned = commit_shallow_clone(&clone_uri, &source_uri, 1);
+    assert_eq!(
+        unsafe { lance_dataset_version(cloned) },
+        1,
+        "shallow clone reports the pinned source version"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(cloned) }, 3);
+    assert_eq!(scan_ids(cloned), vec![1, 2, 3]);
+    assert_eq!(
+        native_typed_fragment_ids(cloned),
+        v1_fragments,
+        "shallow clone shares the source fragments instead of copying them"
+    );
+    let cloned_base_paths = base_paths_json(cloned);
+    assert!(
+        cloned_base_paths.contains(&source_uri),
+        "cloned manifest must record the source base path: {cloned_base_paths}"
+    );
+    unsafe { lance_dataset_close(cloned) };
+
+    // 2. Reopen the target without any clone handle: the manifest base path
+    //    carries the shared source data for a fresh dataset open.
+    let reopened = open_dataset_for_test(&clone_uri);
+    assert_eq!(unsafe { lance_dataset_version(reopened) }, 1);
+    assert_eq!(scan_ids(reopened), vec![1, 2, 3]);
+    unsafe { lance_dataset_close(reopened) };
+
+    // 3. A shallow clone of the clone keeps the original base path and data.
+    let chain_uri = format!("{base}/clone_chain/chain.lance");
+    let chained = commit_shallow_clone(&chain_uri, &clone_uri, 1);
+    assert_eq!(unsafe { lance_dataset_version(chained) }, 1);
+    assert_eq!(scan_ids(chained), vec![1, 2, 3]);
+    let chained_base_paths = base_paths_json(chained);
+    assert!(
+        chained_base_paths.contains(&source_uri),
+        "chained clone must inherit the original base path: {chained_base_paths}"
+    );
+    unsafe { lance_dataset_close(chained) };
+
+    // 4. Deep clones are still rejected natively through the same entry point.
+    let deep_uri = format!("{base}/clone_deep/deep.lance");
+    let ref_path = c_str(&source_uri);
+    let deep =
+        unsafe { lance_operation_clone_new(false, ptr::null(), 1, ref_path.as_ptr(), ptr::null()) };
+    assert!(!deep.is_null(), "{}", take_last_error_message());
+    let deep_transaction = unsafe { lance_transaction_new(1, deep, ptr::null()) };
+    let deep_uri_c = c_str(&deep_uri);
+    let mut deep_dataset: *mut LanceDataset = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_transaction_commit(
+                deep_uri_c.as_ptr(),
+                deep_transaction,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut deep_dataset,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("deep Clone cannot be committed directly"),
+        "deep clone rejection message"
+    );
+    assert!(deep_dataset.is_null());
+    unsafe {
+        lance_operation_close(deep);
+        lance_transaction_close(deep_transaction);
+    }
+}
