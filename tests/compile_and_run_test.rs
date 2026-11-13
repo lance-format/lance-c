@@ -32,6 +32,9 @@ use lance_file::version::LanceFileVersion;
 use common::create_config_base_files_fixture;
 use std::ffi::CString;
 
+#[path = "support/abi_layout.rs"]
+mod abi_layout;
+
 #[path = "support/substrait_aggregate.rs"]
 mod substrait_aggregate;
 
@@ -2152,4 +2155,10 @@ fn test_commit_lock_native_compilation_and_execution() {
         "C++ commit-lock test compilation failed"
     );
     run_test_binary_with_two_args(&cpp_binary, &source_uri, scratch_path);
+}
+
+#[test]
+#[ignore = "requires a C compiler; run with: cargo test --test compile_and_run_test -- --ignored test_public_c_abi_layout_matches_rust"]
+fn test_public_c_abi_layout_matches_rust() {
+    abi_layout::assert_public_abi();
 }
