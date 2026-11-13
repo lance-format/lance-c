@@ -366,13 +366,30 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
             const ArrowArray *blob_a = batch.children[1];
             const ArrowArray *blob_b = batch.children[2];
             const ArrowArray *payload = batch.children[3]->children[0];
-            ok = struct_is_valid(blob_a, 0) && !struct_is_valid(blob_a, 1) &&
-                 struct_is_valid(blob_a, 2) &&
-                 descriptor_size_at(blob_a, 2) == 0 &&
-                 struct_is_valid(blob_b, 0) && struct_is_valid(blob_b, 1) &&
-                 !struct_is_valid(blob_b, 2) && struct_is_valid(payload, 0) &&
-                 !struct_is_valid(payload, 1) && struct_is_valid(payload, 2);
-            if (!ok) fprintf(stderr, "BLOB null and empty rows mismatch\n");
+            int blob_a_valid = struct_is_valid(blob_a, 0) && !struct_is_valid(blob_a, 1) &&
+                               struct_is_valid(blob_a, 2);
+            int blob_b_valid = struct_is_valid(blob_b, 0) && struct_is_valid(blob_b, 1) &&
+                               !struct_is_valid(blob_b, 2);
+            int payload_valid = struct_is_valid(payload, 0) && !struct_is_valid(payload, 1) &&
+                                struct_is_valid(payload, 2);
+            int empty_size = descriptor_size_at(blob_a, 2) == 0;
+            ok = blob_a_valid && blob_b_valid && payload_valid && empty_size;
+            if (!ok) {
+                fprintf(stderr,
+                        "BLOB null and empty rows mismatch: "
+                        "blob_a=%d blob_b=%d payload=%d empty_size=%d "
+                        "a_valid=%d%d%d b_valid=%d%d%d p_valid=%d%d%d sizes=%lld,%lld,%lld "
+                        "n_children=%lld\n",
+                        blob_a_valid, blob_b_valid, payload_valid, empty_size,
+                        struct_is_valid(blob_a, 0), struct_is_valid(blob_a, 1),
+                        struct_is_valid(blob_a, 2), struct_is_valid(blob_b, 0),
+                        struct_is_valid(blob_b, 1), struct_is_valid(blob_b, 2),
+                        struct_is_valid(payload, 0), struct_is_valid(payload, 1),
+                        struct_is_valid(payload, 2), (long long)descriptor_size_at(blob_a, 0),
+                        (long long)descriptor_size_at(blob_a, 1),
+                        (long long)descriptor_size_at(blob_a, 2),
+                        (long long)blob_a->n_children);
+            }
         }
         rows += (int)batch.length;
         batch.release(&batch);
