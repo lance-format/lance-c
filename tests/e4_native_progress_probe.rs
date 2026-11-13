@@ -120,6 +120,10 @@ struct ProbeProgress {
     events: Mutex<Vec<ProbeEvent>>,
     cancel_requested: AtomicBool,
     callback_count: AtomicUsize,
+    /// Directory snapshotted inside the failing callback, to distinguish "no
+    /// sidecar was ever created" from "native cleanup removed it".
+    observe_dir: Mutex<Option<PathBuf>>,
+    observed_during_failure: Mutex<Vec<(String, u64)>>,
 }
 
 impl ProbeProgress {
@@ -152,7 +156,39 @@ impl ProbeProgress {
             events: Mutex::new(Vec::new()),
             cancel_requested: AtomicBool::new(false),
             callback_count: AtomicUsize::new(0),
+            observe_dir: Mutex::new(None),
+            observed_during_failure: Mutex::new(Vec::new()),
         }
+    }
+
+    fn observe_dir(&self, dir: PathBuf) {
+        *self.observe_dir.lock().unwrap() = Some(dir);
+    }
+
+    fn snapshot_observe_dir(&self) {
+        let dir = self.observe_dir.lock().unwrap().clone();
+        let Some(dir) = dir else {
+            return;
+        };
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_file() {
+                    files.push((
+                        entry.file_name().to_string_lossy().to_string(),
+                        metadata.len(),
+                    ));
+                }
+            }
+        }
+        files.sort();
+        *self.observed_during_failure.lock().unwrap() = files;
+    }
+
+    fn observed_during_failure(&self) -> Vec<(String, u64)> {
+        self.observed_during_failure.lock().unwrap().clone()
     }
 
     fn record(&self, event: ProbeEvent) {
@@ -202,6 +238,7 @@ impl IndexBuildProgress for ProbeProgress {
             && fail_stage == stage
             && completed >= *min_completed
         {
+            self.snapshot_observe_dir();
             return Err(probe_cancel("stage_progress", stage));
         }
         Ok(())
@@ -550,16 +587,21 @@ async fn vector_shuffle_error_after_work_prevents_commit() {
     );
 }
 
-// Scenario 4: an uncommitted vector build fails at the first
-// `merge_partitions` progress callback, after partition build work has
-// produced a result. No manifest publication may happen, but the index writer
-// has already created sidecar files: they stay behind unreferenced.
+// Scenario 4: an uncommitted vector build fails at the last
+// `merge_partitions` progress callback, after one partition has already been
+// written into the final index writer. No manifest publication may happen. The
+// writer stages its output in a temp file next to the target; native drop-based
+// cleanup must remove it, leaving no unreferenced sidecar behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vector_merge_error_after_partition_work_leaves_only_unreferenced_sidecar() {
     let (_tmp, uri) = multi_fragment_dataset().await;
     let params = vector_params();
-    let progress = Arc::new(ProbeProgress::fail_progress("merge_partitions", 1));
+    let progress = Arc::new(ProbeProgress::fail_progress(
+        "merge_partitions",
+        NUM_PARTITIONS as u64,
+    ));
     let uuid = probe_uuid();
+    progress.observe_dir(Path::new(&uri).join("_indices").join(uuid.to_string()));
 
     let mut dataset = Dataset::open(&uri).await.unwrap();
     let before = dataset.version().version;
@@ -594,13 +636,29 @@ async fn vector_merge_error_after_partition_work_leaves_only_unreferenced_sideca
         ],
         "failure must land on the first merge progress callback after shuffle"
     );
+    assert_eq!(
+        stage_progress_count(&events, "merge_partitions"),
+        NUM_PARTITIONS,
+        "each merged partition reports progress exactly once"
+    );
     match events.last().unwrap() {
         ProbeEvent::Progress { stage, completed } => {
             assert_eq!(stage, "merge_partitions");
-            assert_eq!(*completed, 1);
+            assert_eq!(*completed, NUM_PARTITIONS as u64);
         }
         other => panic!("last event must be merge progress, got {other:?}"),
     }
+    let during_failure = progress.observed_during_failure();
+    eprintln!("vector_merge_error_after_partition_work: during_failure={during_failure:?}");
+    assert_eq!(
+        during_failure.len(),
+        1,
+        "the final index writer must have staged exactly one temp file when the callback failed"
+    );
+    assert!(
+        during_failure[0].0.starts_with(".tmp"),
+        "staged file must be the writer temp file, got {during_failure:?}"
+    );
 
     let (after, indices) = dataset_state(&uri).await;
     let tree = index_tree(&uri);
@@ -610,15 +668,18 @@ async fn vector_merge_error_after_partition_work_leaves_only_unreferenced_sideca
     assert_eq!(after, before, "uncommitted failure must not publish");
     assert_eq!(indices, 0, "no index metadata may reference the sidecar");
 
-    let sidecar = format!("_indices/{uuid}/{INDEX_FILE_NAME}");
     assert_eq!(
         tree,
-        vec![(sidecar.clone(), 0)],
-        "merge failure leaves exactly the empty index writer sidecar"
+        Vec::<(String, u64)>::new(),
+        "native drop-based cleanup removes the staged writer temp file, leaving no unreferenced sidecar"
     );
     assert!(
-        Path::new(&uri).join(&sidecar).is_file(),
-        "sidecar evidence must exist on disk"
+        !Path::new(&uri)
+            .join("_indices")
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME)
+            .exists(),
+        "the final index path must never be published by a failed build"
     );
 }
 
@@ -656,7 +717,6 @@ async fn vector_success_control_publishes_after_all_checkpoints() {
             "progress:shuffle",
             "complete:shuffle",
             "start:merge_partitions",
-            "progress:merge_partitions",
             "progress:merge_partitions",
             "complete:merge_partitions",
         ]
