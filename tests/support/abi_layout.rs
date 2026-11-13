@@ -63,6 +63,27 @@ macro_rules! abi_struct {
     }};
 }
 
+// The C header names this enum after its public symbol; the Rust type is
+// `IndexBuildProgressEvent`. Keep the exception explicit instead of renaming
+// the public Rust API or guessing a type from the C name.
+macro_rules! abi_rust_enum {
+    (LanceIndexBuildProgressEvent) => {
+        lance_c::IndexBuildProgressEvent
+    };
+    ($name:ident) => {
+        lance_c::$name
+    };
+}
+
+macro_rules! abi_rust_enum_value {
+    (LanceIndexBuildProgressEvent, $variant:ident) => {
+        lance_c::IndexBuildProgressEvent::$variant as i64
+    };
+    ($name:ident, $variant:ident) => {
+        lance_c::$name::$variant as i64
+    };
+}
+
 macro_rules! abi_enum {
     ($manifest:ident, $name:ident { $($c_name:ident => $rust_name:ident),* $(,)? }) => {{
         $manifest.enums.insert(
@@ -72,19 +93,19 @@ macro_rules! abi_enum {
         $manifest.records.insert(format!(
             "enum-size|{}|{}",
             stringify!($name),
-            std::mem::size_of::<lance_c::$name>()
+            std::mem::size_of::<abi_rust_enum!($name)>()
         ));
         $manifest.records.insert(format!(
             "enum-align|{}|{}",
             stringify!($name),
-            std::mem::align_of::<lance_c::$name>()
+            std::mem::align_of::<abi_rust_enum!($name)>()
         ));
         $(
             $manifest.records.insert(format!(
                 "enum-value|{}|{}|{}",
                 stringify!($name),
                 stringify!($c_name),
-                lance_c::$name::$rust_name as i64
+                abi_rust_enum_value!($name, $rust_name)
             ));
         )*
     }};
