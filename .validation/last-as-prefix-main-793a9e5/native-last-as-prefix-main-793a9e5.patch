@@ -989,7 +989,7 @@ index 3d91c67df..5f2b1ee83 100644
                  || producer.document_granularity() != consumer.document_granularity()
                  || producer.params().phrase_slop != consumer.params().phrase_slop
 diff --git a/rust/lance/src/io/exec/fts/flat_match.rs b/rust/lance/src/io/exec/fts/flat_match.rs
-index 47d5eda2a..8bf19ab82 100644
+index 47d5eda2a..88ce03e53 100644
 --- a/rust/lance/src/io/exec/fts/flat_match.rs
 +++ b/rust/lance/src/io/exec/fts/flat_match.rs
 @@ -38,7 +38,6 @@ use lance_index::scalar::inverted::builder::document_input;
@@ -1000,21 +1000,36 @@ index 47d5eda2a..8bf19ab82 100644
  };
  use lance_index::scalar::inverted::{
      DocumentGranularity, FlatBm25SearchOptions, MemBM25Scorer, build_global_bm25_scorer,
-@@ -426,10 +425,10 @@ impl FlatMatchFilterExec {
+@@ -426,12 +425,6 @@ impl FlatMatchFilterExec {
                  "column not set for MatchQuery {}",
                  query.terms
              )))?;
 -        if uses_fuzzy_expansion(query.fuzziness) {
-+        if query.uses_vocabulary_expansion() {
-             return Err(DataFusionError::NotImplemented(format!(
+-            return Err(DataFusionError::NotImplemented(format!(
 -                "Fuzzy MatchQuery is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}",
 -                column, query.fuzziness
-+                "Fuzzy or prefix MatchQuery is not supported when FTS is used as a post-filter: column={}, fuzziness={:?}, last_as_prefix={}",
-+                column, query.fuzziness, query.last_as_prefix
-             )));
-         }
+-            )));
+-        }
          let document_granularity = resolved_field
-@@ -1001,6 +1000,11 @@ impl ExecutionPlan for FlatMatchQueryExec {
+             .as_ref()
+             .map(|resolved| resolved.document_granularity)
+@@ -583,6 +576,15 @@ impl ExecutionPlan for FlatMatchFilterExec {
+         partition: usize,
+         context: Arc<datafusion::execution::TaskContext>,
+     ) -> DataFusionResult<SendableRecordBatchStream> {
++        if self.query.uses_vocabulary_expansion() || self.params.last_as_prefix {
++            return Err(DataFusionError::NotImplemented(format!(
++                "Fuzzy or prefix MatchQuery is not supported when FTS is used as a post-filter: column={:?}, fuzziness={:?}, query.last_as_prefix={}, params.last_as_prefix={}",
++                self.query.column,
++                self.query.fuzziness,
++                self.query.last_as_prefix,
++                self.params.last_as_prefix
++            )));
++        }
+         let input = self.input.execute(partition, context)?;
+         let schema = self.schema();
+         let stream_fut = Self::build_filter_stream(
+@@ -1001,6 +1003,11 @@ impl ExecutionPlan for FlatMatchQueryExec {
          partition: usize,
          context: Arc<datafusion::execution::TaskContext>,
      ) -> DataFusionResult<SendableRecordBatchStream> {
@@ -1026,7 +1041,7 @@ index 47d5eda2a..8bf19ab82 100644
          let query = self.query.clone();
          let tokenized_query = self.tokenized_query.clone();
          let ds = self.dataset.clone();
-@@ -1196,6 +1200,52 @@ mod tests {
+@@ -1196,6 +1203,52 @@ mod tests {
      use lance_index::scalar::inverted::{InvertedIndex, Language};
      use lance_index::{IndexCriteria, IndexType};
 
