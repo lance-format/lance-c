@@ -2640,7 +2640,7 @@ inline int32_t mapper_trampoline(
     ArrowArray* output,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<MapperContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         context->udf->mapper(*input, *input_schema, *output);
         return 0;
     } catch (const lance::Error& exception) {
@@ -2718,7 +2718,7 @@ inline int32_t insert_batch_trampoline(
     ArrowSchema* batch_schema,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
         context->store->insert_batch(info, *batch, *batch_schema);
         return 0;
@@ -2741,7 +2741,7 @@ inline int32_t get_fragment_trampoline(
     LanceOwnedString* out_json,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         auto json = context->store->get_fragment(fragment_id);
         if (!json) return 0;
 
@@ -2775,7 +2775,7 @@ inline int32_t insert_fragment_trampoline(
     const char* fragment_json,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         context->store->insert_fragment(
             fragment_id, std::string(fragment_json == nullptr ? "" : fragment_json));
         return 0;
