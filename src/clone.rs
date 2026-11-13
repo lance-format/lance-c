@@ -503,7 +503,7 @@ mod tests {
         }
     }
 
-    fn try_c_rows(dataset: *const LanceDataset) -> Result<Vec<i32>, String> {
+    fn try_c_rows(dataset: *const LanceDataset) -> std::result::Result<Vec<i32>, String> {
         let scanner = unsafe { lance_scanner_new(dataset, std::ptr::null(), std::ptr::null()) };
         if scanner.is_null() {
             return Err(format!("lance_scanner_new: {}", last_error()));
@@ -548,13 +548,13 @@ mod tests {
     }
 
     fn root_base_path(dataset: *const LanceDataset) -> String {
-        let json = unsafe { crate::base_paths::lance_dataset_base_paths_json(dataset) };
-        assert!(!json.is_null(), "{}", last_error());
-        let json = unsafe { std::ffi::CStr::from_ptr(json) }
+        let json_ptr = unsafe { crate::base_paths::lance_dataset_base_paths_json(dataset) };
+        assert!(!json_ptr.is_null(), "{}", last_error());
+        let json = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
             .to_str()
             .expect("base paths JSON is UTF-8")
             .to_string();
-        unsafe { lance_free_string(json) };
+        unsafe { lance_free_string(json_ptr) };
         let value: serde_json::Value = serde_json::from_str(&json).expect("base paths JSON");
         value
             .as_object()
