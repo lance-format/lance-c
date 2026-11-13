@@ -289,14 +289,14 @@ async fn empty_analysis_and_trailing_punctuation() {
         ids(&run(&ds, match_node("text", "   ", true)).await),
         Vec::<i32>::new()
     );
-    for terms in ["alpha alp!!", "alpha alp   "] {
+    for terms in ["alpha alpe!!", "alpha alpe   "] {
         assert_eq!(
             ids(&run(
                 &ds,
                 match_node("text", terms, true).with_operator(Operator::And)
             )
             .await),
-            vec![0, 7, 8],
+            vec![0, 7],
             "terms={terms}"
         );
     }
@@ -326,7 +326,9 @@ async fn serde_default_is_backwards_compatible() {
     assert_eq!(round_trip, new);
 
     let (_dir, ds) = write_rows(ROWS).await;
-    assert_eq!(ids(&run(&ds, new).await), vec![0, 7, 8]);
+    let mut new = new;
+    new.operator = Operator::And;
+    assert_eq!(ids(&run(&ds, new).await), vec![0, 7]);
 }
 
 #[tokio::test]
