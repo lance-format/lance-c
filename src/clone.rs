@@ -790,7 +790,8 @@ mod tests {
 
         // Existing published target: native preflight rejects without writing
         // the out handle or changing the existing content.
-        let mut sentinel = 0x1 as *mut LanceDataset;
+        let sentinel_value = std::ptr::dangling_mut::<LanceDataset>();
+        let mut sentinel = sentinel_value;
         assert_eq!(
             unsafe {
                 lance_dataset_shallow_clone(
@@ -803,7 +804,7 @@ mod tests {
             },
             -1
         );
-        assert_eq!(sentinel as usize, 0x1, "out written on failure");
+        assert_eq!(sentinel, sentinel_value, "out written on failure");
         assert_eq!(
             lance_last_error_code(),
             LanceErrorCode::DatasetAlreadyExists
