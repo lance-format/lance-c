@@ -32,6 +32,9 @@ use lance_file::version::LanceFileVersion;
 use common::{create_config_base_files_fixture, create_rtree_geometry_fixture};
 use std::ffi::CString;
 
+#[path = "support/abi_layout.rs"]
+mod abi_layout;
+
 #[path = "support/substrait_aggregate.rs"]
 mod substrait_aggregate;
 
@@ -1653,6 +1656,18 @@ fn test_native_data_overlay_consumers() {
 fn test_raw_file_native_compilation_and_execution() {
     let (lib_path, include_dir) = build_lance_c();
     let base = tempfile::tempdir().unwrap();
+    // The raw-file consumers read the released 14.0.2 Blob v2 fixture from the
+    // scratch directory they already receive as argv[1].
+    let fixture_dir = base.path().join("blob_v2_raw_reader");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    std::fs::write(
+        fixture_dir.join("blob_v2_raw.lance"),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/v14.0.2/blob_v2_raw_reader/blob_v2_raw.lance"
+        )),
+    )
+    .unwrap();
     let base_path = base.path().to_str().unwrap();
     let build_dir = tempfile::tempdir().unwrap();
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2158,4 +2173,10 @@ fn test_commit_lock_native_compilation_and_execution() {
         "C++ commit-lock test compilation failed"
     );
     run_test_binary_with_two_args(&cpp_binary, &source_uri, scratch_path);
+}
+
+#[test]
+#[ignore = "requires a C compiler; run with: cargo test --test compile_and_run_test -- --ignored test_public_c_abi_layout_matches_rust"]
+fn test_public_c_abi_layout_matches_rust() {
+    abi_layout::assert_public_abi();
 }

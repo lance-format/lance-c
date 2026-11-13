@@ -2097,6 +2097,13 @@ public:
     static Operation make_update_mem_wal_state(
         const std::vector<CompactedSsTable>& compacted_sstables);
 
+    /// Construct an UpdateMemWalState operation for a specific MemWAL
+    /// directory. Pass an empty `dir_id` for a legacy MemWAL. Native commit
+    /// rejects a stale or removed identifier.
+    static Operation make_update_mem_wal_state_with_dir_id(
+        const std::vector<CompactedSsTable>& compacted_sstables,
+        const std::string& dir_id);
+
     // Update inspection. Inspecting a different operation kind throws
     // LANCE_ERR_NOT_SUPPORTED; every getter below reports native fields
     // unchanged.
@@ -2219,6 +2226,10 @@ public:
     /// but empty value is preserved.
     std::optional<UpdatedFragmentOffsets> updated_fragment_offsets() const;
 
+    /// MemWAL directory identifier named by an Update operation, or nullopt
+    /// for native None. An engaged empty string denotes a legacy MemWAL.
+    std::optional<std::string> update_mem_wal_dir_id() const;
+
     /// Number of groups in a Rewrite operation.
     uint64_t rewrite_group_count() const {
         uint64_t count = 0;
@@ -2264,6 +2275,10 @@ public:
     /// Copy one flushed generation marker by position.
     CompactedSsTable update_mem_wal_state_compacted_sstable_at(
         size_t index) const;
+
+    /// MemWAL directory identifier named by an UpdateMemWalState operation.
+    /// An empty string denotes the legacy `_mem_wal` directory.
+    std::string update_mem_wal_state_dir_id() const;
 
     const LanceOperation* c_handle() const { return handle_.get(); }
 };
@@ -2528,6 +2543,38 @@ struct BatchUDF {
     std::optional<UDFCheckpointStore> checkpoint_store;
 };
 
+/// Schema-aware checkpoint lookup. A hit must return both an owned array and
+/// the exact schema received by `insert_batch`, because native binds a cached
+/// batch to a context marker stored in that schema's metadata. Returns true on
+/// a hit, false on a miss, and throws on error.
+using BatchUDFGetBatchV2 = std::function<bool(
+    const BatchUDFInfo&,
+    ArrowArray&,
+    ArrowSchema&)>;
+
+/// Schema-aware native UDF checkpoint store. Insert and fragment callbacks are
+/// shared with `UDFCheckpointStore`; only the batch lookup differs. All four
+/// callbacks are required when the store is engaged.
+struct UDFCheckpointStoreV2 {
+    BatchUDFGetBatchV2 get_batch;
+
+    std::function<void(
+        const BatchUDFInfo&,
+        ArrowArray&,
+        ArrowSchema&)> insert_batch;
+
+    std::function<std::optional<std::string>(uint32_t)> get_fragment;
+
+    std::function<void(uint64_t, const std::string&)> insert_fragment;
+};
+
+/// Schema-aware native BatchUDF declaration.
+struct BatchUDFV2 {
+    BatchUDFMapper mapper;
+    const ArrowSchema* output_schema = nullptr;
+    std::optional<UDFCheckpointStoreV2> checkpoint_store;
+};
+
 namespace callback_detail {
 
 inline void release_owned_string(LanceOwnedString* value) noexcept {
@@ -2563,14 +2610,29 @@ inline void release_array_after_exception(ArrowArray* value) noexcept {
     }
 }
 
+inline void release_schema_after_exception(ArrowSchema* value) noexcept {
+    if (value != nullptr && value->release != nullptr) {
+        value->release(value);
+    }
+}
+
 struct MapperContext {
     const BatchUDF* udf;
+};
+
+struct MapperContextV2 {
+    const BatchUDFV2* udf;
 };
 
 struct CheckpointContext {
     const UDFCheckpointStore* store;
 };
 
+struct CheckpointContextV2 {
+    const UDFCheckpointStoreV2* store;
+};
+
+template <typename Context>
 inline int32_t mapper_trampoline(
     void* callback_ctx,
     const ArrowArray* input,
@@ -2578,7 +2640,7 @@ inline int32_t mapper_trampoline(
     ArrowArray* output,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<MapperContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         context->udf->mapper(*input, *input_schema, *output);
         return 0;
     } catch (const lance::Error& exception) {
@@ -2620,6 +2682,35 @@ inline int32_t get_batch_trampoline(
     }
 }
 
+inline int32_t get_batch_v2_trampoline(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* raw_info,
+    ArrowArray* output,
+    ArrowSchema* output_schema,
+    LanceCallbackError* error) noexcept {
+    try {
+        auto* context = static_cast<CheckpointContextV2*>(callback_ctx);
+        BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
+        return context->store->get_batch(info, *output, *output_schema) ? 1 : 0;
+    } catch (const lance::Error& exception) {
+        release_array_after_exception(output);
+        release_schema_after_exception(output_schema);
+        set_callback_error(error, static_cast<int32_t>(exception.code), exception.what());
+        return -1;
+    } catch (const std::exception& exception) {
+        release_array_after_exception(output);
+        release_schema_after_exception(output_schema);
+        set_callback_error(error, LANCE_ERR_INTERNAL, exception.what());
+        return -1;
+    } catch (...) {
+        release_array_after_exception(output);
+        release_schema_after_exception(output_schema);
+        set_callback_error(error, LANCE_ERR_INTERNAL, "unknown C++ exception");
+        return -1;
+    }
+}
+
+template <typename Context>
 inline int32_t insert_batch_trampoline(
     void* callback_ctx,
     const LanceUDFBatchInfo* raw_info,
@@ -2627,7 +2718,7 @@ inline int32_t insert_batch_trampoline(
     ArrowSchema* batch_schema,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         BatchUDFInfo info{raw_info->fragment_id, raw_info->batch_index};
         context->store->insert_batch(info, *batch, *batch_schema);
         return 0;
@@ -2643,13 +2734,14 @@ inline int32_t insert_batch_trampoline(
     }
 }
 
+template <typename Context>
 inline int32_t get_fragment_trampoline(
     void* callback_ctx,
     uint32_t fragment_id,
     LanceOwnedString* out_json,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         auto json = context->store->get_fragment(fragment_id);
         if (!json) return 0;
 
@@ -2676,13 +2768,14 @@ inline int32_t get_fragment_trampoline(
     }
 }
 
+template <typename Context>
 inline int32_t insert_fragment_trampoline(
     void* callback_ctx,
     uint64_t fragment_id,
     const char* fragment_json,
     LanceCallbackError* error) noexcept {
     try {
-        auto* context = static_cast<CheckpointContext*>(callback_ctx);
+        auto* context = static_cast<Context*>(callback_ctx);
         context->store->insert_fragment(
             fragment_id, std::string(fragment_json == nullptr ? "" : fragment_json));
         return 0;
@@ -2713,6 +2806,10 @@ struct BatchUDFCall {
     CheckpointContext checkpoint_context{};
     LanceUDFCheckpointStore raw_store{};
     LanceBatchUDF raw{};
+    MapperContextV2 mapper_context_v2{};
+    CheckpointContextV2 checkpoint_context_v2{};
+    LanceUDFCheckpointStoreV2 raw_store_v2{};
+    LanceBatchUDFV2 raw_v2{};
 
     BatchUDFCall(const BatchUDF& udf,
                  std::optional<std::vector<std::string>> columns,
@@ -2739,18 +2836,70 @@ struct BatchUDFCall {
             }
             checkpoint_context.store = store;
             raw_store.get_batch = &get_batch_trampoline;
-            raw_store.insert_batch = &insert_batch_trampoline;
-            raw_store.get_fragment = &get_fragment_trampoline;
-            raw_store.insert_fragment = &insert_fragment_trampoline;
+            raw_store.insert_batch = &insert_batch_trampoline<CheckpointContext>;
+            raw_store.get_fragment = &get_fragment_trampoline<CheckpointContext>;
+            raw_store.insert_fragment =
+                &insert_fragment_trampoline<CheckpointContext>;
             raw_store.callback_ctx = &checkpoint_context;
         }
 
         mapper_context.udf = &udf;
-        raw.mapper = &mapper_trampoline;
+        raw.mapper = &mapper_trampoline<MapperContext>;
         raw.mapper_ctx = &mapper_context;
         raw.output_schema = udf.output_schema;
         raw.checkpoint_store = store == nullptr ? nullptr : &raw_store;
 
+        prepare_arguments(batch_size);
+    }
+
+    BatchUDFCall(const BatchUDFV2& udf,
+                 std::optional<std::vector<std::string>> columns,
+                 std::optional<uint32_t> batch_size)
+        : read_columns(std::move(columns)) {
+        if (!udf.mapper) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT, "BatchUDF mapper must not be empty");
+        }
+        if (udf.output_schema == nullptr) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "BatchUDF output_schema must not be null");
+        }
+
+        const UDFCheckpointStoreV2* store = nullptr;
+        if (udf.checkpoint_store) {
+            store = &*udf.checkpoint_store;
+            if (!store->get_batch || !store->insert_batch ||
+                !store->get_fragment || !store->insert_fragment) {
+                throw Error(
+                    LANCE_ERR_INVALID_ARGUMENT,
+                    "UDFCheckpointStoreV2 must provide all four callbacks");
+            }
+            checkpoint_context_v2.store = store;
+            raw_store_v2.get_batch = &get_batch_v2_trampoline;
+            raw_store_v2.insert_batch = &insert_batch_trampoline<CheckpointContextV2>;
+            raw_store_v2.get_fragment = &get_fragment_trampoline<CheckpointContextV2>;
+            raw_store_v2.insert_fragment =
+                &insert_fragment_trampoline<CheckpointContextV2>;
+            raw_store_v2.callback_ctx = &checkpoint_context_v2;
+        }
+
+        mapper_context_v2.udf = &udf;
+        raw_v2.mapper = &mapper_trampoline<MapperContextV2>;
+        raw_v2.mapper_ctx = &mapper_context_v2;
+        raw_v2.output_schema = udf.output_schema;
+        raw_v2.checkpoint_store = store == nullptr ? nullptr : &raw_store_v2;
+
+        prepare_arguments(batch_size);
+    }
+
+    BatchUDFCall(const BatchUDFCall&) = delete;
+    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
+    BatchUDFCall(BatchUDFCall&&) = delete;
+    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
+
+private:
+    void prepare_arguments(std::optional<uint32_t> batch_size) {
         if (read_columns) {
             read_column_ptrs.reserve(read_columns->size() + 1);
             for (const auto& column : *read_columns) {
@@ -2764,11 +2913,6 @@ struct BatchUDFCall {
             batch_size_ptr = &batch_size_value;
         }
     }
-
-    BatchUDFCall(const BatchUDFCall&) = delete;
-    BatchUDFCall& operator=(const BatchUDFCall&) = delete;
-    BatchUDFCall(BatchUDFCall&&) = delete;
-    BatchUDFCall& operator=(BatchUDFCall&&) = delete;
 };
 
 }  // namespace callback_detail
@@ -4494,6 +4638,12 @@ public:
         std::optional<std::vector<std::string>> read_columns = std::nullopt,
         std::optional<uint32_t> batch_size = std::nullopt) const;
 
+    /// Add columns through the shared schema-aware BatchUDF adapter.
+    std::pair<Fragment, LanceSchema> add_columns_batch_udf(
+        const BatchUDFV2& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) const;
+
     /// Merge a consumed right-hand Arrow stream into this bound fragment.
     std::pair<Fragment, LanceSchema> merge_columns(
         ArrowArrayStream* stream,
@@ -4874,6 +5024,23 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
     ::LanceSchema* out_schema = nullptr;
     if (lance_fragment_add_columns_batch_udf(
             handle_.get(), &call.raw, call.read_columns_ptr,
+            call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
+        check_error();
+    }
+    return fragment_mutation_detail::take_fragment_schema_pair(
+        out_fragment, out_schema);
+}
+
+inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
+    const BatchUDFV2& udf,
+    std::optional<std::vector<std::string>> read_columns,
+    std::optional<uint32_t> batch_size) const {
+    callback_detail::BatchUDFCall call(
+        udf, std::move(read_columns), batch_size);
+    LanceFragment* out_fragment = nullptr;
+    ::LanceSchema* out_schema = nullptr;
+    if (lance_fragment_add_columns_batch_udf_v2(
+            handle_.get(), &call.raw_v2, call.read_columns_ptr,
             call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
         check_error();
     }
@@ -5393,6 +5560,8 @@ public:
         return *this;
     }
 
+    /// Store the override; nullopt selects the native default. Native
+    /// compaction rejects an explicit zero when executed, not in this setter.
     CompactionOptions& set_num_threads(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_num_threads(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
@@ -6219,7 +6388,9 @@ struct CompactedSsTable {
 /// applied: an engaged empty vector means the caller supplied no entries.
 /// `update_mode == std::nullopt`, a null `inserted_rows_filter` and a null
 /// `updated_fragment_offsets` map to native `None`, which is distinct from
-/// empty populated values.
+/// empty populated values. `mem_wal_dir_id == std::nullopt` maps to native
+/// `None`; an engaged value (including an empty string) is required by Lance
+/// 15 when compaction progress is present.
 struct UpdateOperationSpec {
     std::vector<uint64_t> removed_fragment_ids;
     std::vector<const Fragment*> updated_fragments;
@@ -6230,6 +6401,7 @@ struct UpdateOperationSpec {
     std::optional<UpdateMode> update_mode;
     std::optional<KeyExistenceFilter> inserted_rows_filter;
     std::optional<UpdatedFragmentOffsets> updated_fragment_offsets;
+    std::optional<std::string> mem_wal_dir_id;
 };
 
 /// One SSTable referenced by a shard snapshot.
@@ -6662,24 +6834,30 @@ class MemWalIndexDetails {
     std::vector<std::string> maintained_;
     std::vector<ShardingSpec> specs_;
     std::map<std::string, std::string> defaults_;
+    std::string dir_id_;
 
 public:
     MemWalIndexDetails(uint32_t num_shards,
                        bool maintain_all,
                        std::vector<std::string> maintained,
                        std::vector<ShardingSpec> specs,
-                       std::map<std::string, std::string> defaults)
+                       std::map<std::string, std::string> defaults,
+                       std::string dir_id = {})
         : num_shards_(num_shards),
           maintain_all_(maintain_all),
           maintained_(std::move(maintained)),
           specs_(std::move(specs)),
-          defaults_(std::move(defaults)) {}
+          defaults_(std::move(defaults)),
+          dir_id_(std::move(dir_id)) {}
 
     MemWalIndexDetails(MemWalIndexDetails&&) noexcept = default;
     MemWalIndexDetails& operator=(MemWalIndexDetails&&) noexcept = default;
     MemWalIndexDetails(const MemWalIndexDetails&) = delete;
     MemWalIndexDetails& operator=(const MemWalIndexDetails&) = delete;
 
+    /// Directory identifier of this MemWAL. Empty denotes the legacy
+    /// `_mem_wal` directory.
+    const std::string& dir_id() const { return dir_id_; }
     uint32_t num_shards() const { return num_shards_; }
     bool maintain_all_indexes() const { return maintain_all_; }
     const std::vector<std::string>& maintained_indexes() const { return maintained_; }
@@ -9014,6 +9192,8 @@ public:
 
     /// One-shot native `Dataset::merge` left join with distinct keys.
     ///
+    /// Duplicate right-side join keys, including duplicate nulls, are rejected
+    /// by native with LANCE_ERR_INVALID_ARGUMENT.
     /// Empty key strings are forwarded to native validation. Throws
     /// lance::Error on failure.
     void merge(
@@ -9326,6 +9506,23 @@ public:
 
         if (lance_dataset_add_columns_batch_udf(
                 handle_.get(), &call.raw, call.read_columns_ptr,
+                call.batch_size_ptr) != 0) {
+            check_error();
+        }
+    }
+
+    /// Add columns through the schema-aware shared BatchUDF adapter. Batch
+    /// checkpoints are restored from the batch schema, preserving the native
+    /// context marker; the array-only overload keeps its original behavior.
+    void add_columns_batch_udf(
+        const BatchUDFV2& udf,
+        std::optional<std::vector<std::string>> read_columns = std::nullopt,
+        std::optional<uint32_t> batch_size = std::nullopt) {
+        callback_detail::BatchUDFCall call(
+            udf, std::move(read_columns), batch_size);
+
+        if (lance_dataset_add_columns_batch_udf_v2(
+                handle_.get(), &call.raw_v2, call.read_columns_ptr,
                 call.batch_size_ptr) != 0) {
             check_error();
         }
@@ -10203,6 +10400,9 @@ public:
 /// Native version-diff handle. Reusable: `list_transactions` and every
 /// `get_*` stream may be called repeatedly and in any order; each returned
 /// stream owns its state after this (and the dataset) handle closes.
+/// Row-change and deleted-ID streams require stable row IDs at both nonzero
+/// endpoints; version 0 is the empty snapshot. Native rejection surfaces as
+/// lance::Error with LANCE_ERR_INVALID_ARGUMENT when requesting a stream.
 class DatasetDelta {
     Handle<LanceDatasetDelta, lance_dataset_delta_close> handle_;
 
@@ -13861,9 +14061,11 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
         lance_mem_wal_index_details_num_shards(details.get());
     const int32_t maintain_all =
         lance_mem_wal_index_details_maintain_all_indexes(details.get());
+    const char* dir_id = lance_mem_wal_index_details_dir_id(details.get());
+    if (!dir_id) check_error();
     return MemWalIndexDetails(num_shards, maintain_all != 0,
                               std::move(maintained), std::move(specs),
-                              std::move(defaults));
+                              std::move(defaults), std::string(dir_id));
 }
 
 inline ShardWriter Dataset::mem_wal_writer(
@@ -14259,6 +14461,43 @@ Operation::updated_fragment_offsets() const {
     return UpdatedFragmentOffsets(offsets);
 }
 
+inline std::optional<std::string> Operation::update_mem_wal_dir_id() const {
+    bool present = false;
+    const char* dir_id = nullptr;
+    if (lance_operation_update_mem_wal_dir_id(handle_.get(), &present,
+                                               &dir_id) != 0) {
+        check_error();
+    }
+    if (!present) {
+        if (dir_id) {
+            throw Error(LANCE_ERR_INTERNAL,
+                        "Update MemWAL dir_id reported absent with a non-null "
+                        "string");
+        }
+        return std::nullopt;
+    }
+    if (!dir_id) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "Update MemWAL dir_id reported present with a null "
+                    "string");
+    }
+    return std::string(dir_id);
+}
+
+inline std::string Operation::update_mem_wal_state_dir_id() const {
+    const char* dir_id = nullptr;
+    if (lance_operation_update_mem_wal_state_dir_id(handle_.get(), &dir_id) !=
+        0) {
+        check_error();
+    }
+    if (!dir_id) {
+        throw Error(LANCE_ERR_INTERNAL,
+                    "UpdateMemWalState dir_id reported present with a null "
+                    "string");
+    }
+    return std::string(dir_id);
+}
+
 inline RewriteGroup Operation::rewrite_group_at(size_t index) const {
     LanceRewriteGroup* group = nullptr;
     if (lance_operation_rewrite_group_at(handle_.get(), index, &group) != 0) {
@@ -14359,7 +14598,10 @@ inline Operation Operation::make_update(const UpdateOperationSpec& spec) {
             ? spec.updated_fragment_offsets->c_handle()
             : nullptr;
 
-    auto* raw = lance_operation_update_new(&options);
+    auto* raw = spec.mem_wal_dir_id
+                   ? lance_operation_update_new_with_mem_wal_dir_id(
+                         &options, spec.mem_wal_dir_id->c_str())
+                   : lance_operation_update_new(&options);
     if (!raw) check_error();
     return Operation(raw);
 }
@@ -14393,6 +14635,20 @@ inline Operation Operation::make_update_mem_wal_state(
     }
     auto* operation = lance_operation_update_mem_wal_state_new(
         raw.empty() ? nullptr : raw.data(), raw.size());
+    if (!operation) check_error();
+    return Operation(operation);
+}
+
+inline Operation Operation::make_update_mem_wal_state_with_dir_id(
+    const std::vector<CompactedSsTable>& compacted_sstables,
+    const std::string& dir_id) {
+    std::vector<::LanceCompactedSsTable> raw;
+    raw.reserve(compacted_sstables.size());
+    for (const auto& sstable : compacted_sstables) {
+        raw.push_back(sstable.to_c());
+    }
+    auto* operation = lance_operation_update_mem_wal_state_new_with_dir_id(
+        raw.empty() ? nullptr : raw.data(), raw.size(), dir_id.c_str());
     if (!operation) check_error();
     return Operation(operation);
 }

@@ -183,10 +183,10 @@ fn rhs_batch() -> (Arc<Schema>, RecordBatch) {
         Field::new("score", DataType::Int64, true),
         Field::new("tag", DataType::Utf8, true),
     ]));
+    // v15 rejects duplicate right-side join keys, so each key appears once.
     let keys: Vec<Option<i32>> = vec![
         Some(10),
         Some(99),
-        Some(20),
         None,
         Some(20),
         Some(40),
@@ -196,7 +196,6 @@ fn rhs_batch() -> (Arc<Schema>, RecordBatch) {
     let scores: Vec<Option<i64>> = vec![
         Some(100),
         Some(199),
-        Some(200),
         Some(999),
         Some(201),
         Some(400),
@@ -206,9 +205,8 @@ fn rhs_batch() -> (Arc<Schema>, RecordBatch) {
     let tags = vec![
         Some("a"),
         Some("unused-99"),
-        Some("b-first"),
         Some("null-key"),
-        Some("b-last"),
+        Some("b"),
         Some("d"),
         Some("o"),
         Some("unused-70"),
@@ -311,10 +309,7 @@ fn test_merge_matches_native_oracle_and_preserves_snapshots() {
     let actual = rows_by_id(c_dataset);
     assert_eq!(actual, expected);
     assert_eq!(actual.get(&10), Some(&(Some(100), Some("a".to_owned()))));
-    assert_eq!(
-        actual.get(&20),
-        Some(&(Some(201), Some("b-last".to_owned())))
-    );
+    assert_eq!(actual.get(&20), Some(&(Some(201), Some("b".to_owned()))));
     assert_eq!(actual.get(&40), Some(&(Some(400), Some("d".to_owned()))));
     assert_eq!(
         actual.get(&50),
@@ -656,7 +651,32 @@ fn test_merge_errors_consume_stream_and_preserve_version() {
     assert_eq!(take_error().0, LanceErrorCode::InvalidArgument);
     assert_stream_released(&drops);
 
+    let duplicate_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("score", DataType::Int64, true),
+    ]));
+    let duplicate = RecordBatch::try_new(
+        duplicate_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 10])),
+            Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+        ],
+    )
+    .unwrap();
+    let (mut stream, drops) = counted_stream(vec![duplicate], duplicate_schema);
+    assert_eq!(
+        unsafe { lance_dataset_merge(dataset, left.as_ptr(), right.as_ptr(), &mut stream) },
+        -1
+    );
+    let (code, message) = take_error();
+    assert_eq!(code, LanceErrorCode::InvalidArgument);
+    assert!(
+        message.contains("Duplicate right-side join key"),
+        "{message}"
+    );
+    assert_stream_released(&drops);
     assert_eq!(unsafe { lance_dataset_version(dataset) }, baseline);
+
     let (mut stream, drops) = counted_stream(vec![rhs], rhs_schema);
     assert_eq!(
         unsafe { lance_dataset_merge(dataset, left.as_ptr(), right.as_ptr(), &mut stream) },
