@@ -1325,7 +1325,9 @@ fn test_batch_udf_checkpoint_hits_skip_mapper_and_batches() {
         "unexpected seeding failure: {message}"
     );
     assert_eq!(unsafe { lance_dataset_version(dataset) }, original_version);
-    assert_eq!(mapper.calls.load(Ordering::SeqCst), 1);
+    // Both fragments reach the mapper before the second fragment checkpoint is
+    // rejected, so the seeding run only persists the first fragment's result.
+    assert_eq!(mapper.calls.load(Ordering::SeqCst), 2);
 
     // A durable store returns the native fragment JSON verbatim, marker included.
     let checkpointed: Vec<(u64, String)> = store.inserted_fragments.lock().unwrap().clone();
