@@ -214,6 +214,9 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Enable long paths for Lance dependency checkout
+        shell: pwsh
+        run: git config --global core.longpaths true
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
