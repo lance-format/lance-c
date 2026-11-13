@@ -56134,7 +56134,7 @@ fn shallow_clone_across_separate_local_directories_reuse_source_data_through_c_a
 
     let created = write_uncommitted_for_batch(
         &source_uri,
-        &write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
+        write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]),
         LanceWriteMode::Create,
         ptr::null(),
     );
@@ -56149,7 +56149,7 @@ fn shallow_clone_across_separate_local_directories_reuse_source_data_through_c_a
 
     let appended = write_uncommitted_for_batch(
         &source_uri,
-        &write_batch(vec![4, 5, 6], vec![4.0, 5.0, 6.0]),
+        write_batch(vec![4, 5, 6], vec![4.0, 5.0, 6.0]),
         LanceWriteMode::Append,
         ptr::null(),
     );
