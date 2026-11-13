@@ -73,4 +73,31 @@ the caller's mbx-managed default target and cache; no overrides are applied.
 
 ## Validation evidence
 
-To be recorded after execution on NieR.
+Executed on NieR on 2026-11-13 against a disposable clone at base
+`40f15ed1b71b66950961b175829fdf17a763f108` with Rust `1.94.0`
+(`4a4ef493e`) and Cargo `1.94.0`. The runner checked the base and clean tree,
+applied the patch, and ran the formatting check and focused tests:
+
+```bash
+cargo +1.94.0 fmt --all -- --check
+cargo +1.94.0 test -j 8 -p lance --lib checkout_before -- --test-threads=4
+```
+
+Results: formatting exited 0; exactly 7 tests ran and passed, with 6301 tests
+filtered out (`test result: ok. 7 passed; 0 failed; 0 ignored`); runner exit 0.
+The test log is retained at `logs/run-4.log` in the NieR validation workspace
+and at `/tmp/asof-checkout-before.S8uaHE.log` from that run. Builds used the
+mbx default target and cache without overrides.
+
+## Boundaries
+
+- This is a validation-only native candidate; it does not add the C binding,
+  change dependency pins, error numbers, or MSRV, or change Python code.
+- The API accepts a native `DateTime<Utc>` and compares native timestamps at
+  nanosecond precision. Python's local/naive/microsecond conversions remain a
+  separate binding limit; this patch does not claim those cases are equivalent.
+- Only the current branch's attached, retained history is searched. Versions
+  removed by cleanup are unrecoverable and appear only as a shortened history
+  or the documented `InvalidInput` error.
+- The focused tests cover the seven cases listed above; full C/C++ suites were
+  not run because no C surface changed.
