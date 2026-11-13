@@ -1,11 +1,11 @@
 diff --git a/rust/lance-index/src/scalar/inverted.rs b/rust/lance-index/src/scalar/inverted.rs
-index 046a39f45..667a3577f 100644
+index 046a39f454304b4825d082a1dc33b5c117f6cb17..667a3577f0823edcd37dd4efd2f4baf91296bbe7 100644
 --- a/rust/lance-index/src/scalar/inverted.rs
 +++ b/rust/lance-index/src/scalar/inverted.rs
 @@ -22,6 +22,7 @@ mod scorer;
  pub mod tokenizer;
  mod wand;
-
+ 
 +use fst::Automaton;
  use futures::{StreamExt, TryStreamExt, stream};
  use lance_index_core::remapping::BatchRowIdRemapper;
@@ -13,10 +13,10 @@ index 046a39f45..667a3577f 100644
 @@ -50,7 +51,7 @@ pub use lance_tokenizer::Language;
  pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
  pub use tokenizer::*;
-
+ 
 -use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
 +use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
-
+ 
  /// Canonical token vocabulary and BM25 statistics for one indexed query leaf.
  ///
 @@ -157,10 +158,31 @@ pub(crate) fn final_query_tokens(
@@ -30,7 +30,7 @@ index 046a39f45..667a3577f 100644
 +    let indices = indices.iter().map(Arc::as_ref).collect::<Vec<_>>();
 +    expand_query_tokens(&indices, query_tokens, params)
 +}
-
+ 
 +/// Expand one Match leaf's analyzed tokens against the selected segments.
 +///
 +/// Groups are visited in ascending position order and every retained source
@@ -106,7 +106,7 @@ index 046a39f45..667a3577f 100644
          let has_all_query_positions =
              has_all_query_positions(&query_tokens, tokens.as_ref(), params.phrase_slop.is_some());
 diff --git a/rust/lance-index/src/scalar/inverted/compound.rs b/rust/lance-index/src/scalar/inverted/compound.rs
-index ded7c4945..d740f9f31 100644
+index ded7c4945408a57cf1682492364216601d4c5196..d740f9f315e1ff481bddbe8bef90347e8e406797 100644
 --- a/rust/lance-index/src/scalar/inverted/compound.rs
 +++ b/rust/lance-index/src/scalar/inverted/compound.rs
 @@ -3741,7 +3741,8 @@ impl LeafQuery {
@@ -120,12 +120,12 @@ index ded7c4945..d740f9f31 100644
                  .clone()
                  .with_limit(None)
 diff --git a/rust/lance-index/src/scalar/inverted/index/partition.rs b/rust/lance-index/src/scalar/inverted/index/partition.rs
-index 6261a8613..3739db1d4 100644
+index 6261a861397fdcd39982d02ba94cc80ed568fedf..3739db1d460f5de1c5571897f0fc0cd67b80b1e8 100644
 --- a/rust/lance-index/src/scalar/inverted/index/partition.rs
 +++ b/rust/lance-index/src/scalar/inverted/index/partition.rs
 @@ -976,6 +976,9 @@ impl InvertedPartition {
      }
-
+ 
      pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
 +        let last_position = (0..tokens.len())
 +            .map(|token_idx| tokens.position(token_idx))
@@ -160,7 +160,7 @@ index 6261a8613..3739db1d4 100644
 @@ -1012,14 +1028,14 @@ impl InvertedPartition {
          )
      }
-
+ 
 -    /// Collect up to `limit` fuzzy candidates for one query token from this
 +    /// Collect up to `limit` candidates for one query token from this
      /// partition's token FST, in key (lexicographic) order. Callers merge
@@ -175,20 +175,20 @@ index 6261a8613..3739db1d4 100644
          automaton: &A,
          limit: usize,
 diff --git a/rust/lance-index/src/scalar/inverted/index/search.rs b/rust/lance-index/src/scalar/inverted/index/search.rs
-index 9aeb51134..3ca5128ee 100644
+index 9aeb51134bbd8aee3c1ba67c3843541b7e8bc399..3ca5128ee5bd1cdffdbb10e1291124b03842426b 100644
 --- a/rust/lance-index/src/scalar/inverted/index/search.rs
 +++ b/rust/lance-index/src/scalar/inverted/index/search.rs
 @@ -1,7 +1,6 @@
  // SPDX-License-Identifier: Apache-2.0
  // SPDX-FileCopyrightText: Copyright The Lance Authors
-
+ 
 -use super::partition::FuzzyAutomaton;
  use super::*;
-
+ 
  const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
 @@ -51,16 +50,18 @@ fn select_impact_scorer(
  }
-
+ 
  impl InvertedIndex {
 -    /// Add this segment's lexicographically smallest fuzzy candidates for one
 +    /// Add this segment's lexicographically smallest candidates for one
@@ -229,7 +229,7 @@ index 9aeb51134..3ca5128ee 100644
 @@ -411,68 +412,20 @@ impl InvertedIndex {
          Ok(dfs.into_iter().sum())
      }
-
+ 
 -    /// Expand fuzzy query tokens against all partitions in this segment.
 +    /// Expand query tokens against all partitions in this segment.
      ///
@@ -305,7 +305,7 @@ index 9aeb51134..3ca5128ee 100644
 -        .with_term_groups(expanded_groups))
 +        crate::scalar::inverted::expand_query_tokens(&[self], tokens, params)
      }
-
+ 
      /// Search documents that match the query and return row ids sorted by BM25 score.
 @@ -578,16 +531,16 @@ impl InvertedIndex {
          base_scorer: Option<&MemBM25Scorer>,
@@ -328,13 +328,13 @@ index 9aeb51134..3ca5128ee 100644
              if operator == Operator::And || params.phrase_slop.is_some() {
                  // AND/phrase semantics require every original token position
 diff --git a/rust/lance-index/src/scalar/inverted/index/tests/query.rs b/rust/lance-index/src/scalar/inverted/index/tests/query.rs
-index 280152cb0..c0dddd025 100644
+index 280152cb0f5edc1d1ed3b4c60b5a35b9ba49927e..c0dddd02518cb2557aa7935529472d394f514609 100644
 --- a/rust/lance-index/src/scalar/inverted/index/tests/query.rs
 +++ b/rust/lance-index/src/scalar/inverted/index/tests/query.rs
 @@ -762,6 +762,194 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query(
      }
  }
-
+ 
 +/// One partition whose vocabulary is `alp*` plus `beta`. Used to pin the
 +/// `last_as_prefix` rewrite without a dataset: group 0 is an earlier analyzed
 +/// position, group 1 the highest one.
@@ -528,15 +528,15 @@ index 280152cb0..c0dddd025 100644
  async fn write_variant_partition(
 @@ -1648,7 +1836,7 @@ async fn test_fuzzy_candidate_merge_stays_bounded_across_partitions() {
      let automaton = FuzzyAutomaton::new("alphx", &DocType::Text, &params).unwrap();
-
+ 
      index
 -        .collect_fuzzy_candidates_with_automaton(&automaton, limit, &mut candidates)
 +        .collect_expansion_candidates_with_automaton(&automaton, limit, &mut candidates)
          .unwrap();
-
+ 
      assert!(candidates.len() <= limit);
 diff --git a/rust/lance-index/src/scalar/inverted/parser.rs b/rust/lance-index/src/scalar/inverted/parser.rs
-index 0ee49753d..fc035086d 100644
+index 0ee49753d7e3f3bd36fc848ec35fca6108e7621e..fc035086d36bfe58bd5a9fa5607b626bf081c683 100644
 --- a/rust/lance-index/src/scalar/inverted/parser.rs
 +++ b/rust/lance-index/src/scalar/inverted/parser.rs
 @@ -51,6 +51,12 @@ impl JsonParser for MatchQuery {
@@ -550,7 +550,7 @@ index 0ee49753d..fc035086d 100644
 +            })?,
 +        };
          let document_granularity = parse_document_granularity(value)?;
-
+ 
          Ok(Self {
 @@ -61,6 +67,7 @@ impl JsonParser for MatchQuery {
              max_expansions,
@@ -579,7 +579,7 @@ index 0ee49753d..fc035086d 100644
          });
          assert_eq!(fts_query, expected_query);
      }
-
+ 
 +    #[test]
 +    fn test_from_json_match_last_as_prefix_defaults_false() {
 +        let without_field = r#"{ "match": { "terms": "hello" } }"#;
@@ -620,13 +620,13 @@ index 0ee49753d..fc035086d 100644
      fn test_from_json_match_invalid_fuzziness_rejected() {
          // Present-but-invalid fuzziness must be rejected instead of silently
 diff --git a/rust/lance-index/src/scalar/inverted/query.rs b/rust/lance-index/src/scalar/inverted/query.rs
-index 8f8d0dff9..e3c185fcf 100644
+index 8f8d0dff968530991b6c3d726fc0efef4d5e8fcf..e3c185fcf197ef5b8175cd49995220825850266c 100644
 --- a/rust/lance-index/src/scalar/inverted/query.rs
 +++ b/rust/lance-index/src/scalar/inverted/query.rs
 @@ -19,6 +19,18 @@ pub fn uses_fuzzy_expansion(fuzziness: Option<u32>) -> bool {
      fuzziness != Some(0)
  }
-
+ 
 +/// Return whether a Match leaf needs the indexed vocabulary.
 +///
 +/// Fuzzy matching expands every query token to its nearest indexed terms.
@@ -664,7 +664,7 @@ index 8f8d0dff9..e3c185fcf 100644
 +    #[serde(default)]
 +    pub last_as_prefix: bool,
  }
-
+ 
  impl FtsSearchParams {
 @@ -83,6 +102,7 @@ impl FtsSearchParams {
              max_expansions: 50,
@@ -673,7 +673,7 @@ index 8f8d0dff9..e3c185fcf 100644
 +            last_as_prefix: false,
          }
      }
-
+ 
 @@ -115,6 +135,16 @@ impl FtsSearchParams {
          self.prefix_length = prefix_length;
          self
@@ -689,12 +689,12 @@ index 8f8d0dff9..e3c185fcf 100644
 +        uses_vocabulary_expansion(self.fuzziness, self.last_as_prefix)
 +    }
  }
-
+ 
  impl Default for FtsSearchParams {
 @@ -377,6 +407,15 @@ pub struct MatchQuery {
      #[serde(default)]
      pub prefix_length: u32,
-
+ 
 +    /// Match the analyzed token at the highest position as a prefix of the
 +    /// indexed vocabulary.
 +    ///
@@ -718,7 +718,7 @@ index 8f8d0dff9..e3c185fcf 100644
 @@ -439,6 +479,16 @@ impl MatchQuery {
          self
      }
-
+ 
 +    pub fn with_last_as_prefix(mut self, last_as_prefix: bool) -> Self {
 +        self.last_as_prefix = last_as_prefix;
 +        self
@@ -739,14 +739,14 @@ index 8f8d0dff9..e3c185fcf 100644
 +            "last_as_prefix": false,
          });
          assert_eq!(serialized, expected);
-
+ 
 @@ -1609,8 +1660,17 @@ mod tests {
          assert_eq!(query.max_expansions, 50);
          assert_eq!(query.operator, Operator::Or);
          assert_eq!(query.prefix_length, 0);
 +        assert!(!query.last_as_prefix);
          assert_eq!(query.document_granularity, None);
-
+ 
 +        let query = query.with_last_as_prefix(true);
 +        let serialized = serde_json::to_value(&query).unwrap();
 +        assert_eq!(serialized["last_as_prefix"], true);
@@ -761,7 +761,7 @@ index 8f8d0dff9..e3c185fcf 100644
 @@ -1624,6 +1684,25 @@ mod tests {
          );
      }
-
+ 
 +    #[test]
 +    fn test_fts_search_params_last_as_prefix_serde_default() {
 +        use super::*;
@@ -785,7 +785,7 @@ index 8f8d0dff9..e3c185fcf 100644
      fn test_phrase_query_serde() {
          use super::*;
 diff --git a/rust/lance/src/dataset/mem_wal/index/fts.rs b/rust/lance/src/dataset/mem_wal/index/fts.rs
-index 97eef1211..551e24414 100644
+index 97eef121107c03f9adf9a253f9414568decfb7d3..551e2441476aac7870e9fb6a62b65f694740bf52 100644
 --- a/rust/lance/src/dataset/mem_wal/index/fts.rs
 +++ b/rust/lance/src/dataset/mem_wal/index/fts.rs
 @@ -2010,10 +2010,11 @@ impl FtsMemIndex {
@@ -821,7 +821,7 @@ index 97eef1211..551e24414 100644
                      let st = index.state.load_full();
                      let tokens = index.analyze_for_search(&query.terms);
 diff --git a/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs b/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
-index 7f6e2bb6b..0124409f9 100644
+index 7f6e2bb6b447d94a012eb1805bd618baae0ba82c..0124409f9d8adc9d86515a007a3e16f9010f3b93 100644
 --- a/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
 +++ b/rust/lance/src/dataset/mem_wal/memtable/scanner/builder.rs
 @@ -450,22 +450,30 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
@@ -873,7 +873,7 @@ index 7f6e2bb6b..0124409f9 100644
 @@ -2147,6 +2155,17 @@ mod tests {
              "fuzzy AND maps to a conjunctive Fuzzy leaf"
          );
-
+ 
 +        // Prefix expansion is a segment-index feature: refusing it keeps the
 +        // in-memory index from silently running an exact match instead.
 +        let prefix = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
@@ -889,11 +889,11 @@ index 7f6e2bb6b..0124409f9 100644
          let phrase = FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
              PhraseQuery::new("quick fox".to_string()).with_column(Some("text".to_string())),
 diff --git a/rust/lance/src/dataset/scanner/fts.rs b/rust/lance/src/dataset/scanner/fts.rs
-index f627d4722..fc38bd47e 100644
+index f627d4722d1f9717babf6e966975484b826b4e48..fc38bd47e0246b63ae45af22e5ecff79bf4e12a5 100644
 --- a/rust/lance/src/dataset/scanner/fts.rs
 +++ b/rust/lance/src/dataset/scanner/fts.rs
 @@ -210,7 +210,7 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
-
+ 
  fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
      match query {
 -        FtsQuery::Match(query) => query.fuzziness == Some(0),
@@ -932,11 +932,11 @@ index f627d4722..fc38bd47e 100644
          let (filter_plan, candidate_filter) = match filter {
              FlatMatchFilter::BeforeScoring(filter_plan) => (filter_plan, None),
 diff --git a/rust/lance/src/io/exec/fts/compound.rs b/rust/lance/src/io/exec/fts/compound.rs
-index 2f20652fd..869525d7d 100644
+index 2f20652fd0d460c2c1da896a0e4d5588adae9f8f..869525d7dc7ed2881ab7ceb07d1d4e599637ac07 100644
 --- a/rust/lance/src/io/exec/fts/compound.rs
 +++ b/rust/lance/src/io/exec/fts/compound.rs
 @@ -54,8 +54,8 @@ use uuid::Uuid;
-
+ 
  use super::match_query::MatchQueryExec;
  use super::matches::{
 -    PreparedMatch, compound_leaf_columns, compound_query_uses_fuzzy_expansion, count_fts_leaves,
@@ -976,7 +976,7 @@ index 2f20652fd..869525d7d 100644
                  ));
              }
 diff --git a/rust/lance/src/io/exec/fts/corpus.rs b/rust/lance/src/io/exec/fts/corpus.rs
-index 3d91c67df..5f2b1ee83 100644
+index 3d91c67df9c2fa1b643d62e07c265a9945b512ac..5f2b1ee83ef365221ed1e9efc0213361a8530981 100644
 --- a/rust/lance/src/io/exec/fts/corpus.rs
 +++ b/rust/lance/src/io/exec/fts/corpus.rs
 @@ -251,7 +251,7 @@ impl SharedFtsCorpus {
@@ -989,7 +989,7 @@ index 3d91c67df..5f2b1ee83 100644
                  || producer.document_granularity() != consumer.document_granularity()
                  || producer.params().phrase_slop != consumer.params().phrase_slop
 diff --git a/rust/lance/src/io/exec/fts/flat_match.rs b/rust/lance/src/io/exec/fts/flat_match.rs
-index 47d5eda2a..8bf19ab82 100644
+index 47d5eda2aaf3bdf14cd10e074dd93404f42e212a..8bf19ab8283834b8733524f0a0f9b395d61da9a6 100644
 --- a/rust/lance/src/io/exec/fts/flat_match.rs
 +++ b/rust/lance/src/io/exec/fts/flat_match.rs
 @@ -38,7 +38,6 @@ use lance_index::scalar::inverted::builder::document_input;
@@ -1029,7 +1029,7 @@ index 47d5eda2a..8bf19ab82 100644
 @@ -1196,6 +1200,52 @@ mod tests {
      use lance_index::scalar::inverted::{InvertedIndex, Language};
      use lance_index::{IndexCriteria, IndexType};
-
+ 
 +    #[tokio::test]
 +    async fn test_flat_match_query_rejects_last_as_prefix() {
 +        let dataset = lance_datagen::gen_batch()
@@ -1080,7 +1080,7 @@ index 47d5eda2a..8bf19ab82 100644
      #[case::default(InvertedIndexParams::default(), "alpha", "beta")]
      #[case::ngram(InvertedIndexParams::default()
 diff --git a/rust/lance/src/io/exec/fts/match_query.rs b/rust/lance/src/io/exec/fts/match_query.rs
-index 756dde56e..f7ab95dc6 100644
+index 756dde56edce18862a28541c54b4e883769fe97d..f7ab95dc68378e8e6660f549439ad29f0af51228 100644
 --- a/rust/lance/src/io/exec/fts/match_query.rs
 +++ b/rust/lance/src/io/exec/fts/match_query.rs
 @@ -24,9 +24,7 @@ use crate::Dataset;
@@ -1100,7 +1100,7 @@ index 756dde56e..f7ab95dc6 100644
              .with_prefix_length(query.prefix_length)
 +            .with_last_as_prefix(query.last_as_prefix)
      }
-
+ 
      pub fn new(
 @@ -606,10 +605,10 @@ impl ExecutionPlan for MatchQueryExec {
                      &metrics.segment_bind_duration,
@@ -1129,7 +1129,7 @@ index 756dde56e..f7ab95dc6 100644
                          "fuzzy MatchQuery cannot use a scorer-only override; prepare the canonical vocabulary with prepare_bm25_query and pass it with with_prepared_query"
                              .to_string(),
 diff --git a/rust/lance/src/io/exec/fts/matches.rs b/rust/lance/src/io/exec/fts/matches.rs
-index b36fc9c3d..404dd137d 100644
+index b36fc9c3da113f325016d2ee8f6996b157acbcd3..404dd137d4ed45201d08aa424d45c67a69ae5f86 100644
 --- a/rust/lance/src/io/exec/fts/matches.rs
 +++ b/rust/lance/src/io/exec/fts/matches.rs
 @@ -12,9 +12,7 @@ use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
@@ -1146,7 +1146,7 @@ index b36fc9c3d..404dd137d 100644
 @@ -245,24 +243,24 @@ pub(super) fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
      Ok(columns)
  }
-
+ 
 -pub(super) fn compound_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
 +pub(super) fn compound_query_uses_vocabulary_expansion(query: &FtsQuery) -> bool {
      match query {
@@ -1176,13 +1176,13 @@ index b36fc9c3d..404dd137d 100644
      }
  }
 diff --git a/rust/lance/tests/query/inverted.rs b/rust/lance/tests/query/inverted.rs
-index 31261bd67..a25ef4f96 100644
+index 31261bd67b596709aeb107b3748d4bd3e6f0dd72..b529df0eba00cf5d304a0b9a85c0054e7f817b3d 100644
 --- a/rust/lance/tests/query/inverted.rs
 +++ b/rust/lance/tests/query/inverted.rs
 @@ -1292,6 +1292,331 @@ async fn test_element_document_fts_vector_prefilter_deduplicates_parent_rows() {
      assert!(result.column_by_name("_doc_index").is_none());
  }
-
+ 
 +fn scanned_ids(batch: &RecordBatch) -> Vec<i32> {
 +    batch["id"]
 +        .as_primitive::<arrow_array::types::Int32Type>()
@@ -1333,14 +1333,14 @@ index 31261bd67..a25ef4f96 100644
 +    );
 +
 +    assert_eq!(
-+        scanned_ids(&run_fts(&ds, prefix_and("alpha alp", 2), None).await),
++        scanned_ids(&run_fts(&ds, prefix_and("alpha alp", 1), None).await),
 +        Vec::<i32>::new(),
-+        "the earlier exact alternative consumes the shared budget"
++        "the earlier exact alternative consumes the only budget slot"
 +    );
 +    assert_eq!(
-+        scanned_ids(&run_fts(&ds, prefix_and("alpha alp", 3), None).await),
++        scanned_ids(&run_fts(&ds, prefix_and("alpha alp", 2), None).await),
 +        vec![0],
-+        "one more unit of budget reaches alpenglow at the last position"
++        "the absent literal alp consumes no slot; the second slot reaches alpenglow"
 +    );
 +
 +    assert_eq!(

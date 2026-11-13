@@ -12,7 +12,7 @@ pin, C API, ABI, or error contract. No C API surface is added or modified.
 
 | Artifact | SHA256 |
 | --- | --- |
-| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `3d49b06c9cd42b21ec3f56c854ae8cc4c5705b87bc95bf5c9d944bc1298f5e18` |
+| `native-last-as-prefix-main-793a9e5.patch` (this candidate) | `0eb2ee32c25dcff542117dfb911ea4a678ba43b8008a427339ce3ba23641c583` |
 | `../last-as-prefix/native-last-as-prefix.patch` (pinned, unchanged) | `18bad6fe2ae452dc7bd91e5243385eccb9a749413b63f8be8533afab45ae720e` |
 
 - Candidate base tree: `b71237fa79dd9c94da47752e026430bd93ce7243`
@@ -94,7 +94,7 @@ Dataset-level (`rust/lance/tests/query/inverted.rs`):
 
 - `test_inverted_last_as_prefix_expands_only_highest_position` (exact
   unchanged, last-token-only, argument order, Boolean must/should, shared
-  budget 2/3, trailing punctuation, empty analysis, boost score).
+  budget 1/2, trailing punctuation, empty analysis, boost score).
 - `test_inverted_last_as_prefix_respects_list_element_boundaries`.
 - `test_inverted_last_as_prefix_merges_fragments_before_truncation`
   (reject all-unindexed and partially-indexed prefix queries, retain the flat
@@ -126,7 +126,7 @@ Flat execution:
 
 - `git apply --check` on a pristine `793a9e5` working tree: passes.
 - Applying the patch to that pristine tree produces tree
-  `4768d1e3756467a2a017f279aeff3f00da4b0df5`, identical to the local staged
+  `96dfc52af9955f4d27d4f916dc283b1bcbb51c36`, identical to the local staged
   tree of the candidate.
 - `git diff --check`: clean.
 - Static review of every changed hunk, remaining `fuzziness == Some(0)` /
@@ -175,3 +175,14 @@ Any execution of this upstream candidate must identify that toolchain and must
 not be called lance-c Rust 1.94 acceptance. The selected lance-c core pin and
 its Rust 1.94 contract remain unchanged. Native-current execution is pending;
 the previously accepted pinned-native nine-case oracle is separate evidence.
+
+## Dataset budget correction (2026-11-13)
+
+The first NieR dataset run executed three cases on Rust 1.98.1: two passed,
+one exposed a mistaken test expectation. The fixture has no literal `alp` in
+its vocabulary. Shared expansion selects actual vocabulary keys, so `alpha`
+uses the first slot and `alpenglow` uses the second. The corrected test checks
+that cap 1 cannot satisfy both AND positions and cap 2 returns row 0. No
+production selector changed. The prior 14 index and two lance-lib results
+remain applicable; the corrected dataset case awaits its focused recheck.
+Earlier source-only statements describe the original preparation stage.
