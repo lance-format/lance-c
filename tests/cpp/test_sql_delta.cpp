@@ -415,13 +415,12 @@ void test_delta_errors(const std::string& history_uri,
     CHECK(message.find("stable row ids") != std::string::npos);
     // v15 requires stable row ids for every row-change stream, not only for
     // deleted ids, so the C++ wrapper surfaces the same native rejection.
-    for (const auto& get_rows : {
-             [&] { plain_delta.get_inserted_rows(); },
-             [&] { plain_delta.get_updated_rows(); },
-             [&] { plain_delta.get_upserted_rows(); },
-         }) {
-        CHECK(error_code_of(get_rows) == LANCE_ERR_INVALID_ARGUMENT);
-    }
+    CHECK(error_code_of([&] { plain_delta.get_inserted_rows(); }) ==
+          LANCE_ERR_INVALID_ARGUMENT);
+    CHECK(error_code_of([&] { plain_delta.get_updated_rows(); }) ==
+          LANCE_ERR_INVALID_ARGUMENT);
+    CHECK(error_code_of([&] { plain_delta.get_upserted_rows(); }) ==
+          LANCE_ERR_INVALID_ARGUMENT);
     const auto plain_inserted_message =
         error_message_of([&] { plain_delta.get_inserted_rows(); });
     CHECK(plain_inserted_message.find("stable row ids") != std::string::npos);
