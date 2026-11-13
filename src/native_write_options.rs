@@ -390,7 +390,7 @@ fn narrow_u64(value: u64, field: &'static str) -> Result<usize> {
     })
 }
 
-unsafe fn parse_base_store_params(
+pub(crate) unsafe fn parse_base_store_params(
     list: *const LanceBaseStoreParamsList,
 ) -> Result<Option<HashMap<String, ObjectStoreParams>>> {
     if list.is_null() {

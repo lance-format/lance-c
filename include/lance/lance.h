@@ -612,6 +612,55 @@ LanceDataset* lance_dataset_open_with_options(
     const LanceSession* session
 );
 
+/* Defined with the native write-options declarations below; forward-declared
+ * here so the source-store open entry point can take it by pointer. */
+typedef struct LanceBaseStoreParamsList LanceBaseStoreParamsList;
+
+/**
+ * Open a dataset with additive options, an optional shared session, and
+ * per-base store parameters for its shared bases.
+ *
+ * `options` and `session` have the same meaning and ownership behavior as
+ * lance_dataset_open_with_options: NULL options means latest version and native
+ * storage defaults, and NULL session means the default session. A non-NULL
+ * accessor is retained natively and closing the C accessor does not invalidate
+ * the dataset.
+ *
+ * `base_store_params` binds native `ObjectStoreParams` to exact
+ * `BasePath.path` keys from the dataset manifest:
+ *
+ * - NULL selects native `None` (no per-base bindings).
+ * - A non-NULL list with `count == 0` selects native `Some(empty)`, which adds
+ *   no bindings.
+ * - Entries match the exact stored base path, not a base id or name and with no
+ *   URI normalization. Duplicate keys use the last entry.
+ *
+ * An exact binding takes precedence over the dataset-level storage options.
+ * Without one, native base store resolution falls back to the dataset-level
+ * accessor/options scoped to that base. These bindings are runtime-only:
+ * Lance does not persist accessors, credentials, or other store parameters in
+ * the dataset, so reopening the dataset later must supply them again when the
+ * base needs them. This call adds no second parser, credential cache, or store
+ * manager.
+ *
+ * Malformed lists are rejected before the native dataset is opened. A NULL
+ * `items` with a non-zero `count`, a NULL or non-UTF-8 base path, an
+ * out-of-range block size, or invalid S3 refresh nanoseconds returns NULL with
+ * LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * @param uri               Dataset path (file://, s3://, memory://, etc.)
+ * @param options           Additive open options, or NULL
+ * @param session           Shared session, or NULL for the default session
+ * @param base_store_params Per-base bindings, or NULL for native None
+ * @return Dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_open_with_base_store_params(
+    const char* uri,
+    const LanceDatasetOpenOptions* options,
+    const LanceSession* session,
+    const LanceBaseStoreParamsList* base_store_params
+);
+
 /**
  * Open a Lance dataset through a foreign commit lock and an optional dynamic
  * storage-options accessor.
@@ -1423,6 +1472,69 @@ LanceDataset* lance_dataset_checkout_ref(
  * @return 0 on success, -1 on error; the out handle is not written on error
  */
 int32_t lance_dataset_deep_clone(
+    const LanceDataset* dataset,
+    const char* target_path,
+    const LanceRef* reference,
+    const LanceStorageOptionsAccessor* target_storage_options,
+    LanceDataset** out
+);
+
+/**
+ * Shallow clone a dataset snapshot into a new dataset at `target_path`.
+ *
+ * The whole operation is performed by Lance's native
+ * `Dataset::shallow_clone` on a private clone of the source handle's snapshot.
+ * The source handle is not modified and no source write lock is held while the
+ * clone is committed. Native shallow clone publishes a metadata-only target
+ * whose manifest reuses the source base paths instead of copying data files.
+ *
+ * `reference == NULL` clones the source handle's current snapshot: its branch
+ * and version id are pinned into `Ref::Version(branch, Some(version))`. Treat
+ * it as "clone this exact snapshot", not "clone the latest head". Pass an
+ * explicit `LanceRef` from `lance_ref_version(NULL, false, 0)` to clone the
+ * current head of the default branch. Source location, reference resolution,
+ * and the published version are native-defined by the selected reference and
+ * manifest.
+ *
+ * `target_storage_options` is an existing storage-options accessor, or NULL.
+ * Its native accessor Arc is forwarded into `ObjectStoreParams` without
+ * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
+ * its refresh behavior. NULL passes native `None`, which makes the target
+ * inherit the source dataset's dataset-level store parameters as native
+ * shallow clone does. A non-NULL accessor that holds static options and/or a
+ * provider contributes its native `Arc`; an accessor created with neither
+ * contributes native `None`, while an accessor with an engaged static map,
+ * even an empty one, contributes `Some` and selects explicit target
+ * parameters.
+ *
+ * Native shallow clone resolves the target through the source dataset's
+ * session and object-store registry, captured when the source handle was
+ * opened. Schemes visible only to another registry are not available here.
+ *
+ * The returned dataset retains the source store parameters for its base paths
+ * as a runtime binding, so it can read shared source files after the source
+ * handle is closed. Those bindings and accessor owners are not persisted in
+ * the target manifest. Reopening the clone in a new dataset handle requires
+ * supplying them again through lance_dataset_open_with_base_store_params when
+ * the default store configuration cannot read a base. This call does not
+ * reopen the target, persist credentials, or add a custom ObjectStore API.
+ *
+ * The out handle is written only on success. A target that already contains a
+ * published dataset is rejected by the native preflight before clone writes.
+ * Later native failures may leave partial files, including tagged index files,
+ * under `target_path`; they are not rolled back. Remote/cloud behavior is
+ * whatever the configured native providers return; this binding makes no
+ * additional availability or persistence guarantee.
+ *
+ * Caller closes the returned handle with lance_dataset_close().
+ * @param dataset source dataset handle (must not be NULL)
+ * @param target_path UTF-8 target dataset URI (must not be NULL)
+ * @param reference snapshot ref, or NULL for the source handle's snapshot
+ * @param target_storage_options target accessor, or NULL for native None
+ * @param out receives the new dataset handle on success (must not be NULL)
+ * @return 0 on success, -1 on error; the out handle is not written on error
+ */
+int32_t lance_dataset_shallow_clone(
     const LanceDataset* dataset,
     const char* target_path,
     const LanceRef* reference,

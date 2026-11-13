@@ -3275,6 +3275,17 @@ public:
 struct DatasetOpenOptions {
     uint64_t version = 0;
     const StorageOptionsAccessor* storage_options_accessor = nullptr;
+    /// Optional per-base native `ObjectStoreParams` bindings for existing
+    /// shared bases. `std::nullopt` selects native None (no bindings); an
+    /// engaged empty vector selects native `Some(empty)`, which also adds no
+    /// bindings. Entries match exact `BasePath.path` keys from the manifest,
+    /// not base ids or names, and an exact entry takes precedence over the
+    /// dataset-level accessor. The bindings are runtime-only and are not
+    /// persisted; reopening the dataset later must supply them again when the
+    /// base needs them. The returned dataset retains the accessor Arcs, so the
+    /// `DatasetBaseStoreParams` values and accessors may be destroyed after
+    /// `open_with_options` returns.
+    std::optional<std::vector<DatasetBaseStoreParams>> base_store_params;
 };
 
 // ─── Shared Session ──────────────────────────────────────────────────────────
@@ -3498,6 +3509,64 @@ extern "C" inline void release_progress_context(void* callback_ctx) noexcept {
     delete static_cast<ProgressContext*>(callback_ctx);
 }
 
+/// Owns the strings, C views and list passed to `LanceBaseStoreParamsList`
+/// for one C call. Keep it alive until that call returns.
+struct BaseStoreParamsHolder {
+    std::vector<std::string> paths;
+    std::vector<LanceBaseStoreParams> views;
+    LanceBaseStoreParamsList list{};
+};
+
+/// Convert C++ `DatasetBaseStoreParams` values into borrowed C views.
+///
+/// Shared by `NativeWriteOptions` and `DatasetOpenOptions`. An absent optional
+/// leaves `holder.list` zeroed and means native None; an engaged vector, even
+/// empty, fills the list and means native Some (empty or populated).
+inline void build_base_store_params(
+    const std::optional<std::vector<DatasetBaseStoreParams>>& base_store_params,
+    BaseStoreParamsHolder& holder) {
+    if (!base_store_params) return;
+    holder.paths.reserve(base_store_params->size());
+    holder.views.reserve(base_store_params->size());
+    for (const auto& entry : *base_store_params) {
+        holder.paths.push_back(entry.base_path);
+    }
+    for (std::size_t index = 0; index < base_store_params->size(); ++index) {
+        const auto& entry = (*base_store_params)[index];
+        LanceBaseStoreParams view{};
+        view.base_path = holder.paths[index].c_str();
+        view.storage_options_accessor =
+            entry.storage_options_accessor
+                ? entry.storage_options_accessor->c_handle()
+                : nullptr;
+        if (entry.block_size) {
+            view.has_block_size = 1;
+            view.block_size = *entry.block_size;
+        }
+        if (entry.s3_credentials_refresh_offset) {
+            view.has_s3_credentials_refresh_offset = 1;
+            view.s3_credentials_refresh_seconds =
+                entry.s3_credentials_refresh_offset->seconds;
+            view.s3_credentials_refresh_nanos =
+                entry.s3_credentials_refresh_offset->nanos;
+        }
+        if (entry.use_constant_size_upload_parts) {
+            view.has_use_constant_size_upload_parts = 1;
+            view.use_constant_size_upload_parts =
+                *entry.use_constant_size_upload_parts;
+        }
+        if (entry.list_is_lexically_ordered) {
+            view.has_list_is_lexically_ordered = 1;
+            view.list_is_lexically_ordered =
+                *entry.list_is_lexically_ordered;
+        }
+        holder.views.push_back(view);
+    }
+    holder.list.items =
+        holder.views.empty() ? nullptr : holder.views.data();
+    holder.list.count = holder.views.size();
+}
+
 struct BuildState {
     LanceAutoCleanupParams cleanup{};
     LanceWriteOptions write{};
@@ -3520,9 +3589,7 @@ struct BuildState {
     std::vector<const char*> target_name_ptrs;
     LanceStringList target_name_list{};
 
-    std::vector<std::string> base_store_paths;
-    std::vector<LanceBaseStoreParams> base_store_views;
-    LanceBaseStoreParamsList base_store_list{};
+    BaseStoreParamsHolder base_store;
 
     LanceFileWriterOptions file_options{};
 
@@ -3554,52 +3621,6 @@ inline void build_initial_bases(
     state.base_list.items =
         state.base_views.empty() ? &state.empty_base : state.base_views.data();
     state.base_list.count = state.base_views.size();
-}
-
-inline void build_base_store_params(
-    const std::optional<std::vector<DatasetBaseStoreParams>>& base_store_params,
-    BuildState& state) {
-    if (!base_store_params) return;
-    state.base_store_paths.reserve(base_store_params->size());
-    state.base_store_views.reserve(base_store_params->size());
-    for (const auto& entry : *base_store_params) {
-        state.base_store_paths.push_back(entry.base_path);
-    }
-    for (std::size_t index = 0; index < base_store_params->size(); ++index) {
-        const auto& entry = (*base_store_params)[index];
-        LanceBaseStoreParams view{};
-        view.base_path = state.base_store_paths[index].c_str();
-        view.storage_options_accessor =
-            entry.storage_options_accessor
-                ? entry.storage_options_accessor->c_handle()
-                : nullptr;
-        if (entry.block_size) {
-            view.has_block_size = 1;
-            view.block_size = *entry.block_size;
-        }
-        if (entry.s3_credentials_refresh_offset) {
-            view.has_s3_credentials_refresh_offset = 1;
-            view.s3_credentials_refresh_seconds =
-                entry.s3_credentials_refresh_offset->seconds;
-            view.s3_credentials_refresh_nanos =
-                entry.s3_credentials_refresh_offset->nanos;
-        }
-        if (entry.use_constant_size_upload_parts) {
-            view.has_use_constant_size_upload_parts = 1;
-            view.use_constant_size_upload_parts =
-                *entry.use_constant_size_upload_parts;
-        }
-        if (entry.list_is_lexically_ordered) {
-            view.has_list_is_lexically_ordered = 1;
-            view.list_is_lexically_ordered =
-                *entry.list_is_lexically_ordered;
-        }
-        state.base_store_views.push_back(view);
-    }
-    state.base_store_list.items = state.base_store_views.empty()
-                                      ? nullptr
-                                      : state.base_store_views.data();
-    state.base_store_list.count = state.base_store_views.size();
 }
 
 }  // namespace native_write_options_detail
@@ -3651,7 +3672,7 @@ inline NativeWriteOptions::NativeWriteOptions(
         state.target_name_list.count = state.target_name_ptrs.size();
     }
 
-    build_base_store_params(spec.base_store_params, state);
+    build_base_store_params(spec.base_store_params, state.base_store);
 
     if (spec.file_writer_options) {
         if (spec.file_writer_options->data_cache_bytes) {
@@ -3708,7 +3729,7 @@ inline NativeWriteOptions::NativeWriteOptions(
     c_spec.has_target_all_bases = spec.target_all_bases ? 1 : 0;
     c_spec.target_all_bases = spec.target_all_bases.value_or(false);
     c_spec.base_store_params =
-        spec.base_store_params ? &state.base_store_list : nullptr;
+        spec.base_store_params ? &state.base_store.list : nullptr;
     c_spec.allow_external_blob_outside_bases =
         spec.allow_external_blob_outside_bases;
     c_spec.external_blob_mode =
@@ -7783,10 +7804,14 @@ public:
             options.storage_options_accessor
                 ? options.storage_options_accessor->c_handle()
                 : nullptr;
-        auto* ds = lance_dataset_open_with_options(
+        native_write_options_detail::BaseStoreParamsHolder base_store;
+        native_write_options_detail::build_base_store_params(
+            options.base_store_params, base_store);
+        auto* ds = lance_dataset_open_with_base_store_params(
             uri.c_str(),
             &c_options,
-            session ? session->c_handle() : nullptr);
+            session ? session->c_handle() : nullptr,
+            options.base_store_params ? &base_store.list : nullptr);
         if (!ds) check_error();
         return Dataset(ds);
     }
@@ -8813,6 +8838,44 @@ public:
         auto* out = lance_dataset_checkout_ref(
             handle_.get(), reference.c_handle());
         if (!out) check_error();
+        return Dataset(out);
+    }
+
+    /// Shallow clone this handle's snapshot into `target_path`.
+    ///
+    /// Native `Dataset::shallow_clone` publishes a metadata-only target that
+    /// reuses the source base paths instead of copying data files.
+    /// `reference == nullptr` clones the handle's current snapshot (branch and
+    /// version id pinned); it does not select the latest head. Pass
+    /// `Ref::version(std::nullopt, std::nullopt)` to clone the current head of
+    /// the default branch. `storage_options == nullptr` passes native None,
+    /// which inherits the source dataset-level store params as native shallow
+    /// clone does; otherwise the accessor's native Arc is forwarded as-is when
+    /// it holds static options or a provider (an accessor with neither passes
+    /// None), without resolving or copying credentials.
+    ///
+    /// The target is resolved through the source handle's session registry.
+    /// The returned dataset retains runtime source store params for its base
+    /// paths, so it can read shared source files after the source handle is
+    /// closed. Those params are not persisted: a later reopen needs
+    /// `DatasetOpenOptions::base_store_params` when the default store
+    /// configuration cannot read a base. A target with a published dataset is
+    /// rejected before writes; later failures may leave partial files,
+    /// including tagged index files, without rollback. No reopen, credential
+    /// persistence, cloud guarantee, or custom ObjectStore API is added here.
+    Dataset shallow_clone(
+        const std::string& target_path,
+        const Ref* reference = nullptr,
+        const StorageOptionsAccessor* storage_options = nullptr) const {
+        LanceDataset* out = nullptr;
+        if (lance_dataset_shallow_clone(
+                handle_.get(),
+                target_path.c_str(),
+                reference ? reference->c_handle() : nullptr,
+                storage_options ? storage_options->c_handle() : nullptr,
+                &out) != 0) {
+            check_error();
+        }
         return Dataset(out);
     }
 

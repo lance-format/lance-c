@@ -5473,6 +5473,180 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
     PASS();
 }
 
+static std::vector<int32_t> cpp_scan_ids(lance::Dataset& dataset) {
+    auto scanner = dataset.scan();
+    scanner.project(std::vector<lance::ProjectionColumn>{{"id", "id"}});
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    std::vector<int32_t> ids;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        const int rc = stream.get_next(&stream, &array);
+        if (rc != 0) {
+            const char* error = stream.get_last_error
+                ? stream.get_last_error(&stream)
+                : nullptr;
+            std::string message = error ? error : "Arrow stream get_next failed";
+            if (stream.release) stream.release(&stream);
+            throw std::runtime_error(message);
+        }
+        if (!array.release) break;
+        assert(array.n_children == 1);
+        const ArrowArray* column = array.children[0];
+        assert(column->n_buffers >= 2 && column->buffers[1] != nullptr);
+        const auto* values = static_cast<const int32_t*>(column->buffers[1]);
+        for (int64_t row = 0; row < array.length; ++row) {
+            ids.push_back(values[row]);
+        }
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+static std::string cpp_root_base_path(lance::Dataset& dataset) {
+    const std::string json = dataset.base_paths_json();
+    const auto root = json.find("\"is_dataset_root\":true");
+    if (root == std::string::npos) {
+        throw std::runtime_error("base_paths_json has no dataset root");
+    }
+    const std::string marker = "\"path\":\"";
+    auto start = json.find(marker, root);
+    if (start == std::string::npos) {
+        start = json.rfind(marker, root);
+    }
+    if (start == std::string::npos) {
+        throw std::runtime_error("base_paths_json root has no path");
+    }
+    start += marker.size();
+    const auto end = json.find('"', start);
+    if (end == std::string::npos) {
+        throw std::runtime_error("base_paths_json root path is unterminated");
+    }
+    return json.substr(start, end - start);
+}
+
+static void test_dataset_shallow_clone_base_store_params(
+    const std::string& feature_uri) {
+    TEST(test_dataset_shallow_clone_base_store_params);
+
+    const std::string suffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string target =
+        "shared-memory://cpp-shallow-" + suffix + "/target.lance";
+
+    lance::StorageOptionsAccessor source_accessor(
+        std::optional<lance::StorageOptions>{
+            lance::StorageOptions{{"local_fsync", "true"}}},
+        nullptr);
+    lance::StorageOptionsAccessor invalid_target_accessor(
+        std::optional<lance::StorageOptions>{
+            lance::StorageOptions{{"local_fsync", "invalid"}}},
+        nullptr);
+
+    lance::DatasetOpenOptions source_options;
+    source_options.storage_options_accessor = &source_accessor;
+
+    uint64_t source_version = 0;
+    std::string source_base;
+    std::vector<int32_t> source_ids;
+    std::unique_ptr<lance::Dataset> cloned;
+    {
+        auto source =
+            lance::Dataset::open_with_options(feature_uri, source_options);
+        source_version = source.version();
+        source_ids = cpp_scan_ids(source);
+        assert(!source_ids.empty());
+        source_base = cpp_root_base_path(source);
+
+        // The target accepts the static options (shared-memory ignores them),
+        // while the clone keeps the source's valid params for the local base.
+        cloned = std::make_unique<lance::Dataset>(source.shallow_clone(
+            target, nullptr, &invalid_target_accessor));
+        assert(cloned->version() == source_version);
+        assert(cpp_scan_ids(*cloned) == source_ids);
+    }
+
+    // The returned handle retains runtime base params after the source closes.
+    assert(cpp_scan_ids(*cloned) == source_ids);
+
+    // Without per-base bindings the local base falls back to the target's
+    // invalid dataset-level accessor and fails when it rebuilds that store.
+    lance::DatasetOpenOptions reopen_target_options;
+    reopen_target_options.storage_options_accessor = &invalid_target_accessor;
+    {
+        auto missing =
+            lance::Dataset::open_with_options(target, reopen_target_options);
+        bool failed = false;
+        try {
+            (void)cpp_scan_ids(missing);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        assert(failed && "reading the local base without bindings must fail");
+    }
+
+    // A non-matching key does not bind the local base.
+    lance::DatasetBaseStoreParams wrong;
+    wrong.base_path = "shared-memory://unrelated/base";
+    lance::DatasetOpenOptions wrong_options;
+    wrong_options.storage_options_accessor = &invalid_target_accessor;
+    wrong_options.base_store_params =
+        std::vector<lance::DatasetBaseStoreParams>{wrong};
+    {
+        auto wrong_open =
+            lance::Dataset::open_with_options(target, wrong_options);
+        bool failed = false;
+        try {
+            (void)cpp_scan_ids(wrong_open);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        assert(failed && "a non-matching base path must not bind the base");
+    }
+
+    // An exact valid binding restores reads through a fresh handle.
+    lance::DatasetBaseStoreParams binding;
+    binding.base_path = source_base;
+    binding.storage_options_accessor = &source_accessor;
+    lance::DatasetOpenOptions reopen_options;
+    reopen_options.storage_options_accessor = &invalid_target_accessor;
+    reopen_options.base_store_params =
+        std::vector<lance::DatasetBaseStoreParams>{binding};
+    {
+        auto reopened =
+            lance::Dataset::open_with_options(target, reopen_options);
+        assert(reopened.version() == source_version);
+        assert(cpp_scan_ids(reopened) == source_ids);
+    }
+
+    // Explicit invalid target options fail in native policy before the local
+    // target is published; the wrapper surfaces the native message.
+    const std::string rejected =
+        feature_uri + ".cpp-shallow-rejected-" + suffix;
+    bool rejected_error = false;
+    try {
+        (void)cloned->shallow_clone(
+            rejected, nullptr, &invalid_target_accessor);
+    } catch (const lance::Error& error) {
+        rejected_error =
+            std::string(error.what()).find("local_fsync") != std::string::npos;
+    }
+    assert(rejected_error && "invalid target options must throw");
+
+    // A NULL accessor inherits native source params for the chained target and
+    // keeps the original shared base binding for reads.
+    auto inherited = cloned->shallow_clone(target + ".inherited");
+    assert(inherited.version() == source_version);
+    assert(cpp_scan_ids(inherited) == source_ids);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 12) {
         fprintf(stderr,
@@ -5542,6 +5716,7 @@ int main(int argc, char** argv) {
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_dataset_deep_clone(fragment_read_uri);
+    test_dataset_shallow_clone_base_store_params(fragment_read_uri);
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
     test_native_write_base_and_presence(uri, write_uri);

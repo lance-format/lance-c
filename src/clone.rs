@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Native dataset deep clone.
+//! Native dataset deep and shallow clone.
 //!
-//! The C entry point delegates the whole operation to Lance's
-//! `Dataset::deep_clone`. This module owns the FFI translation: source snapshot
-//! capture, NULL-reference defaulting, and passing the target storage-options
-//! accessor through as a native `ObjectStoreParams`.
+//! The C entry points delegate the whole operation to Lance's
+//! `Dataset::deep_clone` and `Dataset::shallow_clone`. This module owns the FFI
+//! translation: source snapshot capture, NULL-reference defaulting, and passing
+//! the target storage-options accessor through as a native
+//! `ObjectStoreParams`.
 
 use std::ffi::{c_char, c_int};
 use std::sync::{Arc, RwLock};
@@ -119,12 +120,114 @@ unsafe fn deep_clone_inner(
     Ok(0)
 }
 
+/// Shallow clone the dataset's current snapshot into `target_path`.
+///
+/// The source handle is not modified and no source write lock is held while
+/// the clone is committed: the handle's snapshot `Arc` is cloned and the native
+/// `Dataset` value is cloned before `Dataset::shallow_clone` runs.
+///
+/// - `reference == NULL` clones the source handle's current snapshot, using
+///   `Ref::Version(snapshot.manifest.branch, Some(snapshot.version_id()))`.
+///   This pins the snapshot; it does not select the latest head of the branch.
+/// - `target_storage_options == NULL` passes native `None`, so the target
+///   inherits the source dataset's dataset-level store parameters (with the
+///   store location rewritten to `target_path` by native code). A non-NULL
+///   accessor that holds static options and/or a provider contributes its
+///   native `Arc` to `ObjectStoreParams`; an accessor created with neither
+///   contributes native `None`. An accessor with an engaged static map, even
+///   an empty one, contributes `Some` and selects explicit target parameters.
+///   Credentials are not resolved or copied here.
+///
+/// The target is resolved through the same session and object-store registry
+/// that the source handle captured when it was opened (the native default
+/// session when it was opened without one). Schemes visible only to another
+/// registry are not available to this call.
+///
+/// Native shallow-clone semantics define the source location, reference
+/// resolution, and published version. The returned dataset retains the source
+/// store parameters for its base paths as a runtime binding, so it can read
+/// the shared source files after the source handle is closed. Those per-base
+/// bindings, and any accessor owners, are not persisted in the target manifest:
+/// reopening the clone in a new dataset handle requires supplying them again
+/// through `lance_dataset_open_with_base_store_params` when the default store
+/// configuration cannot read a base. This function does not reopen the target
+/// or cache source accessors for later opens.
+///
+/// A target that already contains a published dataset is rejected by the
+/// native preflight before any clone writes. Later native failures may leave
+/// partial files, including tagged index files, under `target_path`; the
+/// binding makes no rollback or added-atomicity claim and does not remove them.
+///
+/// The out handle is written only on success. The function exposes no native
+/// `ObjectStore` trait-object or arbitrary custom store API, and makes no
+/// availability or persistence guarantee for remote/cloud storage beyond what
+/// the configured providers return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_shallow_clone(
+    dataset: *const LanceDataset,
+    target_path: *const c_char,
+    reference: *const LanceRef,
+    target_storage_options: *const LanceStorageOptionsAccessor,
+    out: *mut *mut LanceDataset,
+) -> c_int {
+    ffi_try!(
+        unsafe {
+            shallow_clone_inner(dataset, target_path, reference, target_storage_options, out)
+        },
+        -1
+    )
+}
+
+unsafe fn shallow_clone_inner(
+    dataset: *const LanceDataset,
+    target_path: *const c_char,
+    reference: *const LanceRef,
+    target_storage_options: *const LanceStorageOptionsAccessor,
+    out: *mut *mut LanceDataset,
+) -> Result<c_int> {
+    if out.is_null() {
+        return Err(invalid("out must not be NULL"));
+    }
+    if dataset.is_null() {
+        return Err(invalid("dataset must not be NULL"));
+    }
+    let target_path = unsafe { helpers::parse_c_string(target_path)? }
+        .ok_or_else(|| invalid("target_path must not be NULL"))?;
+    let snapshot = unsafe { &*dataset }.snapshot();
+    let reference = if reference.is_null() {
+        Ref::Version(
+            snapshot.manifest.branch.clone(),
+            Some(snapshot.version_id()),
+        )
+    } else {
+        unsafe { reference_at(reference)? }.clone()
+    };
+    // Reuse the accessor's Arc. It composes whatever static options or dynamic
+    // provider the caller configured; nothing is snapshotted into credentials.
+    let store_params =
+        storage_options_from_ffi(target_storage_options).map(|accessor| ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        });
+
+    // The mutable value is a private shallow clone. Native code may check out a
+    // different ref on it, which must not be visible through the source handle.
+    let mut source = Dataset::clone(&*snapshot);
+    let cloned = block_on(source.shallow_clone(target_path, reference, store_params))?;
+    let handle = Box::into_raw(Box::new(LanceDataset {
+        inner: RwLock::new(Arc::new(cloned)),
+    }));
+    unsafe { *out = handle };
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::sync::Arc;
 
+    use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
     };
@@ -141,11 +244,18 @@ mod tests {
 
     use super::*;
     use crate::dataset::{
-        lance_dataset_close, lance_dataset_count_rows, lance_dataset_open_with_session,
+        LanceDatasetOpenOptions, lance_dataset_close, lance_dataset_count_rows,
+        lance_dataset_open_with_base_store_params, lance_dataset_open_with_session,
         lance_dataset_version,
     };
-    use crate::error::{LanceErrorCode, lance_last_error_code};
+    use crate::error::{LanceErrorCode, lance_free_string, lance_last_error_code};
+    use crate::native_write_options::{LanceBaseStoreParams, LanceBaseStoreParamsList};
+    use crate::scanner::{lance_scanner_close, lance_scanner_new, lance_scanner_to_arrow_stream};
     use crate::session::LanceSession;
+    use crate::storage_options::{
+        LanceStorageOptionsInput, lance_storage_options_accessor_close,
+        lance_storage_options_accessor_new,
+    };
     use crate::versions::{
         lance_ref_close, lance_ref_tag, lance_ref_version, lance_ref_version_number,
     };
@@ -338,6 +448,146 @@ mod tests {
         .0
     }
 
+    fn accessor(options: &[(&str, &str)]) -> *mut LanceStorageOptionsAccessor {
+        let keys: Vec<CString> = options.iter().map(|(key, _)| c_string(key)).collect();
+        let values: Vec<CString> = options.iter().map(|(_, value)| c_string(value)).collect();
+        let key_ptrs: Vec<*const std::ffi::c_char> = keys.iter().map(|key| key.as_ptr()).collect();
+        let value_ptrs: Vec<*const std::ffi::c_char> =
+            values.iter().map(|value| value.as_ptr()).collect();
+        let input = LanceStorageOptionsInput {
+            keys: key_ptrs.as_ptr(),
+            values: value_ptrs.as_ptr(),
+            count: options.len(),
+        };
+        let handle = unsafe { lance_storage_options_accessor_new(&input, std::ptr::null()) };
+        assert!(!handle.is_null(), "{}", last_error());
+        handle
+    }
+
+    fn base_entry(
+        base_path: *const std::ffi::c_char,
+        accessor: *const LanceStorageOptionsAccessor,
+    ) -> LanceBaseStoreParams {
+        LanceBaseStoreParams {
+            base_path,
+            storage_options_accessor: accessor,
+            has_block_size: 0,
+            block_size: 0,
+            has_s3_credentials_refresh_offset: 0,
+            s3_credentials_refresh_seconds: 0,
+            s3_credentials_refresh_nanos: 0,
+            has_use_constant_size_upload_parts: 0,
+            use_constant_size_upload_parts: false,
+            has_list_is_lexically_ordered: 0,
+            list_is_lexically_ordered: false,
+        }
+    }
+
+    fn open_with_base(
+        dataset_uri: &str,
+        options: *const LanceDatasetOpenOptions,
+        session: &Session,
+        base_store_params: *const LanceBaseStoreParamsList,
+    ) -> *mut LanceDataset {
+        let uri = c_string(dataset_uri);
+        let handle = LanceSession {
+            inner: Arc::new(session.clone()),
+        };
+        unsafe {
+            lance_dataset_open_with_base_store_params(
+                uri.as_ptr(),
+                options,
+                &handle as *const LanceSession,
+                base_store_params,
+            )
+        }
+    }
+
+    fn try_c_rows(dataset: *const LanceDataset) -> Result<Vec<i32>, String> {
+        let scanner = unsafe { lance_scanner_new(dataset, std::ptr::null(), std::ptr::null()) };
+        if scanner.is_null() {
+            return Err(format!("lance_scanner_new: {}", last_error()));
+        }
+        let mut stream = FFI_ArrowArrayStream::empty();
+        if unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) } != 0 {
+            let error = last_error();
+            unsafe { lance_scanner_close(scanner) };
+            return Err(format!("lance_scanner_to_arrow_stream: {error}"));
+        }
+        let reader = match unsafe { ArrowArrayStreamReader::from_raw(&mut stream) } {
+            Ok(reader) => reader,
+            Err(error) => {
+                unsafe { lance_scanner_close(scanner) };
+                return Err(format!("ArrowArrayStreamReader: {error}"));
+            }
+        };
+        let mut ids = Vec::new();
+        for batch in reader {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    unsafe { lance_scanner_close(scanner) };
+                    return Err(format!("stream read: {error}"));
+                }
+            };
+            let column = batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id Int32");
+            ids.extend(column.values().iter().copied());
+        }
+        unsafe { lance_scanner_close(scanner) };
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    fn c_rows(dataset: *const LanceDataset) -> Vec<i32> {
+        try_c_rows(dataset).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn root_base_path(dataset: *const LanceDataset) -> String {
+        let json = unsafe { crate::base_paths::lance_dataset_base_paths_json(dataset) };
+        assert!(!json.is_null(), "{}", last_error());
+        let json = unsafe { std::ffi::CStr::from_ptr(json) }
+            .to_str()
+            .expect("base paths JSON is UTF-8")
+            .to_string();
+        unsafe { lance_free_string(json) };
+        let value: serde_json::Value = serde_json::from_str(&json).expect("base paths JSON");
+        value
+            .as_object()
+            .expect("base paths object")
+            .values()
+            .find(|base| base["is_dataset_root"] == true)
+            .expect("dataset root base")["path"]
+            .as_str()
+            .expect("base path string")
+            .to_string()
+    }
+
+    fn file_count(root: &std::path::Path) -> usize {
+        if !root.exists() {
+            return 0;
+        }
+        let mut count = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).expect("read dir") {
+                let entry = entry.expect("dir entry");
+                if entry.file_type().expect("file type").is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    const SHALLOW_ROWS: [i32; 5] = [0, 1, 2, 4, 5];
+
     fn open_c(dataset_uri: &str, session: &Session) -> *mut LanceDataset {
         let uri = c_string(dataset_uri);
         let handle = LanceSession {
@@ -351,6 +601,364 @@ mod tests {
                 &handle as *const LanceSession,
             )
         }
+    }
+
+    #[test]
+    fn shallow_clone_cross_store_retains_source_params_and_reopens_with_base_bindings() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("source.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let dst_uri = memory_uri(&format!("shallow-{suffix}"), "target.lance");
+        let chain_uri = memory_uri(&format!("shallow-{suffix}-chain"), "target.lance");
+        let session = default_session();
+        write_source(session.clone(), &src_uri);
+
+        let source_accessor = accessor(&[("local_fsync", "true")]);
+        let invalid_target_accessor = accessor(&[("local_fsync", "invalid")]);
+        let source_options = LanceDatasetOpenOptions {
+            version: 0,
+            storage_options_accessor: source_accessor,
+        };
+        let source = open_with_base(&src_uri, &source_options, &session, std::ptr::null());
+        assert!(!source.is_null(), "{}", last_error());
+        let source_version = unsafe { lance_dataset_version(source) };
+        let source_base = root_base_path(source);
+
+        let dst_c = c_string(&dst_uri);
+        let mut cloned: *mut LanceDataset = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_dataset_shallow_clone(
+                    source,
+                    dst_c.as_ptr(),
+                    std::ptr::null(),
+                    invalid_target_accessor,
+                    &mut cloned,
+                )
+            },
+            0,
+            "{}",
+            last_error()
+        );
+        assert!(!cloned.is_null());
+        assert_eq!(
+            unsafe { lance_dataset_version(cloned) },
+            source_version,
+            "shallow clone must keep the native snapshot version"
+        );
+        assert_eq!(c_rows(cloned), SHALLOW_ROWS);
+
+        // The returned handle retains the source base params. It reads shared
+        // source files after the source handle is closed.
+        unsafe { lance_dataset_close(source) };
+        assert_eq!(c_rows(cloned), SHALLOW_ROWS);
+
+        // A fresh open sees only the persisted manifest. The target-level
+        // accessor is valid for the memory target but invalid for the local
+        // source base, so base resolution must be supplied again.
+        let target_options = LanceDatasetOpenOptions {
+            version: 0,
+            storage_options_accessor: invalid_target_accessor,
+        };
+        let no_binding = open_with_base(&dst_uri, &target_options, &session, std::ptr::null());
+        assert!(!no_binding.is_null(), "{}", last_error());
+        let error = try_c_rows(no_binding).expect_err("missing source base binding must fail");
+        assert!(error.contains("local_fsync"), "{error}");
+        unsafe { lance_dataset_close(no_binding) };
+
+        let wrong_c = c_string("shared-memory://unrelated/base");
+        let wrong_entry = base_entry(wrong_c.as_ptr(), source_accessor);
+        let wrong_list = LanceBaseStoreParamsList {
+            items: &wrong_entry,
+            count: 1,
+        };
+        let wrong_open = open_with_base(&dst_uri, &target_options, &session, &wrong_list);
+        assert!(!wrong_open.is_null(), "{}", last_error());
+        let error = try_c_rows(wrong_open).expect_err("non-matching base key must not bind");
+        assert!(error.contains("local_fsync"), "{error}");
+        unsafe { lance_dataset_close(wrong_open) };
+
+        let source_base_c = c_string(&source_base);
+        let source_entry = base_entry(source_base_c.as_ptr(), source_accessor);
+        let source_list = LanceBaseStoreParamsList {
+            items: &source_entry,
+            count: 1,
+        };
+        let reopened = open_with_base(&dst_uri, &target_options, &session, &source_list);
+        assert!(!reopened.is_null(), "{}", last_error());
+        assert_eq!(
+            try_c_rows(reopened).expect("bound reopen reads"),
+            SHALLOW_ROWS
+        );
+        unsafe { lance_dataset_close(reopened) };
+
+        // A chained shallow clone inherited the original source binding from
+        // the intermediate clone, not the intermediate target accessor.
+        let chain_c = c_string(&chain_uri);
+        let mut chained: *mut LanceDataset = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_dataset_shallow_clone(
+                    cloned,
+                    chain_c.as_ptr(),
+                    std::ptr::null(),
+                    invalid_target_accessor,
+                    &mut chained,
+                )
+            },
+            0,
+            "{}",
+            last_error()
+        );
+        unsafe { lance_dataset_close(cloned) };
+        assert_eq!(c_rows(chained), SHALLOW_ROWS);
+        unsafe { lance_dataset_close(chained) };
+
+        // The source dataset did not change.
+        let source_reopened =
+            open_with_base(&src_uri, std::ptr::null(), &session, std::ptr::null());
+        assert!(!source_reopened.is_null(), "{}", last_error());
+        assert_eq!(
+            unsafe { lance_dataset_version(source_reopened) },
+            source_version
+        );
+        assert_eq!(c_rows(source_reopened), SHALLOW_ROWS);
+        unsafe { lance_dataset_close(source_reopened) };
+
+        unsafe {
+            lance_storage_options_accessor_close(source_accessor);
+            lance_storage_options_accessor_close(invalid_target_accessor);
+        }
+    }
+
+    #[test]
+    fn shallow_clone_local_target_is_metadata_only_and_protects_existing_target() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("source.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let dst_uri = dst_dir
+            .path()
+            .join("target.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let session = default_session();
+        write_source(session.clone(), &src_uri);
+
+        let source = open_c(&src_uri, &session);
+        assert!(!source.is_null(), "{}", last_error());
+        let source_version = unsafe { lance_dataset_version(source) };
+        let dst_c = c_string(&dst_uri);
+        let mut cloned: *mut LanceDataset = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_dataset_shallow_clone(
+                    source,
+                    dst_c.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut cloned,
+                )
+            },
+            0,
+            "{}",
+            last_error()
+        );
+        assert_eq!(unsafe { lance_dataset_version(cloned) }, source_version);
+        assert_eq!(c_rows(cloned), SHALLOW_ROWS);
+        assert_eq!(
+            file_count(&std::path::Path::new(&dst_uri).join("data")),
+            0,
+            "shallow clone must not copy data files"
+        );
+        let clone_base = root_base_path(cloned);
+        assert_eq!(clone_base, root_base_path(source));
+
+        // The source handle and its data are unchanged.
+        assert_eq!(c_rows(source), SHALLOW_ROWS);
+        assert_eq!(unsafe { lance_dataset_version(source) }, source_version);
+
+        // Existing published target: native preflight rejects without writing
+        // the out handle or changing the existing content.
+        let mut sentinel = 0x1 as *mut LanceDataset;
+        assert_eq!(
+            unsafe {
+                lance_dataset_shallow_clone(
+                    source,
+                    dst_c.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut sentinel,
+                )
+            },
+            -1
+        );
+        assert_eq!(sentinel as usize, 0x1, "out written on failure");
+        assert_eq!(
+            lance_last_error_code(),
+            LanceErrorCode::DatasetAlreadyExists
+        );
+        assert_eq!(c_rows(cloned), SHALLOW_ROWS);
+        unsafe {
+            lance_dataset_close(cloned);
+            lance_dataset_close(source);
+        }
+    }
+
+    #[test]
+    fn shallow_clone_uses_explicit_target_options_and_null_inherits_source() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("source.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let dst_uri = dst_dir
+            .path()
+            .join("target.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let session = default_session();
+        write_source(session.clone(), &src_uri);
+
+        let source = open_c(&src_uri, &session);
+        assert!(!source.is_null(), "{}", last_error());
+        let invalid_target_accessor = accessor(&[("local_fsync", "invalid")]);
+        let dst_c = c_string(&dst_uri);
+
+        let mut out: *mut LanceDataset = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lance_dataset_shallow_clone(
+                    source,
+                    dst_c.as_ptr(),
+                    std::ptr::null(),
+                    invalid_target_accessor,
+                    &mut out,
+                )
+            },
+            -1
+        );
+        assert!(out.is_null(), "out written on failure");
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(last_error().contains("local_fsync"), "{}", last_error());
+        assert!(
+            !std::path::Path::new(&dst_uri).join("_versions").exists(),
+            "failed target setup must not publish metadata"
+        );
+
+        // NULL forwards native None, so the target inherits the source's
+        // dataset-level params instead of the rejected explicit accessor.
+        assert_eq!(
+            unsafe {
+                lance_dataset_shallow_clone(
+                    source,
+                    dst_c.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut out,
+                )
+            },
+            0,
+            "{}",
+            last_error()
+        );
+        assert_eq!(c_rows(out), SHALLOW_ROWS);
+        unsafe {
+            lance_dataset_close(out);
+            lance_dataset_close(source);
+            lance_storage_options_accessor_close(invalid_target_accessor);
+        }
+    }
+
+    #[test]
+    fn open_with_base_store_params_validates_the_list_and_applies_bindings() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_uri = src_dir
+            .path()
+            .join("source.lance")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let session = default_session();
+        write_source(session.clone(), &src_uri);
+
+        let missing_items = LanceBaseStoreParamsList {
+            items: std::ptr::null(),
+            count: 1,
+        };
+        let opened = open_with_base(&src_uri, std::ptr::null(), &session, &missing_items);
+        assert!(opened.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(
+            last_error().contains("base_store_params.items must not be NULL when count = 1"),
+            "{}",
+            last_error()
+        );
+
+        let null_path = base_entry(std::ptr::null(), std::ptr::null());
+        let null_path_list = LanceBaseStoreParamsList {
+            items: &null_path,
+            count: 1,
+        };
+        let opened = open_with_base(&src_uri, std::ptr::null(), &session, &null_path_list);
+        assert!(opened.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        assert!(
+            last_error().contains("items[0].base_path must not be NULL"),
+            "{}",
+            last_error()
+        );
+
+        // Engaged empty list is native Some(empty) and adds no binding.
+        let empty = LanceBaseStoreParamsList {
+            items: std::ptr::null(),
+            count: 0,
+        };
+        let opened = open_with_base(&src_uri, std::ptr::null(), &session, &empty);
+        assert!(!opened.is_null(), "{}", last_error());
+        assert_eq!(c_rows(opened), SHALLOW_ROWS);
+        unsafe { lance_dataset_close(opened) };
+
+        // A well-formed binding for the dataset's own root base opens and
+        // leaves access through the normal dataset-level store path intact.
+        let base_c = c_string(&src_uri);
+        let entry = base_entry(base_c.as_ptr(), std::ptr::null());
+        let list = LanceBaseStoreParamsList {
+            items: &entry,
+            count: 1,
+        };
+        let opened = open_with_base(&src_uri, std::ptr::null(), &session, &list);
+        assert!(!opened.is_null(), "{}", last_error());
+        assert_eq!(c_rows(opened), SHALLOW_ROWS);
+        unsafe { lance_dataset_close(opened) };
+
+        // NULL options and session keep the existing open defaults.
+        let uri_c = c_string(&src_uri);
+        let opened = unsafe {
+            lance_dataset_open_with_base_store_params(
+                uri_c.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!opened.is_null(), "{}", last_error());
+        assert_eq!(c_rows(opened), SHALLOW_ROWS);
+        unsafe { lance_dataset_close(opened) };
     }
 
     #[test]
