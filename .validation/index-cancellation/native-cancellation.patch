@@ -1,0 +1,376 @@
+diff --git a/rust/lance-index/Cargo.toml b/rust/lance-index/Cargo.toml
+index c5ecd22bf..22eae5b82 100644
+--- a/rust/lance-index/Cargo.toml
++++ b/rust/lance-index/Cargo.toml
+@@ -72,6 +72,7 @@ blake3.workspace = true
+ # posting-list builder small.
+ smallvec = { version = "1.15", features = ["union"] }
+ tokio.workspace = true
++tokio-util.workspace = true
+ tracing.workspace = true
+ twox-hash.workspace = true
+ tempfile.workspace = true
+diff --git a/rust/lance-index/src/progress.rs b/rust/lance-index/src/progress.rs
+index b02ec4280..6f5740555 100644
+--- a/rust/lance-index/src/progress.rs
++++ b/rust/lance-index/src/progress.rs
+@@ -2,8 +2,10 @@
+ // SPDX-FileCopyrightText: Copyright The Lance Authors
+ 
+ use async_trait::async_trait;
+-use lance_core::Result;
++use lance_core::{Error, Result};
++use std::fmt;
+ use std::sync::Arc;
++use tokio_util::sync::CancellationToken;
+ 
+ /// Progress callback for index building and distributed index finalization.
+ ///
+@@ -30,6 +32,45 @@ pub trait IndexBuildProgress: std::fmt::Debug + Sync + Send {
+ 
+     /// A named stage has completed.
+     async fn stage_complete(&self, stage: &str) -> Result<()>;
++
++    /// Returns an error when the build has been cancelled.
++    ///
++    /// Native builders call this at checkpoints that are not stage
++    /// boundaries, such as before publication. The default implementation
++    /// never cancels, which keeps existing progress implementations source
++    /// compatible and leaves the default no-cancellation path unchanged.
++    async fn check_cancelled(&self) -> Result<()> {
++        Ok(())
++    }
++}
++
++/// Typed source for a cooperatively cancelled index build.
++///
++/// The error travels through the existing [`Error::External`] representation,
++/// so the public core error enum stays unchanged. Recover it with
++/// [`is_index_build_cancelled`] or downcast the external source.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct IndexBuildCancelled;
++
++impl fmt::Display for IndexBuildCancelled {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("index build was cancelled at a cooperative checkpoint")
++    }
++}
++
++impl std::error::Error for IndexBuildCancelled {}
++
++/// Creates the typed cancellation error returned to a native index builder.
++pub fn index_build_cancelled() -> Error {
++    Error::external(Box::new(IndexBuildCancelled))
++}
++
++/// Returns whether `err` is the typed native cancellation source.
++///
++/// Unrelated observer and I/O errors keep their own identity and return
++/// `false`.
++pub fn is_index_build_cancelled(err: &Error) -> bool {
++    matches!(err, Error::External { source } if source.is::<IndexBuildCancelled>())
+ }
+ 
+ #[derive(Debug, Clone, Default)]
+@@ -52,3 +93,56 @@ impl IndexBuildProgress for NoopIndexBuildProgress {
+ pub fn noop_progress() -> Arc<dyn IndexBuildProgress> {
+     Arc::new(NoopIndexBuildProgress)
+ }
++
++/// Wraps an existing progress observer with a cooperative cancellation token.
++///
++/// Every observer call first consults the token, then forwards to the wrapped
++/// observer. The adapter also overrides [`IndexBuildProgress::check_cancelled`],
++/// so native builders can consult the same token at non-stage checkpoints.
++/// Observer errors are forwarded unchanged and are not reclassified as
++/// cancellation.
++#[derive(Debug, Clone)]
++pub struct CancellableIndexBuildProgress {
++    inner: Arc<dyn IndexBuildProgress>,
++    cancellation: CancellationToken,
++}
++
++impl CancellableIndexBuildProgress {
++    pub fn new(inner: Arc<dyn IndexBuildProgress>, cancellation: CancellationToken) -> Self {
++        Self {
++            inner,
++            cancellation,
++        }
++    }
++
++    fn check_token(&self) -> Result<()> {
++        if self.cancellation.is_cancelled() {
++            Err(index_build_cancelled())
++        } else {
++            Ok(())
++        }
++    }
++}
++
++#[async_trait]
++impl IndexBuildProgress for CancellableIndexBuildProgress {
++    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> Result<()> {
++        self.check_cancelled().await?;
++        self.inner.stage_start(stage, total, unit).await
++    }
++
++    async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
++        self.check_cancelled().await?;
++        self.inner.stage_progress(stage, completed).await
++    }
++
++    async fn stage_complete(&self, stage: &str) -> Result<()> {
++        self.check_cancelled().await?;
++        self.inner.stage_complete(stage).await
++    }
++
++    async fn check_cancelled(&self) -> Result<()> {
++        self.check_token()?;
++        self.inner.check_cancelled().await
++    }
++}
+diff --git a/rust/lance-index/src/scalar/btree.rs b/rust/lance-index/src/scalar/btree.rs
+index d1401bdc7..064e96856 100644
+--- a/rust/lance-index/src/scalar/btree.rs
++++ b/rust/lance-index/src/scalar/btree.rs
+@@ -3050,6 +3050,27 @@ pub async fn train_btree_index(
+     fragment_ids: Option<Vec<u32>>,
+     range_id: Option<u32>,
+ ) -> Result<Vec<IndexFile>> {
++    train_btree_index_with_progress(
++        batches_source,
++        index_store,
++        batch_size,
++        fragment_ids,
++        range_id,
++        noop_progress(),
++    )
++    .await
++}
++
++/// Train a btree index while reporting page-building progress.
++pub async fn train_btree_index_with_progress(
++    batches_source: SendableRecordBatchStream,
++    index_store: &dyn IndexStore,
++    batch_size: u64,
++    fragment_ids: Option<Vec<u32>>,
++    range_id: Option<u32>,
++    progress: Arc<dyn IndexBuildProgress>,
++) -> Result<Vec<IndexFile>> {
++    progress.check_cancelled().await?;
+     // Create `partition_id` for distributed index building.
+     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
+     // that index partitions generated by different workers do not conflict.
+@@ -3075,6 +3096,8 @@ pub async fn train_btree_index(
+         Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+     ]));
+ 
++    progress.stage_start("build_pages", None, "batches").await?;
++
+     let mut sub_index_file = match partition_id {
+         None => {
+             index_store
+@@ -3103,6 +3126,7 @@ pub async fn train_btree_index(
+     let mut batches_source = chunk_concat_stream(batches_source, batch_size as usize);
+ 
+     while let Some(batch) = batches_source.try_next().await? {
++        progress.check_cancelled().await?;
+         encoded_batches.push(
+             train_btree_page(
+                 batch,
+@@ -3113,7 +3137,12 @@ pub async fn train_btree_index(
+             .await?,
+         );
+         batch_idx += 1;
++        progress
++            .stage_progress("build_pages", batch_idx as u64)
++            .await?;
+     }
++    progress.stage_complete("build_pages").await?;
++    progress.check_cancelled().await?;
+     let pages_file = sub_index_file.finish().await?;
+     let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
+     let mut file_schema = record_batch.schema().as_ref().clone();
+@@ -3773,7 +3802,7 @@ impl BasicTrainer for BTreeIndexPlugin {
+         index_store: &dyn IndexStore,
+         request: Box<dyn TrainingRequest>,
+         _fragment_ids: Option<Vec<u32>>,
+-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
++        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+     ) -> Result<CreatedIndex> {
+         let request = request
+             .as_any()
+@@ -3793,7 +3822,7 @@ impl BasicTrainer for BTreeIndexPlugin {
+                  The `range_id` field will be removed in a future release."
+             );
+         }
+-        let files = train_btree_index(
++        let files = train_btree_index_with_progress(
+             data,
+             index_store,
+             request
+@@ -3802,6 +3831,7 @@ impl BasicTrainer for BTreeIndexPlugin {
+                 .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
+             None,
+             None,
++            progress,
+         )
+         .await?;
+         Ok(CreatedIndex {
+diff --git a/rust/lance/src/index/create.rs b/rust/lance/src/index/create.rs
+index 1a92152fb..608d38b7e 100644
+--- a/rust/lance/src/index/create.rs
++++ b/rust/lance/src/index/create.rs
+@@ -180,6 +180,8 @@ impl<'a> CreateIndexBuilder<'a> {
+ 
+     fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+         async move {
++        // Reject an already-cancelled request before planning or reading any index data.
++        self.progress.check_cancelled().await?;
+         if self.columns.len() != 1 {
+             return Err(Error::index(
+                 "Only support building index on 1 column at the moment".to_string(),
+@@ -688,6 +690,9 @@ impl<'a> CreateIndexBuilder<'a> {
+         };
+         // A generic scalar request only resolves to an implementation here.
+         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
++        // A request observed before the uncommitted result is returned must not
++        // look like a usable index to the caller.
++        self.progress.check_cancelled().await?;
+         Ok(index_metadata)
+         }
+         .boxed()
+@@ -695,6 +700,7 @@ impl<'a> CreateIndexBuilder<'a> {
+ 
+     #[instrument(skip_all)]
+     async fn execute(mut self) -> Result<IndexMetadata> {
++        self.progress.check_cancelled().await?;
+         // Multi-segment FM-Index path: when num_segments > 1, build one segment
+         // per fragment group and commit them all atomically.
+         if let Some(num_segments) = self.fmindex_num_segments()
+@@ -715,6 +721,10 @@ impl<'a> CreateIndexBuilder<'a> {
+         } else {
+             vec![]
+         };
++        // Best-effort final checkpoint: a request observed here returns the typed
++        // cancellation instead of publishing this index. A request that arrives
++        // after this check may still lose to the commit below.
++        self.progress.check_cancelled().await?;
+         let transaction = TransactionBuilder::new(
+             new_idx.dataset_version,
+             Operation::CreateIndex {
+@@ -756,6 +766,8 @@ impl<'a> CreateIndexBuilder<'a> {
+ 
+     /// Build FM-Index with multiple segments, each covering a subset of fragments.
+     async fn execute_multi_segment_fmindex(&mut self, num_segments: u32) -> Result<IndexMetadata> {
++        // Reject an already-cancelled request before planning or reading any index data.
++        self.progress.check_cancelled().await?;
+         // Validate column count: same check as execute_uncommitted
+         if self.columns.len() != 1 {
+             return Err(Error::index(
+@@ -863,6 +875,8 @@ impl<'a> CreateIndexBuilder<'a> {
+                 vec![]
+             };
+ 
++            // Empty/untrained segments are published through their own commit path.
++            self.progress.check_cancelled().await?;
+             let transaction = TransactionBuilder::new(
+                 self.dataset.manifest.version,
+                 Operation::CreateIndex {
+@@ -891,6 +905,7 @@ impl<'a> CreateIndexBuilder<'a> {
+ 
+         let mut segment_metadatas = Vec::with_capacity(num_segments);
+         for chunk in all_fragment_ids.chunks(chunk_size) {
++            self.progress.check_cancelled().await?;
+             let fragment_ids = chunk.to_vec();
+             let segment_uuid = Uuid::new_v4();
+             let created_index = build_scalar_index(
+@@ -940,6 +955,8 @@ impl<'a> CreateIndexBuilder<'a> {
+             vec![]
+         };
+ 
++        // Trained multi-segment builds publish all segments through one commit.
++        self.progress.check_cancelled().await?;
+         let transaction = TransactionBuilder::new(
+             self.dataset.manifest.version,
+             Operation::CreateIndex {
+diff --git a/rust/lance/src/index/vector/builder.rs b/rust/lance/src/index/vector/builder.rs
+index f37ebe347..bec545778 100644
+--- a/rust/lance/src/index/vector/builder.rs
++++ b/rust/lance/src/index/vector/builder.rs
+@@ -553,6 +553,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+     // build the index and return the files created by the writer.
+     pub async fn build(&mut self) -> Result<VectorIndexBuildSummary> {
+         let progress = self.progress.clone();
++        progress.check_cancelled().await?;
+ 
+         // step 1. train IVF & quantizer
+         let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
+@@ -1107,6 +1108,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+ 
+     #[instrument(name = "build_partitions", level = "debug", skip_all)]
+     async fn build_partitions(&mut self) -> Result<BuildStream<S, Q>> {
++        self.progress.check_cancelled().await?;
+         let Some(ivf) = self.ivf.as_ref() else {
+             return Err(Error::invalid_input(
+                 "IVF not set before building partitions",
+@@ -1261,9 +1263,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+                 column,
+                 frag_reuse_index,
+                 FreshPartitionBuildLimits::default(),
++                self.progress.clone(),
+             );
+         }
+         let partition_adjustment = Arc::new(partition_adjustment);
++        let progress = self.progress.clone();
+         let build_iter = (0..num_partitions).map(move |partition| {
+             let output_partition_id = partition;
+             let reader = reader.clone();
+@@ -1274,7 +1278,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+             let column = column.clone();
+             let frag_reuse_index = frag_reuse_index.clone();
+             let partition_adjustment = partition_adjustment.clone();
++            let progress = progress.clone();
+             async move {
++                progress.check_cancelled().await?;
+                 let (is_affected, split_reader) = match partition_adjustment.as_ref() {
+                     Some(PartitionAdjustment::Split {
+                         affected_partitions,
+@@ -1384,6 +1390,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+         column: String,
+         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+         limits: FreshPartitionBuildLimits,
++        progress: Arc<dyn IndexBuildProgress>,
+     ) -> Result<BuildStream<S, Q>> {
+         let concurrency = get_num_compute_intensive_cpus().max(1);
+         let max_entries = concurrency.saturating_mul(PARTITION_BUILD_ENTRIES_PER_WORKER);
+@@ -1395,10 +1402,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+             let column = column.clone();
+             let frag_reuse_index = frag_reuse_index.clone();
+             let cpu_permits = cpu_permits.clone();
++            let progress = progress.clone();
+             async move {
+                 if next_partition_id == num_partitions {
+                     return Ok(None);
+                 }
++                progress.check_cancelled().await?;
+                 let plan = reader.plan_partition_window(
+                     next_partition_id,
+                     limits.window_bytes,
+@@ -1727,6 +1736,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+         let is_rq = quantization_type == QuantizationType::Rabit;
+         let is_flat = quantization_type == QuantizationType::Flat;
+ 
++        self.progress.check_cancelled().await?;
++
+         // prepare the final writers
+         let storage_path = self.index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+         let index_path = self.index_dir.clone().join(INDEX_FILE_NAME);
+@@ -1767,6 +1778,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q>
+             ordered_results.push(partition_id, result)?;
+ 
+             while let Some((partition_id, result)) = ordered_results.pop_next() {
++                progress.check_cancelled().await?;
+                 let Budgeted {
+                     value: PartitionBuildResult { built: part, .. },
+                     permit: _permit,
