@@ -55,6 +55,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::minhash_lsh::MinHashQuery as NativeMinHashQuery;
 use lance_select::{RowAddrMask as NativeRowAddrMask, RowAddrTreeMap as NativeRowAddrTreeMap};
+use lance_table::format::pb_actions;
 
 use common::create_config_base_files_fixture;
 
@@ -8079,7 +8080,7 @@ fn test_robotics_e2e_write_then_finalize() {
     use lance_file::reader::{CachedFileMetadata, FileReader as LanceFileReader};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
     use lance_io::utils::CachedFileSize;
-    use lance_table::format::{DataFile, Fragment, pb_actions};
+    use lance_table::format::{DataFile, Fragment};
 
     // ── Step 1: "C++ edge device" writes fragment data files ──
 
