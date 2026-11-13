@@ -35,7 +35,7 @@ index 6d18cdb8c..a3614606d 100644
          self.refs.tags()
      }
 diff --git a/rust/lance/src/dataset/tests/dataset_versioning.rs b/rust/lance/src/dataset/tests/dataset_versioning.rs
-index e97f9c90c..f4ef02ab6 100644
+index e97f9c90c..08b0e108c 100644
 --- a/rust/lance/src/dataset/tests/dataset_versioning.rs
 +++ b/rust/lance/src/dataset/tests/dataset_versioning.rs
 @@ -16,9 +16,10 @@ use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
@@ -58,7 +58,7 @@ index e97f9c90c..f4ef02ab6 100644
  use crate::dataset::refs::branch_contents_path;
  use crate::utils::test::copy_test_data_to_tmp;
  use futures::TryStreamExt;
-@@ -1598,3 +1600,263 @@ async fn test_branch() {
+@@ -1598,3 +1600,284 @@ async fn test_branch() {
          .unwrap();
      assert!(branches.is_empty());
  }
@@ -100,12 +100,13 @@ index e97f9c90c..f4ef02ab6 100644
 +async fn checkout_before_selects_greatest_eligible_version() {
 +    let test_uri = TempStrDir::default();
 +    set_commit_time(10, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 0..5, WriteMode::Create).await;
++    let mut dataset = write_checkout_version(test_uri.as_str(), 0..5, WriteMode::Create).await;
++    assert_eq!(dataset.version_id(), 1);
 +    set_commit_time(30, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 5..10, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 5..10, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 2);
 +    set_commit_time(20, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 10..15, WriteMode::Append).await;
-+
++    dataset = write_checkout_version(test_uri.as_str(), 10..15, WriteMode::Append).await;
 +    assert_eq!(dataset.version_id(), 3);
 +    assert_eq!(scan_i_values(&dataset).await, (0..15).collect::<Vec<_>>());
 +    assert!(dataset.get_fragments().len() > 1);
@@ -151,12 +152,13 @@ index e97f9c90c..f4ef02ab6 100644
 +async fn checkout_before_strict_nanosecond_boundary_and_equal_timestamps() {
 +    let test_uri = TempStrDir::default();
 +    set_commit_time(10, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    let mut dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    assert_eq!(dataset.version_id(), 1);
 +    set_commit_time(10, 1);
-+    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 2);
 +    set_commit_time(10, 1);
-+    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
-+
++    dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
 +    assert_eq!(dataset.version_id(), 3);
 +
 +    // Versions 2 and 3 share a timestamp exactly equal to the cutoff, so the
@@ -199,13 +201,16 @@ index e97f9c90c..f4ef02ab6 100644
 +async fn checkout_before_ignores_removed_history() {
 +    let test_uri = TempStrDir::default();
 +    set_commit_time(10, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    let mut dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    assert_eq!(dataset.version_id(), 1);
 +    set_commit_time(30, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 2);
 +    set_commit_time(20, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 3);
 +    set_commit_time(40, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 9..12, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 9..12, WriteMode::Append).await;
 +    assert_eq!(dataset.version_id(), 4);
 +
 +    let policy = CleanupPolicyBuilder::default()
@@ -239,11 +244,14 @@ index e97f9c90c..f4ef02ab6 100644
 +async fn checkout_before_old_handle_does_not_cap_history() {
 +    let test_uri = TempStrDir::default();
 +    set_commit_time(10, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    let mut dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    assert_eq!(dataset.version_id(), 1);
 +    set_commit_time(20, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 2);
 +    set_commit_time(30, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 3);
 +
 +    let old = dataset.checkout_version(1).await.unwrap();
 +    assert_eq!(old.version_id(), 1);
@@ -264,10 +272,13 @@ index e97f9c90c..f4ef02ab6 100644
 +    let test_uri = TempStrDir::default();
 +    set_commit_time(10, 0);
 +    let mut main = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    assert_eq!(main.version_id(), 1);
 +    set_commit_time(30, 0);
 +    main = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    assert_eq!(main.version_id(), 2);
 +
 +    let mut dev = main.create_branch("dev", 2, None).await.unwrap();
++    assert_eq!(dev.version_id(), 2);
 +    set_commit_time(20, 0);
 +    dev = write_checkout_version(dev.uri(), 100..103, WriteMode::Append).await;
 +    assert_eq!(dev.version_id(), 3);
@@ -298,11 +309,14 @@ index e97f9c90c..f4ef02ab6 100644
 +async fn checkout_before_propagates_manifest_read_failure() {
 +    let test_uri = TempStrDir::default();
 +    set_commit_time(10, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    let mut dataset = write_checkout_version(test_uri.as_str(), 0..3, WriteMode::Create).await;
++    assert_eq!(dataset.version_id(), 1);
 +    set_commit_time(20, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 3..6, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 2);
 +    set_commit_time(30, 0);
-+    let dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    dataset = write_checkout_version(test_uri.as_str(), 6..9, WriteMode::Append).await;
++    assert_eq!(dataset.version_id(), 3);
 +
 +    let locations = dataset
 +        .commit_handler
@@ -314,11 +328,18 @@ index e97f9c90c..f4ef02ab6 100644
 +        .iter()
 +        .find(|location| location.version == 2)
 +        .unwrap();
-+    dataset.object_store.delete(&location.path).await.unwrap();
++    // Corrupt the manifest while keeping it in the listing. Listing alone
++    // cannot detect this, so the failure must surface from the read.
++    dataset
++        .object_store
++        .inner
++        .put(&location.path, vec![0_u8; 8].into())
++        .await
++        .unwrap();
 +
 +    let err = dataset
 +        .checkout_before(checkout_before_time(35, 0))
 +        .await
 +        .unwrap_err();
-+    assert!(matches!(err, Error::NotFound { .. }), "{err}");
++    assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
 +}

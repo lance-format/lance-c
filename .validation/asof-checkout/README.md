@@ -10,7 +10,7 @@ or Python code.
 - Repository: `lance-format/lance`
 - Commit: `40f15ed1b71b66950961b175829fdf17a763f108` (Lance 14.0.2)
 - Patch: `native-checkout-before.patch`
-- Patch SHA-256: `a1253543bc589f07edbc223e31ef0be0d691d1dae1d1d7595c00f55b0723c56b`
+- Patch SHA-256: `06292bd11676c72369a6dcd59d33ce6e7c81ed8dc32107a2919047916e4490e5`
 - Files changed:
   - `rust/lance/src/dataset.rs`
   - `rust/lance/src/dataset/tests/dataset_versioning.rs`
@@ -48,7 +48,9 @@ commit timestamps and multi-fragment datasets (`max_rows_per_file: 2`):
 Each positive case asserts both the selected version and the actual returned
 rows. The tests cover nonmonotonic timestamps (max version, not max timestamp),
 strict equality, equal timestamps, nanosecond precision, cleanup gaps, branch
-isolation, old handles, and unchanged receivers.
+isolation, old handles, and unchanged receivers. The final test corrupts a
+retained manifest while keeping it listed, so the read failure cannot be hidden
+by a shorter listing.
 
 ## Runner
 
