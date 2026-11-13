@@ -3539,8 +3539,6 @@ fn prepared_blob_field(name: &str) -> Field {
 
 fn prepared_blob_array(payloads: &[Option<&[u8]>]) -> StructArray {
     let nulls = NullBuffer::from(payloads.iter().map(Option::is_some).collect::<Vec<_>>());
-    let fields: Fields = prepared_blob_field("blob").data_type().clone().into();
-    let _ = fields;
     StructArray::try_new(
         vec![
             Field::new("kind", DataType::UInt8, true),
