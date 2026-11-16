@@ -30,7 +30,6 @@ jobs:
   lint:
     name: Format & License
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -437,7 +436,6 @@ jobs:
   license-headers:
     name: License headers
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
