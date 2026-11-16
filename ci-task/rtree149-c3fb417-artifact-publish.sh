@@ -17,7 +17,7 @@ PREFIX_PARENT=${PREFIX_PARENT:-/home/xuanwo/Code/lance-c-validation/rtree149-bet
 STAGE="$PREFIX_PARENT/stage-c3fb417"
 FINAL="$PREFIX_PARENT/candidate-c3fb417"
 RUNNER_DIR=${RUNNER_DIR:-/home/xuanwo/Code/lance-c-exec/rtree149-c3fb417-runner}
-RUNNER_COMMIT=cd3bbc3d9ed72685d5a93989a4d9d5b95431349e
+RUNNER_COMMIT=$(git -C "$RUNNER_DIR" rev-parse FETCH_HEAD 2>/dev/null || echo unknown)
 
 fail() {
     echo "FAIL: $*" >&2
