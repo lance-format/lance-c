@@ -526,8 +526,9 @@ recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
 
 This subsection describes the five `v0.1.9` archives. Candidate results appear
 only where they are labelled as such, and none of them is part of a release.
-vcpkg and Conan select three of the five archives. The Linux baseline for
-future packages is separate; see [Linux baseline for future
+vcpkg and Conan select three of the five archives. Future releases publish one
+glibc 2.28 archive per Linux architecture instead of the four `v0.1.9` Linux
+archives; see [Linux baseline for future
 packages](#linux-baseline-for-future-packages).
 
 | Archive | Selected by |
@@ -626,10 +627,12 @@ unverified, with no implied requirement to test every older release.
 The GLIBC maxima above describe the four published Linux `v0.1.9` archives; they are
 not the baseline for future Linux packages. For future tags, the generic
 `x86_64` and `aarch64` archives target **glibc 2.28** (`manylinux_2_28`).
+Future releases do not publish separate Debian 12 variants.
 This is a packaging decision, not a change to any downloadable asset:
 
-- Keep the Debian 12 variants, whose `v0.1.9` shared libraries reference
-  `GLIBC_2.35`, as separate archives next to the generic ones.
+- The Debian 12 variants, whose `v0.1.9` shared libraries reference
+  `GLIBC_2.35`, remain published with their current hashes and recipe
+  selections. They are historical assets; no future tag adds another one.
 - Keep the physical `lib/` install layout, with no `lib64` and no
   compatibility symlinks, and keep the C++17 consumer requirement.
 - Runtime evidence is limited to the glibc 2.28 containers that were executed
@@ -638,10 +641,11 @@ This is a packaging decision, not a change to any downloadable asset:
   for every glibc 2.28 distribution, and no glibc 2.28 archive has been
   published.
 - The workflow change that would produce these archives is author-maintained
-  in [#50](https://github.com/lance-format/lance-c/pull/50). Until packages built
-  with this baseline are published and the recipe hashes are updated, the
-  recipes keep selecting the `v0.1.9`
-  archives listed above: `x64-linux`, `x64-linux-dynamic` and
+  in [#50](https://github.com/lance-format/lance-c/pull/50). It is not part of
+  `release.yml` on `main` yet, which still builds the two Debian 12 rows next
+  to the generic Linux rows. Until packages built with this baseline are
+  published and the recipe hashes are updated, the recipes keep selecting the
+  `v0.1.9` archives listed above: `x64-linux`, `x64-linux-dynamic` and
   `Linux/x86_64` use the Debian 12 x86_64 archive, while `arm64-linux`,
   `arm64-linux-dynamic` and `Linux/armv8` use the standard aarch64 archive
   (`GLIBC_2.39`).
@@ -1292,6 +1296,9 @@ back.
 ## Releasing
 
 Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds eight prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
+
+The two Debian 12 rows belong to this current workflow, not to the future Linux baseline. The glibc 2.28-only policy replaces them with a single generic archive per Linux architecture, pending in the author-maintained [#50](https://github.com/lance-format/lance-c/pull/50); `main` still builds all eight tarballs until that change lands.
+
 Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports. Linux rows also verify direct runtime dependencies. Windows verifies PE architecture, exact DLL and import-library export sets, absence of redistributable CRT imports, compatible static-CRT archive and consumer directives, and installed static/shared consumers.
 
 ### Recommended: cut a release via Actions UI
