@@ -15,9 +15,23 @@ use crate::runtime::RT;
 /// Spawn a Lance future and translate its terminal state into exactly one C
 /// completion.
 ///
+/// The bridge owns delivery after the task starts, but callers still own the
+/// entry-point contract:
+///
+/// - Reject a NULL callback before constructing a [`Completion`].
+/// - Guard call-time setup (validation, runtime access, `RT.spawn`) with
+///   `catch_unwind`; a panic there happens before this function is reached and
+///   must still deliver one panic completion.
+/// - Report validation failures on both channels: the caller thread's
+///   thread-local error for the synchronous return path, and the completion
+///   for the callback thread.
+/// - Choose a per-handle panic policy. `on_panic` runs before the panic
+///   completion is delivered; stateful callers can poison their handle there,
+///   while stateless callers can pass a no-op.
+///
 /// `into_result` converts the successful Rust value into an operation-specific
-/// C result pointer. `on_panic` lets stateful callers poison or invalidate
-/// state before the panic completion is delivered.
+/// C result pointer. It runs inside the task's panic boundary, so a panic in
+/// the converter still produces one panic completion.
 pub(crate) fn spawn_lance_future<F, T, S, P>(
     completion: Completion,
     future: F,
@@ -30,7 +44,7 @@ pub(crate) fn spawn_lance_future<F, T, S, P>(
     P: FnOnce() + Send + 'static,
 {
     RT.spawn(async move {
-        let completion_on_panic = completion;
+        let completion_on_panic = completion.clone();
         let outcome = std::panic::AssertUnwindSafe(async move {
             match future.await {
                 Ok(value) => completion.succeed(into_result(value)),
@@ -182,6 +196,39 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|message| message.contains("async bridge panic"))
+        );
+        unsafe { drop(Box::from_raw(ctx)) };
+    }
+
+    #[test]
+    fn panicking_converter_delivers_one_panic_completion() {
+        let (completion, rx, ctx) = completion();
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_ran_in_hook = Arc::clone(&hook_ran);
+        spawn_lance_future(
+            completion,
+            async { Ok::<_, lance_core::Error>(7_u64) },
+            |_| panic!("success converter panic"),
+            move || hook_ran_in_hook.store(true, Ordering::SeqCst),
+        );
+
+        // `into_result` is evaluated before `succeed` is entered, inside the
+        // task's panic boundary: the panicking converter must not lose the
+        // completion or turn into a second success delivery.
+        let observation = receive(&rx);
+        assert!(hook_ran.load(Ordering::SeqCst));
+        assert_eq!(observation.status, -1);
+        assert!(observation.result.is_null());
+        assert_eq!(observation.code, LanceErrorCode::Panic);
+        assert!(
+            observation
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("success converter panic"))
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a panicking converter must deliver exactly one completion"
         );
         unsafe { drop(Box::from_raw(ctx)) };
     }

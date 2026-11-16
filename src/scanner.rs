@@ -3,26 +3,43 @@
 
 //! Scanner C API: builder, sync iteration, async scan, poll-based iteration.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::Int64Array;
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::ExecutionPlan;
-use futures::{Stream, StreamExt};
-use lance::Dataset;
-use lance::dataset::scanner::{
-    DatasetRecordBatchStream, ExecutionStatsCallback, ExecutionSummaryCounts,
+use datafusion::physical_expr::expressions;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::{
+    ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
+    replace_children_if_necessary,
 };
-use lance::io::exec::fts::MatchQueryExec;
+use futures::{FutureExt, Stream, StreamExt};
+use lance::Dataset;
+use lance::dataset::fragment::FileFragment;
+use lance::dataset::scanner::{
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap,
+};
+use lance::io::exec::fts::{
+    FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorerExec,
+};
 use lance_core::Result;
+use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
+use lance_datafusion::exec::{
+    LanceExecutionOptions, analyze_plan as analyze_execution_plan, execute_plan,
+};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::minhash_lsh::MinHashQuery;
+use lance_index::vector::ApproxMode;
 use lance_io::stream::RecordBatchStream;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{Fragment, IndexMetadata};
 use uuid::Uuid;
 
 use crate::async_bridge::spawn_lance_future;
@@ -34,11 +51,19 @@ use crate::error::{
     panic_payload_message, set_lance_error, set_last_error, swallow_unwind,
 };
 use crate::fts_query::{
-    FtsQueryContextInner, LanceFtsQueryContext, clone_context, parse_segment_uuids,
+    FtsQueryContextInner, LanceFtsQuery, LanceFtsQueryContext, PreparedFtsQuery, clone_context,
+    clone_query, parse_segment_uuids,
 };
 use crate::helpers;
 use crate::runtime::{RT, block_on};
+use crate::scalar_segment::PreparedScalarSegment;
 use crate::stream_guard::GuardedReader;
+
+const DISTANCE_COLUMN: &str = "_distance";
+/// Prefix for the binding-private column that carries the native distance
+/// through the caller's final projection. Projection expressions may rename or
+/// transform `_distance`, so the result window cannot rank on the output name.
+const MULTIVECTOR_WINDOW_DISTANCE_COLUMN: &str = "_lance_c_multivector_distance";
 
 /// Data type tag for query vectors, mirroring the C enum `LanceDataType`.
 #[repr(i32)]
@@ -51,28 +76,208 @@ pub enum LanceDataType {
     Int8 = 4,
 }
 
+/// Speed / accuracy tradeoff for approximate vector search, mirroring the C
+/// enum `LanceApproxMode`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceApproxMode {
+    Fast = 0,
+    Normal = 1,
+    Accurate = 2,
+}
+
+impl LanceApproxMode {
+    fn from_i32(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Fast),
+            1 => Ok(Self::Normal),
+            2 => Ok(Self::Accurate),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got {value}")
+                    .into(),
+            )),
+        }
+    }
+
+    fn to_approx_mode(self) -> ApproxMode {
+        match self {
+            Self::Fast => ApproxMode::Fast,
+            Self::Normal => ApproxMode::Normal,
+            Self::Accurate => ApproxMode::Accurate,
+        }
+    }
+}
+
+/// Materialization style for ordinary scanner payload columns, mirroring the
+/// C enum `LanceMaterializationStyle`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceMaterializationStyle {
+    Heuristic = 0,
+    AllLate = 1,
+    AllEarly = 2,
+    AllEarlyExcept = 3,
+}
+
+impl LanceMaterializationStyle {
+    fn from_i32(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Heuristic),
+            1 => Ok(Self::AllLate),
+            2 => Ok(Self::AllEarly),
+            3 => Ok(Self::AllEarlyExcept),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "materialization_style must be 0 (HEURISTIC), 1 (ALL_LATE), 2 (ALL_EARLY), or 3 (ALL_EARLY_EXCEPT), got {value}"
+                )
+                .into(),
+            )),
+        }
+    }
+}
+
+/// Sort direction for one scanner ordering key, mirroring the C enum
+/// `LanceOrderDirection`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceOrderDirection {
+    Ascending = 0,
+    Descending = 1,
+}
+
+/// NULL placement for one scanner ordering key, mirroring the C enum
+/// `LanceNullOrder`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanceNullOrder {
+    NullsLast = 0,
+    NullsFirst = 1,
+}
+
+/// One native scanner ordering key, mirroring the C struct
+/// `LanceColumnOrdering`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceColumnOrdering {
+    pub column_name: *const c_char,
+    pub direction: i32,
+    pub null_order: i32,
+}
+
+/// One scanner projection entry, mirroring the C struct
+/// `LanceProjectionColumn`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LanceProjectionColumn {
+    pub output_name: *const c_char,
+    pub expression: *const c_char,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionExpression {
+    output_name: String,
+    expression: String,
+}
+
+/// A scanner has exactly one projection source: the legacy column list passed
+/// to `lance_scanner_new`, an ordered SQL-expression projection, or no
+/// projection at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectionSelection {
+    Columns(Vec<String>),
+    Expressions(Vec<ProjectionExpression>),
+}
+
+impl ProjectionSelection {
+    fn conflicts_with_output(&self, name: &str) -> bool {
+        match self {
+            Self::Columns(columns) => columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(name)),
+            Self::Expressions(columns) => columns
+                .iter()
+                .any(|column| column.output_name.eq_ignore_ascii_case(name)),
+        }
+    }
+}
+
+/// Fragment scope carried by a scanner.
+///
+/// `All` uses the dataset snapshot's default fragment set. `Ids` resolves
+/// native metadata from that snapshot. `Metadata` carries the exact native
+/// fragment values supplied by a staged fragment operation.
+#[derive(Clone, Debug)]
+enum FragmentSelection {
+    All,
+    Ids(Vec<u64>),
+    Metadata(Vec<Fragment>),
+}
+
+impl FragmentSelection {
+    fn is_restricted(&self) -> bool {
+        !matches!(self, Self::All)
+    }
+
+    fn scalar_segment_ids(&self) -> Option<Vec<u64>> {
+        match self {
+            Self::Ids(ids) if !ids.is_empty() => Some(ids.clone()),
+            Self::Metadata(fragments) if !fragments.is_empty() => {
+                Some(fragments.iter().map(|fragment| fragment.id).collect())
+            }
+            Self::All | Self::Ids(_) | Self::Metadata(_) => None,
+        }
+    }
+}
+
 /// Opaque scanner handle. Stores configuration until stream materialization.
 pub struct LanceScanner {
     dataset: Arc<Dataset>,
-    columns: Option<Vec<String>>,
+    projection: Option<ProjectionSelection>,
+    disable_scoring_autoprojection: bool,
     filter: Option<String>,
     substrait_filter: Option<Vec<u8>>,
+    substrait_aggregate: Option<Vec<u8>>,
+    additional_sql_filters: Vec<String>,
+    blob_handling: Option<BlobHandling>,
     limit: Option<i64>,
     offset: Option<i64>,
     batch_size: Option<usize>,
+    batch_size_bytes: Option<u64>,
+    strict_batch_size: Option<bool>,
+    io_buffer_size: Option<u64>,
+    batch_readahead: Option<usize>,
+    fragment_readahead: Option<usize>,
+    target_parallelism: Option<usize>,
+    scan_in_order: Option<bool>,
+    use_scalar_index: Option<bool>,
+    use_stats: Option<bool>,
     with_row_id: bool,
-    fragment_ids: Option<Vec<u64>>,
+    with_row_address: bool,
+    include_deleted_rows: bool,
+    fragment_selection: FragmentSelection,
+    // External row prefilter keyed in the dataset's `_rowid` space; combined into
+    // a single `RowAddrMask` (allowed AND NOT blocked) when the scanner is built.
+    row_addr_allowlist: Option<RowAddrTreeMap>,
+    row_addr_blocklist: Option<RowAddrTreeMap>,
     index_segments: Option<Vec<Uuid>>,
+    scalar_index_segment: Option<Uuid>,
+    scalar_index_auto_selection: bool,
     nearest: Option<NearestQuery>,
-    nprobes: Option<u32>,
+    probe: ProbeConfig,
+    approx_mode: Option<LanceApproxMode>,
+    query_parallelism: Option<i32>,
     refine_factor: Option<u32>,
     ef: Option<u32>,
     metric_override: Option<crate::index::LanceMetricType>,
     use_index: Option<bool>,
     prefilter: bool,
+    materialization_style: MaterializationStyle,
+    fast_search: bool,
+    minhash_query: Option<MinHashQuery>,
     fts_query: Option<FullTextSearchQuery>,
     fts_context: Option<Arc<FtsQueryContextInner>>,
     fts_index_segments: Option<Vec<Uuid>>,
+    order_by: Option<Vec<ColumnOrdering>>,
     // Set when a panic is caught in any operation on this scanner (issue #61):
     // once poisoned, every later `lance_scanner_*` call on this handle (except
     // `lance_scanner_close`, which must always free memory) fails with
@@ -93,10 +298,155 @@ pub struct LanceScanner {
     schema: Option<SchemaRef>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NearestMode {
+    Single,
+    MultiVector,
+    Batch { num_queries: usize },
+}
+
+const MAX_BATCH_QUERIES: usize = 128;
+const MAX_BATCH_QUERY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BATCH_CANDIDATES: usize = 100_000;
+
+fn batch_query_value_count(dimension: usize, num_queries: usize, width: usize) -> Result<usize> {
+    // Check both products before constructing an FFI slice, including on 32-bit targets.
+    let overflow = || {
+        let message = format!(
+            "batch query byte size overflows usize: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        lance_core::Error::invalid_input_source(message.into())
+    };
+    let count = dimension.checked_mul(num_queries).ok_or_else(overflow)?;
+    let bytes = count.checked_mul(width).ok_or_else(overflow)?;
+    if bytes > MAX_BATCH_QUERY_BYTES {
+        let message = format!(
+            "batch query byte size {bytes} exceeds limit {MAX_BATCH_QUERY_BYTES}: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        return Err(lance_core::Error::invalid_input_source(message.into()));
+    }
+    Ok(count)
+}
+
+fn validate_batch_candidates(num_queries: usize, k: u32, refine_factor: Option<u32>) -> Result<()> {
+    let refine = refine_factor.unwrap_or(1) as usize;
+    if refine == 0
+        || num_queries
+            .checked_mul(k as usize)
+            .and_then(|n| n.checked_mul(refine))
+            .is_none_or(|n| n > MAX_BATCH_CANDIDATES)
+    {
+        return Err(lance_core::Error::invalid_input_source(format!(
+            "batch num_queries ({num_queries}) * k ({k}) * refine_factor ({refine}) must be in 1..={MAX_BATCH_CANDIDATES}"
+        ).into()));
+    }
+    Ok(())
+}
+
 struct NearestQuery {
+    mode: NearestMode,
     column: String,
     query: arrow_array::ArrayRef,
     k: u32,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+}
+
+/// Native probe intent. `nprobes` is kept separate from explicit bounds so a
+/// later `search_effort` can ignore the fixed count without discarding the
+/// caller's explicit minimum and maximum.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ProbeConfig {
+    nprobes: Option<u32>,
+    minimum: Option<u32>,
+    maximum: Option<u32>,
+    search_effort: Option<f64>,
+}
+
+impl ProbeConfig {
+    fn with_nprobes(self, nprobes: u32) -> Result<Self> {
+        if nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        Ok(Self {
+            nprobes: Some(nprobes),
+            search_effort: self.search_effort,
+            ..Self::default()
+        })
+    }
+
+    fn with_minimum(self, minimum_nprobes: u32) -> Result<Self> {
+        if minimum_nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "minimum_nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        if let Some(maximum_nprobes) = self.maximum
+            && minimum_nprobes > maximum_nprobes
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "minimum_nprobes ({minimum_nprobes}) must not exceed maximum_nprobes ({maximum_nprobes})"
+                )
+                .into(),
+            ));
+        }
+        Ok(Self {
+            minimum: Some(minimum_nprobes),
+            ..self
+        })
+    }
+
+    fn with_maximum(self, maximum_nprobes: u32) -> Result<Self> {
+        if maximum_nprobes == 0 {
+            return Err(lance_core::Error::invalid_input_source(
+                "maximum_nprobes must be greater than 0, got 0".into(),
+            ));
+        }
+        if let Some(minimum_nprobes) = self.minimum
+            && maximum_nprobes < minimum_nprobes
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "maximum_nprobes ({maximum_nprobes}) must not be less than minimum_nprobes ({minimum_nprobes})"
+                )
+                .into(),
+            ));
+        }
+        Ok(Self {
+            maximum: Some(maximum_nprobes),
+            ..self
+        })
+    }
+
+    fn with_effort(self, effort: f64) -> Result<Self> {
+        if !effort.is_finite() || !(0.0..=1.0).contains(&effort) {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("search_effort must be finite and in [0, 1], got {effort}").into(),
+            ));
+        }
+        Ok(Self {
+            search_effort: Some(effort),
+            ..self
+        })
+    }
+
+    fn validate_for_scan(self) -> Result<()> {
+        let fixed = self.nprobes.filter(|_| self.search_effort.is_none());
+        let minimum = self.minimum.or(fixed).unwrap_or(1);
+        let maximum = self.maximum.or(fixed);
+        if let Some(maximum) = maximum
+            && minimum > maximum
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("minimum_nprobes ({minimum}) must not exceed maximum_nprobes ({maximum})")
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Poll status for `lance_scanner_poll_next`.
@@ -122,25 +472,50 @@ impl LanceScanner {
     fn new(dataset: Arc<Dataset>) -> Self {
         Self {
             dataset,
-            columns: None,
+            projection: None,
+            disable_scoring_autoprojection: false,
             filter: None,
             substrait_filter: None,
+            substrait_aggregate: None,
+            additional_sql_filters: Vec::new(),
+            blob_handling: None,
             limit: None,
             offset: None,
             batch_size: None,
+            batch_size_bytes: None,
+            strict_batch_size: None,
+            io_buffer_size: None,
+            batch_readahead: None,
+            fragment_readahead: None,
+            target_parallelism: None,
+            scan_in_order: None,
+            use_scalar_index: None,
+            use_stats: None,
             with_row_id: false,
-            fragment_ids: None,
+            with_row_address: false,
+            include_deleted_rows: false,
+            fragment_selection: FragmentSelection::All,
+            row_addr_allowlist: None,
+            row_addr_blocklist: None,
             index_segments: None,
+            scalar_index_segment: None,
+            scalar_index_auto_selection: false,
             nearest: None,
-            nprobes: None,
+            probe: ProbeConfig::default(),
+            approx_mode: None,
+            query_parallelism: None,
             refine_factor: None,
             ef: None,
             metric_override: None,
             use_index: None,
             prefilter: false,
+            materialization_style: MaterializationStyle::Heuristic,
+            fast_search: false,
+            minhash_query: None,
             fts_query: None,
             fts_context: None,
             fts_index_segments: None,
+            order_by: None,
             poisoned: Arc::new(AtomicBool::new(false)),
             poll_wakers: PollWakerRegistry::default(),
             scan_statistics_callback: None,
@@ -148,6 +523,16 @@ impl LanceScanner {
             stream: None,
             schema: None,
         }
+    }
+
+    /// Create a scanner whose initial selection is one native fragment.
+    ///
+    /// `FileFragment::scan` starts from the fragment's owned dataset snapshot
+    /// and selects that fragment's metadata over the ordinary scanner path.
+    pub(crate) fn from_fragment(fragment: &FileFragment) -> Self {
+        let mut scanner = Self::new(Arc::new(fragment.dataset().clone()));
+        scanner.fragment_selection = FragmentSelection::Metadata(vec![fragment.metadata().clone()]);
+        scanner
     }
 
     /// Whether a panic was caught in an earlier stateful operation on this
@@ -163,23 +548,168 @@ impl LanceScanner {
         Arc::clone(&self.poisoned)
     }
 
-    /// Apply fragment selection to a scanner builder if fragment_ids is set.
-    fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
-        if let Some(ids) = &self.fragment_ids {
-            let all_fragments = self.dataset.get_fragments();
-            let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
-            let selected: Vec<_> = all_fragments
-                .into_iter()
-                .filter(|f| id_set.contains(&(f.id() as u64)))
-                .map(|f| f.metadata().clone())
-                .collect();
-            scanner.with_fragments(selected);
+    fn ensure_scan_not_started(&self, setting_name: &str) -> Result<()> {
+        if self.scan_started.load(Ordering::Acquire) {
+            return Err(lance_core::Error::invalid_input_source(
+                format!("{setting_name} must be set before the scan starts").into(),
+            ));
         }
+        Ok(())
+    }
+
+    fn begin_scan(&self) {
+        self.scan_started.store(true, Ordering::Release);
+    }
+
+    /// Pick an output name for the native distance that cannot collide with a
+    /// stored field, a projected output, or wildcard expansion of the stored
+    /// schema. The name is binding-private and removed after the result window.
+    fn multi_vector_window_distance_column(&self) -> String {
+        let mut name = MULTIVECTOR_WINDOW_DISTANCE_COLUMN.to_string();
+        let mut suffix = 0usize;
+        loop {
+            let stored = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .any(|field| field.name.eq_ignore_ascii_case(&name));
+            let projected = self
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection.conflicts_with_output(&name));
+            if !stored && !projected {
+                return name;
+            }
+            suffix += 1;
+            name = format!("{MULTIVECTOR_WINDOW_DISTANCE_COLUMN}_{suffix}");
+        }
+    }
+
+    /// Apply the configured projection to the native scanner.
+    ///
+    /// `window_distance_column` is only used by the multi-vector adapter. It
+    /// adds the native distance as an extra output so the final result window
+    /// can rank on it even when the caller's projection renames or transforms
+    /// `_distance`.
+    fn apply_projection(
+        &self,
+        scanner: &mut lance::dataset::scanner::Scanner,
+        window_distance_column: Option<&str>,
+    ) -> Result<()> {
+        match &self.projection {
+            None => {}
+            Some(ProjectionSelection::Columns(columns)) if window_distance_column.is_none() => {
+                scanner.project(columns)?;
+            }
+            Some(ProjectionSelection::Columns(columns)) => {
+                let mut native = columns
+                    .iter()
+                    .map(|column| (column.as_str(), escape_field_path_for_project(column)))
+                    .collect::<Vec<_>>();
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN.to_string()));
+                }
+                scanner.project_with_transform(&native)?;
+            }
+            Some(ProjectionSelection::Expressions(columns)) => {
+                let mut native = columns
+                    .iter()
+                    .map(|column| (column.output_name.as_str(), column.expression.as_str()))
+                    .collect::<Vec<_>>();
+                if let Some(distance_column) = window_distance_column {
+                    native.push((distance_column, DISTANCE_COLUMN));
+                }
+                scanner.project_with_transform(&native)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate an expression projection through the same native configuration
+    /// method the scan will use. Lance reports malformed expressions, duplicate
+    /// outputs, and schema-dependent expression resolution here; planning-only
+    /// errors remain materialization errors.
+    fn validate_expression_projection(&self, columns: &[ProjectionExpression]) -> Result<()> {
+        let mut scanner = self.dataset.scan();
+        let native = columns
+            .iter()
+            .map(|column| (column.output_name.as_str(), column.expression.as_str()))
+            .collect::<Vec<_>>();
+        scanner.project_with_transform(&native)?;
+        Ok(())
+    }
+
+    /// Apply the scanner's fragment selection.
+    /// For nearest queries this limits candidates before Top-K regardless of prefilter;
+    /// it is not a predicate applied to the ranked results.
+    fn apply_fragment_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        match &self.fragment_selection {
+            FragmentSelection::All => {}
+            FragmentSelection::Ids(ids) => {
+                let all_fragments = self.dataset.get_fragments();
+                let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+                let selected: Vec<_> = all_fragments
+                    .into_iter()
+                    .filter(|f| id_set.contains(&(f.id() as u64)))
+                    .map(|f| f.metadata().clone())
+                    .collect();
+                scanner.with_fragments(selected);
+            }
+            FragmentSelection::Metadata(fragments) => {
+                scanner.with_fragments(fragments.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The external row prefilter, combined the same way as
+    /// `RowAddrMask::from_serialized_parts`: rows in the allowlist and not in the
+    /// blocklist. `None` when neither list is set (no mask, not "select nothing").
+    fn row_addr_mask(&self) -> Option<RowAddrMask> {
+        match (&self.row_addr_allowlist, &self.row_addr_blocklist) {
+            (Some(allow), Some(block)) => {
+                Some(RowAddrMask::from_allowed(allow.clone()).also_block(block.clone()))
+            }
+            (Some(allow), None) => Some(RowAddrMask::from_allowed(allow.clone())),
+            (None, Some(block)) => Some(RowAddrMask::from_block(block.clone())),
+            (None, None) => None,
+        }
+    }
+
+    fn apply_filter(&self, scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+        if let Some(substrait) = &self.substrait_filter {
+            scanner.filter_substrait(substrait)?;
+        } else if let Some(sql) = &self.filter {
+            scanner.filter(sql)?;
+        }
+
+        if self.additional_sql_filters.is_empty() {
+            return Ok(());
+        }
+
+        // Let Lance resolve every SQL expression against the scanner's full
+        // filterable schema. Besides stored columns, this includes metadata
+        // columns and query-generated columns such as _distance and _score.
+        let mut combined = scanner.get_expr_filter()?;
+        for sql in &self.additional_sql_filters {
+            let mut additional_scanner = scanner.clone();
+            additional_scanner.filter(sql)?;
+            let additional = additional_scanner
+                .get_expr_filter()?
+                .expect("additional SQL filter exists");
+            combined = Some(match combined {
+                Some(existing) => existing.and(additional),
+                None => additional,
+            });
+        }
+        scanner.filter_expr(combined.expect("additional SQL filter exists"));
         Ok(())
     }
 
     /// Build the underlying Scanner and open a stream.
     fn materialize_stream(&mut self) -> Result<()> {
+        self.begin_scan();
         let prepared_scanner = self.build_scanner()?;
         let stream = block_on(prepared_scanner.try_into_stream())?;
         self.schema = Some(stream.schema());
@@ -189,27 +719,118 @@ impl LanceScanner {
 
     /// Build a Scanner (without materializing) and return it.
     fn build_scanner(&self) -> Result<PreparedScanner> {
-        self.scan_started.store(true, Ordering::Release);
+        self.build_scanner_for(ScannerOperation::Scan)
+    }
+
+    fn build_count_scanner(&self) -> Result<PreparedScanner> {
+        self.build_scanner_for(ScannerOperation::Count)
+    }
+
+    fn build_scanner_for(&self, operation: ScannerOperation) -> Result<PreparedScanner> {
         let mut scanner = self.dataset.scan();
-        if let Some(cols) = &self.columns {
-            scanner.project(cols)?;
+        // Both batch and multi-vector inputs are matrices, but only multi-vector
+        // queries may use the custom row-level scoring and global result window.
+        let multi_vector = self
+            .nearest
+            .as_ref()
+            .is_some_and(|query| query.mode == NearestMode::MultiVector);
+        let has_aggregate =
+            operation == ScannerOperation::Scan && self.substrait_aggregate.is_some();
+        if self.nearest.is_none() && self.probe.search_effort.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "search_effort requires nearest() to be configured".into(),
+            ));
         }
-        // Substrait filter takes precedence over SQL filter when both are set.
-        if let Some(bytes) = &self.substrait_filter {
-            scanner.filter_substrait(bytes)?;
-        } else if let Some(filter) = &self.filter {
-            scanner.filter(filter)?;
+        // The multi-vector window must rank on the native distance after the
+        // final projection. Projections can rename or transform `_distance`,
+        // so carry a binding-private copy whenever a projection is configured.
+        let private_multi_vector_distance =
+            multi_vector && self.projection.is_some() && !has_aggregate;
+        let window_distance_column =
+            private_multi_vector_distance.then(|| self.multi_vector_window_distance_column());
+        self.apply_projection(&mut scanner, window_distance_column.as_deref())?;
+        if self.disable_scoring_autoprojection && !(multi_vector && self.projection.is_none()) {
+            scanner.disable_scoring_autoprojection();
+        }
+        if let Some(handling) = &self.blob_handling {
+            scanner.blob_handling(handling.clone());
+        }
+        if operation == ScannerOperation::Scan
+            && multi_vector
+            && !has_aggregate
+            && self
+                .order_by
+                .as_ref()
+                .is_some_and(|ordering| !ordering.is_empty())
+        {
+            return Err(lance_core::Error::invalid_input_source(
+                "order_by is not supported with nearest_multivector because its result window is always distance-ordered"
+                    .into(),
+            ));
+        }
+        scanner.order_by(self.order_by.clone())?;
+        if let Some(NearestQuery {
+            mode: NearestMode::Batch { num_queries },
+            k,
+            ..
+        }) = &self.nearest
+        {
+            validate_batch_candidates(*num_queries, *k, self.refine_factor)?;
         }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
+            if multi_vector && operation == ScannerOperation::Scan && !has_aggregate {
+                // Retain Lance's window validation, but defer truncation until the final sort.
+                scanner.limit(None, None)?;
+            }
         }
         if let Some(bs) = self.batch_size {
             scanner.batch_size(bs);
         }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(strict_batch_size) = self.strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
+        }
+        if let Some(io_buffer_size) = self.io_buffer_size {
+            scanner.io_buffer_size(io_buffer_size);
+        }
+        if let Some(batch_readahead) = self.batch_readahead {
+            scanner.batch_readahead(batch_readahead);
+        }
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            scanner.fragment_readahead(fragment_readahead);
+        }
+        if let Some(target_parallelism) = self.target_parallelism {
+            scanner.target_parallelism(target_parallelism);
+        }
+        if let Some(scan_in_order) = self.scan_in_order {
+            scanner.scan_in_order(scan_in_order);
+        }
+        if let Some(use_scalar_index) = self.use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
+        }
+        if let Some(use_stats) = self.use_stats {
+            scanner.use_stats(use_stats);
+        }
         if self.with_row_id {
             scanner.with_row_id();
         }
-        self.apply_fragment_filter(&mut scanner)?;
+        if self.with_row_address {
+            scanner.with_row_address();
+        }
+        if self.include_deleted_rows {
+            scanner.include_deleted_rows();
+        }
+        // Lance rejects nearest() when fragments are already configured and prefilter is off.
+        // Deferring with_fragments only works around that configuration-time guard: fragments
+        // still restrict indexed and flat-search inputs before Top-K. The prefilter setting
+        // controls scanner filter expressions, not this search-domain scope.
+        let apply_fragment_filter_after_nearest = self.nearest.is_some() && !self.prefilter;
+        if !apply_fragment_filter_after_nearest {
+            self.apply_fragment_filter(&mut scanner)?;
+        }
         if self.index_segments.is_some() && self.nearest.is_none() {
             return Err(lance_core::Error::invalid_input_source(
                 "index_segments requires nearest() to be configured".into(),
@@ -220,22 +841,75 @@ impl LanceScanner {
                 "fts_index_segments requires an FTS query context".into(),
             ));
         }
-        if self.fts_context.is_some() && self.fragment_ids.is_some() {
+        if self.fts_context.is_some() && self.fragment_selection.is_restricted() {
             return Err(lance_core::Error::invalid_input_source(
                 "fragment_ids cannot be combined with an FTS query context; split the query by FTS index segment UUID instead".into(),
             ));
         }
-        // nearest() checks the current prefilter setting before accepting a
-        // fragment-scoped search. Enable it before installing the query.
+        // A segment-scoped scalar scan installs its own row prefilter from the segment's
+        // candidates, which would replace this one.
+        let row_addr_mask = self.row_addr_mask().map(Arc::new);
+        if row_addr_mask.is_some() && self.scalar_index_segment.is_some() {
+            return Err(lance_core::Error::invalid_input_source(
+                "row address allowlist/blocklist cannot be combined with scalar_index_segment"
+                    .into(),
+            ));
+        }
+        if let Some(mask) = &row_addr_mask {
+            scanner.with_row_id_prefilter(RowAddrMask::clone(mask));
+        }
         if self.prefilter {
             scanner.prefilter(true);
         }
+        if self.fast_search {
+            // Pylance applies fast_search before nearest/use_index. Preserve that order:
+            // an explicit use_index=false remains effective and lets the native planner
+            // return its indexed-only outcome rather than silently falling back.
+            scanner.fast_search();
+        }
         if let Some(n) = &self.nearest {
+            self.probe.validate_for_scan()?;
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
-            if let Some(np) = self.nprobes {
-                scanner.nprobes(np as usize);
+            scanner.distance_range(n.lower_bound, n.upper_bound);
+            if let Some(nprobes) = self.probe.nprobes {
+                scanner.nprobes(nprobes as usize);
             }
-            if let Some(rf) = self.refine_factor {
+            if let Some(minimum_nprobes) = self.probe.minimum {
+                scanner.minimum_nprobes(minimum_nprobes as usize);
+            }
+            if let Some(maximum_nprobes) = self.probe.maximum {
+                scanner.maximum_nprobes(maximum_nprobes as usize);
+            }
+            if let Some(search_effort) = self.probe.search_effort {
+                scanner.search_effort(search_effort)?;
+            }
+            if let Some(approx_mode) = self.approx_mode {
+                scanner.approx_mode(approx_mode.to_approx_mode());
+            }
+            if let Some(query_parallelism) = self.query_parallelism {
+                scanner.query_parallelism(query_parallelism);
+            }
+            if multi_vector {
+                if matches!(
+                    self.metric_override,
+                    Some(crate::index::LanceMetricType::Hamming)
+                ) {
+                    return Err(lance_core::Error::invalid_input_source(
+                        "multi-vector queries support only l2, cosine, and dot metrics".into(),
+                    ));
+                }
+                let refine = self.refine_factor.unwrap_or(1);
+                if refine == 0
+                    || n.k as usize
+                        > crate::multivector::MAX_QUERY_VECTOR_CANDIDATES / refine as usize
+                {
+                    return Err(lance_core::Error::invalid_input_source(
+                        "multi-vector refined candidate count must be in 1..=100000".into(),
+                    ));
+                }
+                // Validate actual stored values and refine candidate scores before TopK.
+                scanner.refine(refine);
+            } else if let Some(rf) = self.refine_factor {
                 scanner.refine(rf);
             }
             if let Some(ef) = self.ef {
@@ -243,6 +917,9 @@ impl LanceScanner {
             }
             if let Some(m) = self.metric_override {
                 scanner.distance_metric(m.to_distance());
+            } else if multi_vector {
+                // Resolve the same default on indexed and uncovered fragments.
+                scanner.distance_metric(lance_linalg::distance::DistanceType::L2);
             }
             if let Some(ui) = self.use_index {
                 scanner.use_index(ui);
@@ -251,6 +928,14 @@ impl LanceScanner {
                 scanner.with_index_segments(segments.clone())?;
             }
         }
+        if apply_fragment_filter_after_nearest {
+            // This delayed builder call preserves the same fragment search domain.
+            self.apply_fragment_filter(&mut scanner)?;
+        }
+        scanner.materialization_style(self.materialization_style.clone());
+        if let Some(query) = &self.minhash_query {
+            scanner.minhash_search(query.clone())?;
+        }
         if let Some(fts) = &self.fts_query {
             scanner.full_text_search(fts.clone())?;
         }
@@ -258,25 +943,76 @@ impl LanceScanner {
             context.validate_dataset_identity(&self.dataset)?;
             let segments = select_fts_segments(context, self.fts_index_segments.as_deref())?;
             scanner.full_text_search(context.query.clone())?;
-            // Both STRICT and INDEX_ONLY context scans must use only the
-            // committed segments pinned in the context. In STRICT mode all
-            // current fragments were already proven covered during prepare.
-            scanner.fast_search();
             Some(PreparedFtsExecution {
                 context: Arc::clone(context),
                 segments,
+                scope_prefilter_to_fts_segments: self.prefilter
+                    && (self.filter.is_some()
+                        || self.substrait_filter.is_some()
+                        || !self.additional_sql_filters.is_empty()),
+                row_addr_mask,
                 batch_size: self.batch_size,
                 scan_statistics_callback: self.scan_statistics_callback.clone(),
             })
         } else {
             None
         };
+        self.apply_filter(&mut scanner)?;
+        let scalar_segment = if let Some(segment_uuid) = self.scalar_index_segment {
+            if self.nearest.is_some()
+                || self.minhash_query.is_some()
+                || self.fts_query.is_some()
+                || self.fts_context.is_some()
+                || self.index_segments.is_some()
+                || self.fts_index_segments.is_some()
+                || self.include_deleted_rows
+            {
+                return Err(lance_core::Error::invalid_input_source(
+                    "scalar_index_segment requires an ordinary scan of live rows; vector/MinHash/FTS queries and include_deleted_rows=true are unsupported".into(),
+                ));
+            }
+            let fragment_ids = self.fragment_selection.scalar_segment_ids()
+                .ok_or_else(|| lance_core::Error::invalid_input_source(
+                    "scalar_index_segment requires explicit nonempty fragment_ids for its read and fallback domain".into(),
+                ))?;
+            Some(PreparedScalarSegment {
+                dataset: Arc::clone(&self.dataset),
+                segment_uuid,
+                auto_selection: self.scalar_index_auto_selection,
+                fragment_ids,
+                use_scalar_index: self.use_scalar_index.unwrap_or(true),
+                callback: self.scan_statistics_callback.clone(),
+            })
+        } else {
+            None
+        };
+        if operation == ScannerOperation::Scan
+            && let Some(bytes) = &self.substrait_aggregate
+        {
+            scanner.aggregate(AggregateExpr::substrait(bytes.clone()))?;
+        }
         if let Some(callback) = &self.scan_statistics_callback {
             scanner.scan_stats_callback(callback.clone());
         }
+        let multi_vector_window = (multi_vector
+            && operation == ScannerOperation::Scan
+            && !has_aggregate)
+            .then(|| MultiVectorWindow {
+                offset: self.offset.unwrap_or(0) as usize,
+                limit: self.limit.map(|n| n as usize),
+                distance_column: window_distance_column
+                    .unwrap_or_else(|| DISTANCE_COLUMN.to_string()),
+                drop_distance_column: private_multi_vector_distance
+                    || (self.projection.is_none() && self.disable_scoring_autoprojection),
+            });
         Ok(PreparedScanner {
             scanner,
             distributed_fts,
+            multi_vector,
+            multi_vector_window,
+            batch_size: self.batch_size,
+            scan_statistics_callback: self.scan_statistics_callback.clone(),
+            scalar_segment,
         })
     }
 }
@@ -284,6 +1020,10 @@ impl LanceScanner {
 struct PreparedFtsExecution {
     context: Arc<FtsQueryContextInner>,
     segments: Vec<IndexMetadata>,
+    scope_prefilter_to_fts_segments: bool,
+    // Re-applied to the rebuilt Match/Phrase execs: they are reconstructed from the
+    // planned ones, which do not expose the external mask Lance attached to them.
+    row_addr_mask: Option<Arc<RowAddrMask>>,
     batch_size: Option<usize>,
     scan_statistics_callback: Option<ExecutionStatsCallback>,
 }
@@ -291,33 +1031,281 @@ struct PreparedFtsExecution {
 struct PreparedScanner {
     scanner: lance::dataset::scanner::Scanner,
     distributed_fts: Option<PreparedFtsExecution>,
+    multi_vector: bool,
+    multi_vector_window: Option<MultiVectorWindow>,
+    batch_size: Option<usize>,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
+    scalar_segment: Option<PreparedScalarSegment>,
+}
+
+struct MultiVectorWindow {
+    offset: usize,
+    limit: Option<usize>,
+    /// Column holding the native distance before any caller projection
+    /// expression is applied.
+    distance_column: String,
+    /// Whether `distance_column` is binding-private and must not be returned.
+    drop_distance_column: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScannerOperation {
+    Scan,
+    Count,
+}
+
+struct PreparedPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    batch_size: Option<usize>,
+    stats_callback: Option<ExecutionStatsCallback>,
 }
 
 impl PreparedScanner {
-    async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
-        let Some(distributed_fts) = self.distributed_fts else {
-            return self.scanner.try_into_stream().await;
-        };
-        let plan = self.scanner.create_plan().await?;
-        let (plan, replaced) = replace_match_query_exec(
-            plan,
-            &distributed_fts.segments,
-            &distributed_fts.context.scorer,
-        )?;
-        if replaced != 1 {
-            return Err(lance_core::Error::internal(format!(
-                "expected exactly one MatchQueryExec in prepared FTS plan, replaced {replaced}"
-            )));
+    async fn create_plan(self, operation: ScannerOperation) -> Result<PreparedPlan> {
+        let PreparedScanner {
+            scanner,
+            distributed_fts,
+            multi_vector,
+            multi_vector_window,
+            batch_size,
+            scan_statistics_callback,
+            scalar_segment,
+        } = self;
+
+        if let Some(scalar_segment) = scalar_segment {
+            let configured = scalar_segment.configure(scanner).await?;
+            let mut scanner = configured.scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = scanner.create_plan().await?;
+            return Ok(PreparedPlan {
+                plan,
+                batch_size,
+                stats_callback: if operation == ScannerOperation::Scan {
+                    configured.stats_callback
+                } else {
+                    None
+                },
+            });
         }
-        let stream = lance_datafusion::exec::execute_plan(
-            plan,
-            lance_datafusion::exec::LanceExecutionOptions {
+
+        if multi_vector {
+            let mut scanner = scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = crate::multivector::rewrite(scanner.create_plan().await?)?;
+            let plan = if let Some(window) = multi_vector_window {
+                let plan = crate::multivector::apply_result_window(
+                    plan,
+                    window.offset,
+                    window.limit,
+                    &window.distance_column,
+                )?;
+                if window.drop_distance_column {
+                    drop_column_from_plan(plan, &window.distance_column)?
+                } else {
+                    plan
+                }
+            } else {
+                plan
+            };
+            return Ok(PreparedPlan {
+                plan,
+                batch_size,
+                stats_callback: if operation == ScannerOperation::Scan {
+                    scan_statistics_callback
+                } else {
+                    None
+                },
+            });
+        }
+
+        if let Some(distributed_fts) = distributed_fts {
+            let mut scanner = scanner;
+            if operation == ScannerOperation::Count {
+                add_count_aggregate(&mut scanner)?;
+            }
+            let plan = build_prepared_fts_plan(scanner, &distributed_fts).await?;
+            return Ok(PreparedPlan {
+                plan,
                 batch_size: distributed_fts.batch_size,
-                execution_stats_callback: distributed_fts.scan_statistics_callback,
+                stats_callback: if operation == ScannerOperation::Scan {
+                    distributed_fts.scan_statistics_callback
+                } else {
+                    None
+                },
+            });
+        }
+
+        let mut scanner = scanner;
+        if operation == ScannerOperation::Count {
+            add_count_aggregate(&mut scanner)?;
+        }
+        Ok(PreparedPlan {
+            plan: scanner.create_plan().await?,
+            batch_size,
+            stats_callback: if operation == ScannerOperation::Scan {
+                scan_statistics_callback
+            } else {
+                None
+            },
+        })
+    }
+
+    async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
+        let prepared = self.create_plan(ScannerOperation::Scan).await?;
+        let stream = execute_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                execution_stats_callback: prepared.stats_callback,
                 ..Default::default()
             },
         )?;
         Ok(DatasetRecordBatchStream::new(stream))
+    }
+
+    async fn schema(self) -> Result<SchemaRef> {
+        Ok(self
+            .create_plan(ScannerOperation::Scan)
+            .await?
+            .plan
+            .schema())
+    }
+
+    async fn explain_plan(self, verbose: bool) -> Result<String> {
+        let plan = self.create_plan(ScannerOperation::Scan).await?.plan;
+        Ok(format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(verbose)
+        ))
+    }
+
+    async fn analyze_plan(self) -> Result<String> {
+        let prepared = self.create_plan(ScannerOperation::Scan).await?;
+        analyze_execution_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn count_rows(self) -> Result<u64> {
+        let prepared = self.create_plan(ScannerOperation::Count).await?;
+        count_plan_rows(prepared.plan).await
+    }
+
+    async fn analyze_count_plan(self) -> Result<String> {
+        let prepared = self.create_plan(ScannerOperation::Count).await?;
+        analyze_execution_plan(
+            prepared.plan,
+            LanceExecutionOptions {
+                batch_size: prepared.batch_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+}
+
+fn add_count_aggregate(scanner: &mut lance::dataset::scanner::Scanner) -> Result<()> {
+    scanner.aggregate(AggregateExpr::builder().count_star().build())?;
+    Ok(())
+}
+
+async fn count_plan_rows(plan: Arc<dyn ExecutionPlan>) -> Result<u64> {
+    let mut stream = execute_plan(plan, LanceExecutionOptions::default())?;
+    if let Some(first_batch) = stream.next().await {
+        let batch = first_batch?;
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input(
+                    "Count plan did not return an Int64Array".to_string(),
+                )
+            })?;
+        Ok(array.value(0) as u64)
+    } else {
+        Ok(0)
+    }
+}
+
+async fn build_prepared_fts_plan(
+    mut scanner: lance::dataset::scanner::Scanner,
+    distributed_fts: &PreparedFtsExecution,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let selected_fragments = selected_current_fts_fragments(
+        &distributed_fts.context.dataset,
+        &distributed_fts.segments,
+    )?;
+    let selected_segments_have_current_fragments = !selected_fragments.is_empty();
+    if distributed_fts.scope_prefilter_to_fts_segments && selected_segments_have_current_fragments {
+        // The scanner is already split by the selected FTS segment(s). Applying the same
+        // fragment scope before plan creation lets Lance restrict scalar-index segment loads
+        // for the TVF prefilter without changing unfiltered FTS scans.
+        scanner.with_fragments(selected_fragments);
+    }
+    let plan = scanner.create_plan().await?;
+    let (plan, rewritten) = rewrite_prepared_fts_plan(
+        plan,
+        &distributed_fts.segments,
+        &distributed_fts.context.prepared,
+        selected_segments_have_current_fragments,
+        distributed_fts.row_addr_mask.as_ref(),
+    )?;
+    // Fast search may eliminate every FTS source. Projection and row-fetch
+    // nodes can still wrap EmptyExec, with no query node to rewrite.
+    let empty_sources_only = rewritten.indexed_query_execs == 0
+        && rewritten.flat_match_query_execs == 0
+        && fts_plan_has_only_empty_sources(plan.as_ref());
+    if !empty_sources_only
+        && (rewritten.indexed_query_execs > 1
+            || rewritten.flat_match_query_execs > 1
+            || rewritten.indexed_query_execs + rewritten.flat_match_query_execs == 0
+            || (selected_segments_have_current_fragments && rewritten.indexed_query_execs != 1))
+    {
+        return Err(lance_core::Error::internal(format!(
+            "unexpected prepared FTS plan for selected segments with current fragment coverage {selected_segments_have_current_fragments}: rewrote {} indexed FTS query node(s) and removed {} FlatMatchQueryExec node(s)",
+            rewritten.indexed_query_execs, rewritten.flat_match_query_execs
+        )));
+    }
+    Ok(plan)
+}
+
+fn drop_column_from_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    column_name: &str,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let projection = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != column_name)
+        .map(|field| {
+            Ok((
+                expressions::col(field.name(), schema.as_ref())?,
+                field.name().clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(DFProjectionExec::try_new(projection, plan)?))
+}
+
+fn fts_plan_has_only_empty_sources(plan: &dyn ExecutionPlan) -> bool {
+    let children = plan.children();
+    if children.is_empty() {
+        plan.downcast_ref::<EmptyExec>().is_some()
+    } else {
+        children
+            .into_iter()
+            .all(|child| fts_plan_has_only_empty_sources(child.as_ref()))
     }
 }
 
@@ -353,24 +1341,103 @@ fn select_fts_segments(
     Ok(selected)
 }
 
-fn replace_match_query_exec(
+fn selected_current_fts_fragments(
+    dataset: &lance::Dataset,
+    segments: &[IndexMetadata],
+) -> Result<Vec<Fragment>> {
+    let mut selected_fragment_ids = std::collections::HashSet::new();
+    for segment in segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            lance_core::Error::internal(format!(
+                "prepared FTS segment {} lost its validated fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        selected_fragment_ids.extend(fragment_bitmap.iter());
+    }
+
+    let mut selected_fragments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        let fragment_id = u32::try_from(fragment.id()).map_err(|_| {
+            lance_core::Error::internal(format!(
+                "current fragment id {} exceeds the validated u32 FTS coverage range",
+                fragment.id()
+            ))
+        })?;
+        if selected_fragment_ids.contains(&fragment_id) {
+            selected_fragments.push(fragment.metadata().clone());
+        }
+    }
+    Ok(selected_fragments)
+}
+
+#[derive(Default)]
+struct PreparedFtsPlanRewriteCounts {
+    indexed_query_execs: usize,
+    flat_match_query_execs: usize,
+}
+
+fn rewrite_prepared_fts_plan(
     plan: Arc<dyn ExecutionPlan>,
     segments: &[IndexMetadata],
-    scorer: &Arc<lance_index::scalar::inverted::MemBM25Scorer>,
-) -> Result<(Arc<dyn ExecutionPlan>, usize)> {
+    prepared: &PreparedFtsQuery,
+    selected_segments_have_current_fragments: bool,
+    row_addr_mask: Option<&Arc<RowAddrMask>>,
+) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
+    // A prepared scan always replaces the flat branch with EmptyExec, so the
+    // v15 corpus owner has no producer left to coordinate with. Drop the owner
+    // and keep the rebuilt indexed leaf, which already carries the prepared
+    // corpus-wide scorer.
+    if plan.downcast_ref::<SharedFtsScorerExec>().is_some() {
+        let children = plan.children();
+        let [input] = children.as_slice() else {
+            return Err(lance_core::Error::internal(format!(
+                "prepared FTS corpus owner must have exactly one input, got {}",
+                children.len()
+            )));
+        };
+        return rewrite_prepared_fts_plan(
+            Arc::clone(input),
+            segments,
+            prepared,
+            selected_segments_have_current_fragments,
+            row_addr_mask,
+        );
+    }
+
+    // Lance's ordinary FTS planner adds a flat-search branch for fragments not
+    // covered by the logical index. A prepared INDEX_ONLY scan must omit that
+    // branch, but using Scanner::with_fragments to do so would turn an
+    // otherwise unfiltered index search into a full row-id prefilter scan.
+    if plan.downcast_ref::<FlatMatchQueryExec>().is_some() {
+        return Ok((
+            Arc::new(EmptyExec::new(plan.schema())),
+            PreparedFtsPlanRewriteCounts {
+                indexed_query_execs: 0,
+                flat_match_query_execs: 1,
+            },
+        ));
+    }
+
     let children = plan.children();
-    let mut replaced = 0;
+    let mut rewritten = PreparedFtsPlanRewriteCounts::default();
     let rebuilt = if children.is_empty() {
         plan
     } else {
         let mut new_children = Vec::with_capacity(children.len());
         for child in children {
-            let (new_child, child_replaced) =
-                replace_match_query_exec(Arc::clone(child), segments, scorer)?;
+            let (new_child, child_rewritten) = rewrite_prepared_fts_plan(
+                Arc::clone(child),
+                segments,
+                prepared,
+                selected_segments_have_current_fragments,
+                row_addr_mask,
+            )?;
             new_children.push(new_child);
-            replaced += child_replaced;
+            rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
+            rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
         }
-        plan.with_new_children(new_children).map_err(|error| {
+        replace_children_if_necessary(plan, new_children).map_err(|error| {
             lance_core::Error::internal(format!(
                 "failed to rebuild FTS execution plan children: {error}"
             ))
@@ -378,17 +1445,48 @@ fn replace_match_query_exec(
     };
 
     if let Some(exec) = rebuilt.downcast_ref::<MatchQueryExec>() {
+        rewritten.indexed_query_execs += 1;
+        if !selected_segments_have_current_fragments {
+            return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
+        }
+        let PreparedFtsQuery::Match(scorer) = prepared else {
+            return Err(lance_core::Error::internal(
+                "prepared Phrase state cannot be attached to MatchQueryExec".to_string(),
+            ));
+        };
         let replacement = MatchQueryExec::new_with_segments(
             Arc::clone(exec.dataset()),
             exec.query().clone(),
             exec.params().clone(),
             exec.prefilter_source().clone(),
             segments.to_vec(),
-        )
-        .with_base_scorer(Arc::clone(scorer));
-        return Ok((Arc::new(replacement), replaced + 1));
+        )?
+        .with_base_scorer(Arc::clone(scorer))
+        .with_external_mask(row_addr_mask.cloned());
+        return Ok((Arc::new(replacement), rewritten));
     }
-    Ok((rebuilt, replaced))
+    if let Some(exec) = rebuilt.downcast_ref::<PhraseQueryExec>() {
+        rewritten.indexed_query_execs += 1;
+        if !selected_segments_have_current_fragments {
+            return Ok((Arc::new(EmptyExec::new(rebuilt.schema())), rewritten));
+        }
+        let PreparedFtsQuery::Phrase(scorer) = prepared else {
+            return Err(lance_core::Error::internal(
+                "prepared Match state cannot be attached to PhraseQueryExec".to_string(),
+            ));
+        };
+        let replacement = PhraseQueryExec::new_with_segments(
+            Arc::clone(exec.dataset()),
+            exec.query().clone(),
+            exec.params().clone(),
+            exec.prefilter_source().clone(),
+            segments.to_vec(),
+        )?
+        .with_base_scorer(Arc::clone(scorer))
+        .with_external_mask(row_addr_mask.cloned());
+        return Ok((Arc::new(replacement), rewritten));
+    }
+    Ok((rebuilt, rewritten))
 }
 
 /// Type of a dynamically named scan metric.
@@ -541,11 +1639,8 @@ macro_rules! scanner_poison_check {
     };
 }
 
-/// Run a scanner configuration call through the common FFI guard and poison
-/// the handle if that call catches a panic. Regular Lance errors remain
-/// recoverable and do not poison the builder.
-macro_rules! scanner_ffi_try {
-    ($scanner:expr, $body:expr $(,)?) => {{
+macro_rules! scanner_ffi_try_value {
+    ($scanner:expr, $errval:expr, $body:expr $(,)?) => {{
         let scanner_ptr = $scanner;
         ffi_guard_with(
             || $body,
@@ -555,10 +1650,62 @@ macro_rules! scanner_ffi_try {
                         .poison_flag()
                         .store(true, Ordering::SeqCst);
                 }
-                -1
+                $errval
             },
         )
     }};
+}
+
+/// Run a scanner configuration call through the common FFI guard and poison
+/// the handle if that call catches a panic. Regular Lance errors remain
+/// recoverable and do not poison the builder.
+macro_rules! scanner_ffi_try {
+    ($scanner:expr, $body:expr $(,)?) => {
+        scanner_ffi_try_value!($scanner, -1, $body)
+    };
+}
+
+/// Enable bounded runtime BTree selection for an explicitly scoped scalar segment scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scalar_index_auto_selection(
+    scanner: *mut LanceScanner,
+    enabled: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, {
+        let scanner = unsafe { scanner.as_mut() }
+            .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+        scanner.ensure_scan_not_started("scalar_index_auto_selection")?;
+        scanner.scalar_index_auto_selection = enabled;
+        Ok(0)
+    })
+}
+
+/// Select one physical scalar index segment. NULL clears the selection.
+/// Requires explicit fragment_ids and an ordinary live-row scan. See the C header.
+/// include_deleted_rows=true is rejected when preparing the scan, even if
+/// use_scalar_index=false selects the scoped non-indexed fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scalar_index_segment(
+    scanner: *mut LanceScanner,
+    segment_uuid: *const u8,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, {
+        let scanner = unsafe { scanner.as_mut() }
+            .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+        scanner.ensure_scan_not_started("scalar_index_segment")?;
+        let segment = if segment_uuid.is_null() {
+            None
+        } else {
+            Some(
+                Uuid::from_slice(unsafe { std::slice::from_raw_parts(segment_uuid, 16) })
+                    .map_err(|e| lance_core::Error::invalid_input_source(e.into()))?,
+            )
+        };
+        scanner.scalar_index_segment = segment;
+        Ok(0)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +1743,7 @@ unsafe fn scanner_new_inner(
     let filter_str = unsafe { helpers::parse_c_string(filter)? }.map(|s| s.to_string());
 
     let mut scanner = LanceScanner::new(ds.snapshot());
-    scanner.columns = col_names;
+    scanner.projection = col_names.map(ProjectionSelection::Columns);
     scanner.filter = filter_str;
     Ok(Box::into_raw(Box::new(scanner)))
 }
@@ -615,6 +1762,14 @@ unsafe fn scanner_set_limit_inner(scanner: *mut LanceScanner, limit: i64) -> Res
         ));
     }
     let s = unsafe { &mut *scanner };
+    if s.nearest
+        .as_ref()
+        .is_some_and(|q| matches!(q.mode, NearestMode::Batch { .. }))
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            "global limit is unsupported for batch nearest; apply windows per query_index in the caller".into(),
+        ));
+    }
     s.limit = Some(limit);
     Ok(0)
 }
@@ -635,6 +1790,14 @@ unsafe fn scanner_set_offset_inner(scanner: *mut LanceScanner, offset: i64) -> R
         ));
     }
     let s = unsafe { &mut *scanner };
+    if s.nearest
+        .as_ref()
+        .is_some_and(|q| matches!(q.mode, NearestMode::Batch { .. }))
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            "global offset is unsupported for batch nearest; apply windows per query_index in the caller".into(),
+        ));
+    }
     s.offset = Some(offset);
     Ok(0)
 }
@@ -662,6 +1825,666 @@ unsafe fn scanner_set_batch_size_inner(scanner: *mut LanceScanner, batch_size: i
     Ok(0)
 }
 
+/// Set the target output batch size in bytes. Returns 0 on success.
+///
+/// The size must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_batch_size_bytes(
+    scanner: *mut LanceScanner,
+    batch_size_bytes: u64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_size_bytes_inner(scanner, batch_size_bytes)
+    })
+}
+
+unsafe fn scanner_set_batch_size_bytes_inner(
+    scanner: *mut LanceScanner,
+    batch_size_bytes: u64,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if batch_size_bytes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "batch_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("batch_size_bytes")?;
+    if scanner.strict_batch_size == Some(true) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}"
+            )
+            .into(),
+        ));
+    }
+    scanner.batch_size_bytes = Some(batch_size_bytes);
+    Ok(0)
+}
+
+/// Set the scanner I/O buffer size in bytes. Returns 0 on success.
+///
+/// The size must be between 1 and [`i64::MAX`] and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_io_buffer_size(
+    scanner: *mut LanceScanner,
+    io_buffer_size_bytes: u64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_io_buffer_size_inner(scanner, io_buffer_size_bytes)
+    })
+}
+
+unsafe fn scanner_set_io_buffer_size_inner(
+    scanner: *mut LanceScanner,
+    io_buffer_size_bytes: u64,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if io_buffer_size_bytes == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "io_buffer_size_bytes must be greater than 0, got 0".into(),
+        ));
+    }
+    if io_buffer_size_bytes > i64::MAX as u64 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "io_buffer_size_bytes must be at most {}, got {io_buffer_size_bytes}",
+                i64::MAX
+            )
+            .into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("io_buffer_size_bytes")?;
+    scanner.io_buffer_size = Some(io_buffer_size_bytes);
+    Ok(0)
+}
+
+/// Set the number of batches to decode concurrently. Returns 0 on success.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_batch_readahead(
+    scanner: *mut LanceScanner,
+    batch_readahead: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_batch_readahead_inner(scanner, batch_readahead)
+    })
+}
+
+unsafe fn scanner_set_batch_readahead_inner(
+    scanner: *mut LanceScanner,
+    batch_readahead: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if batch_readahead == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "batch_readahead must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("batch_readahead")?;
+    scanner.batch_readahead = Some(batch_readahead);
+    Ok(0)
+}
+
+/// Set the number of fragments to read ahead for unordered scans.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fragment_readahead(
+    scanner: *mut LanceScanner,
+    fragment_readahead: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fragment_readahead_inner(scanner, fragment_readahead)
+    })
+}
+
+unsafe fn scanner_set_fragment_readahead_inner(
+    scanner: *mut LanceScanner,
+    fragment_readahead: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if fragment_readahead == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "fragment_readahead must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("fragment_readahead")?;
+    scanner.fragment_readahead = Some(fragment_readahead);
+    Ok(0)
+}
+
+/// Set the target number of physical execution partitions.
+///
+/// The value must be greater than zero and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_target_parallelism(
+    scanner: *mut LanceScanner,
+    target_parallelism: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_target_parallelism_inner(scanner, target_parallelism)
+    })
+}
+
+unsafe fn scanner_set_target_parallelism_inner(
+    scanner: *mut LanceScanner,
+    target_parallelism: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if target_parallelism == 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "target_parallelism must be greater than 0, got 0".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("target_parallelism")?;
+    scanner.target_parallelism = Some(target_parallelism);
+    Ok(0)
+}
+
+/// Configure whether scan results are returned in storage order.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_scan_in_order(
+    scanner: *mut LanceScanner,
+    scan_in_order: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_scan_in_order_inner(scanner, scan_in_order)
+    })
+}
+
+unsafe fn scanner_set_scan_in_order_inner(
+    scanner: *mut LanceScanner,
+    scan_in_order: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("scan_in_order")?;
+    scanner.scan_in_order = Some(scan_in_order);
+    Ok(0)
+}
+
+/// Configure whether scalar indices may be used to optimize filters.
+///
+/// Scalar indices are enabled by default in Lance. Must be set before the scan
+/// starts. False also disables explicit scalar segment search while preserving
+/// the configured fragment domain and snapshot validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_scalar_index(
+    scanner: *mut LanceScanner,
+    use_scalar_index: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_scalar_index_inner(scanner, use_scalar_index)
+    })
+}
+
+unsafe fn scanner_set_use_scalar_index_inner(
+    scanner: *mut LanceScanner,
+    use_scalar_index: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("use_scalar_index")?;
+    scanner.use_scalar_index = Some(use_scalar_index);
+    Ok(0)
+}
+
+/// Configure whether output batches use the exact row-based batch size.
+///
+/// Must be set before the scan starts. Enabling this together with a
+/// byte-based batch-size limit is rejected without changing scanner state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_strict_batch_size(
+    scanner: *mut LanceScanner,
+    strict_batch_size: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_strict_batch_size_inner(scanner, strict_batch_size)
+    })
+}
+
+unsafe fn scanner_set_strict_batch_size_inner(
+    scanner: *mut LanceScanner,
+    strict_batch_size: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("strict_batch_size")?;
+    if strict_batch_size && let Some(batch_size_bytes) = scanner.batch_size_bytes {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "strict_batch_size=true cannot be combined with batch_size_bytes={batch_size_bytes}"
+            )
+            .into(),
+        ));
+    }
+    scanner.strict_batch_size = Some(strict_batch_size);
+    Ok(0)
+}
+
+/// Configure whether file statistics may be used to optimize the scan.
+///
+/// Statistics are enabled by default. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_use_stats(
+    scanner: *mut LanceScanner,
+    use_stats: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_use_stats_inner(scanner, use_stats)
+    })
+}
+
+unsafe fn scanner_set_use_stats_inner(scanner: *mut LanceScanner, use_stats: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("use_stats")?;
+    scanner.use_stats = Some(use_stats);
+    Ok(0)
+}
+
+/// Replace the native scan ordering.
+///
+/// `orderings == NULL` clears the ordering (Rust `None`). A non-NULL array,
+/// including `len == 0`, is an explicit ordering list (Rust `Some`); Lance
+/// treats an empty list as no ordering. Every entry and its column name are
+/// copied before this call returns. Column existence is validated by Lance
+/// when the scan is materialized.
+///
+/// Must be set before the scan starts. Invalid direction or NULL-order values
+/// are rejected without changing the previous ordering.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_order_by(
+    scanner: *mut LanceScanner,
+    orderings: *const LanceColumnOrdering,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_order_by_inner(scanner, orderings, len)
+    })
+}
+
+unsafe fn scanner_set_order_by_inner(
+    scanner: *mut LanceScanner,
+    orderings: *const LanceColumnOrdering,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("order_by")?;
+    if orderings.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "orderings is NULL but len > 0".into(),
+        ));
+    }
+
+    let parsed = if orderings.is_null() {
+        None
+    } else {
+        let specs = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(orderings, len) }
+        };
+        let mut parsed = Vec::with_capacity(specs.len());
+        for spec in specs {
+            parsed.push(unsafe { parse_column_ordering(spec)? });
+        }
+        Some(parsed)
+    };
+    scanner.order_by = parsed;
+    Ok(0)
+}
+
+unsafe fn parse_column_ordering(spec: &LanceColumnOrdering) -> Result<ColumnOrdering> {
+    let column_name = unsafe { helpers::parse_c_string(spec.column_name)? }
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source("order_by column_name must not be NULL".into())
+        })?
+        .to_owned();
+    let ascending = match spec.direction {
+        0 => true,
+        1 => false,
+        other => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "order_by direction must be 0 (LanceOrderDirection::Ascending) or 1 (LanceOrderDirection::Descending), got {other}"
+                )
+                .into(),
+            ));
+        }
+    };
+    let nulls_first = match spec.null_order {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
+                    "order_by null_order must be 0 (LanceNullOrder::NullsLast) or 1 (LanceNullOrder::NullsFirst), got {other}"
+                )
+                .into(),
+            ));
+        }
+    };
+    Ok(ColumnOrdering {
+        ascending,
+        nulls_first,
+        column_name,
+    })
+}
+
+/// Replace the scanner projection with ordered output-name / SQL-expression pairs.
+///
+/// `columns == NULL` with `len == 0` clears the projection, returning to the
+/// native unset projection (all columns). A non-NULL array, including
+/// `len == 0`, is an explicit projection; an empty array therefore selects no
+/// output columns. Entries and both strings are copied before this call
+/// returns. An invalid entry or a projection rejected by Lance leaves the
+/// previous projection unchanged.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_projection(
+    scanner: *mut LanceScanner,
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_projection_inner(scanner, columns, len)
+    })
+}
+
+unsafe fn scanner_set_projection_inner(
+    scanner: *mut LanceScanner,
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("projection")?;
+
+    let parsed = unsafe { parse_projection_columns(columns, len)? };
+    if let Some(columns) = &parsed {
+        scanner.validate_expression_projection(columns)?;
+    }
+    scanner.projection = parsed.map(ProjectionSelection::Expressions);
+    Ok(0)
+}
+
+unsafe fn parse_projection_columns(
+    columns: *const LanceProjectionColumn,
+    len: usize,
+) -> Result<Option<Vec<ProjectionExpression>>> {
+    if columns.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "columns is NULL but len > 0".into(),
+        ));
+    }
+    if columns.is_null() {
+        return Ok(None);
+    }
+    let specs = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(columns, len) }
+    };
+    let mut parsed = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let output_name = unsafe { helpers::parse_c_string(spec.output_name)? }
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "projection output_name must not be NULL".into(),
+                )
+            })?
+            .to_owned();
+        let expression = unsafe { helpers::parse_c_string(spec.expression)? }
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    "projection expression must not be NULL".into(),
+                )
+            })?
+            .to_owned();
+        parsed.push(ProjectionExpression {
+            output_name,
+            expression,
+        });
+    }
+    Ok(Some(parsed))
+}
+
+/// Disable automatic projection of `_score` / `_distance` for this scanner.
+///
+/// The published default remains unchanged unless this function succeeds:
+/// explicit projections still receive scoring columns automatically. Once
+/// disabled, the setting cannot be re-enabled on the same scanner; create a
+/// new scanner to restore the default. Must be called before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_disable_scoring_autoprojection(
+    scanner: *mut LanceScanner,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_disable_scoring_autoprojection_inner(scanner)
+    })
+}
+
+unsafe fn scanner_disable_scoring_autoprojection_inner(scanner: *mut LanceScanner) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("disable_scoring_autoprojection")?;
+    scanner.disable_scoring_autoprojection = true;
+    Ok(0)
+}
+
+/// Set how blob columns are materialized. `handling` is the C enum
+/// `LanceBlobHandling` as an integer: 0 descriptors for blob columns (the
+/// default), 1 bytes for every blob column, 2 descriptors for every binary
+/// column. Other values are rejected. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_blob_handling(
+    scanner: *mut LanceScanner,
+    handling: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_blob_handling_inner(scanner, handling)
+    })
+}
+
+unsafe fn scanner_set_blob_handling_inner(
+    scanner: *mut LanceScanner,
+    handling: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("blob_handling")?;
+    let parsed = match handling {
+        0 => BlobHandling::BlobsDescriptions,
+        1 => BlobHandling::AllBinary,
+        2 => BlobHandling::AllDescriptions,
+        other => {
+            return Err(lance_core::Error::invalid_input(format!(
+                "blob_handling must be 0 (blobs as descriptions), 1 (all binary) or 2 (all descriptions); got {other}"
+            )));
+        }
+    };
+    scanner.blob_handling = Some(parsed);
+    Ok(0)
+}
+
+unsafe fn parse_c_string_array_with_count(
+    values: *const *const c_char,
+    count: usize,
+    parameter_name: &str,
+) -> Result<Vec<String>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if values.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("{parameter_name} is NULL but early_except_column_count is {count}").into(),
+        ));
+    }
+    if count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "early_except_column_count {count} exceeds the maximum addressable array length"
+            )
+            .into(),
+        ));
+    }
+
+    let entries = unsafe { std::slice::from_raw_parts(values, count) };
+    let mut columns = Vec::with_capacity(count);
+    for (index, entry) in entries.iter().copied().enumerate() {
+        let column = unsafe { helpers::parse_c_string(entry)? }.ok_or_else(|| {
+            lance_core::Error::invalid_input_source(
+                format!("{parameter_name}[{index}] is NULL").into(),
+            )
+        })?;
+        columns.push(column.to_string());
+    }
+    Ok(columns)
+}
+
+/// Configure when ordinary scanner payload columns are materialized.
+///
+/// The style follows Lance's native `MaterializationStyle`. For
+/// `ALL_EARLY_EXCEPT`, `early_except_columns` contains column paths resolved by
+/// Lance's schema projection; an empty list means every column is early. The
+/// names are copied and resolved before this function returns. Native
+/// schema-projection errors are returned without changing the previous style.
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_materialization_style(
+    scanner: *mut LanceScanner,
+    style: i32,
+    early_except_columns: *const *const c_char,
+    early_except_column_count: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_materialization_style_inner(
+            scanner,
+            style,
+            early_except_columns,
+            early_except_column_count,
+        )
+    })
+}
+
+unsafe fn scanner_set_materialization_style_inner(
+    scanner: *mut LanceScanner,
+    style: i32,
+    early_except_columns: *const *const c_char,
+    early_except_column_count: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("materialization_style")?;
+    let style = LanceMaterializationStyle::from_i32(style)?;
+    if style != LanceMaterializationStyle::AllEarlyExcept && early_except_column_count != 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "early_except_column_count must be 0 for materialization_style={style:?}, got {early_except_column_count}"
+            )
+            .into(),
+        ));
+    }
+    let materialization_style = match style {
+        LanceMaterializationStyle::AllEarlyExcept => {
+            let columns = unsafe {
+                parse_c_string_array_with_count(
+                    early_except_columns,
+                    early_except_column_count,
+                    "early_except_columns",
+                )
+            }?;
+            MaterializationStyle::all_early_except(&columns, s.dataset.schema())?
+        }
+        LanceMaterializationStyle::Heuristic => MaterializationStyle::Heuristic,
+        LanceMaterializationStyle::AllLate => MaterializationStyle::AllLate,
+        LanceMaterializationStyle::AllEarly => MaterializationStyle::AllEarly,
+    };
+    s.materialization_style = materialization_style;
+    Ok(0)
+}
+
 /// Enable or disable row ID in scan output. Returns 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_with_row_id(
@@ -682,6 +2505,64 @@ unsafe fn scanner_with_row_id_inner(scanner: *mut LanceScanner, enable: bool) ->
     }
     let s = unsafe { &mut *scanner };
     s.with_row_id = enable;
+    Ok(0)
+}
+
+/// Enable or disable the `_rowaddr` metadata column in scan output.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_with_row_address(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_with_row_address_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_with_row_address_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("with_row_address")?;
+    scanner.with_row_address = enable;
+    Ok(0)
+}
+
+/// Configure whether deleted rows still present in storage are returned.
+///
+/// Requires with_row_id=true; deleted rows have a NULL `_rowid`.
+/// Filtered scans also need use_scalar_index=false because indices may omit
+/// tombstoned rows. Incompatible with scalar_index_segment.
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_include_deleted_rows(
+    scanner: *mut LanceScanner,
+    include_deleted_rows: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_include_deleted_rows_inner(scanner, include_deleted_rows)
+    })
+}
+
+unsafe fn scanner_set_include_deleted_rows_inner(
+    scanner: *mut LanceScanner,
+    include_deleted_rows: bool,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("include_deleted_rows")?;
+    scanner.include_deleted_rows = include_deleted_rows;
     Ok(0)
 }
 
@@ -722,7 +2603,88 @@ unsafe fn scanner_set_fragment_ids_inner(
     } else {
         &[]
     };
-    s.fragment_ids = Some(id_slice.to_vec());
+    s.fragment_selection = FragmentSelection::Ids(id_slice.to_vec());
+    Ok(0)
+}
+
+/// Restrict the scan or search to rows whose `_rowid` is in `row_ids`.
+///
+/// The ids are in the dataset's `_rowid` space: the stable row id when stable
+/// row ids are enabled, otherwise the row address. The allowlist is applied
+/// before ranking: a nearest or full-text search (including a prepared FTS
+/// query context) computes its top-k over the allowed rows only, and a plain
+/// scan reads only those rows. Combined with any filter expression (AND) and
+/// with a blocklist (allowed AND NOT blocked). `len == 0` allows no rows.
+/// Calling it again replaces the previous allowlist. Must be called before the
+/// scan starts; the ids are copied.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_row_addr_allowlist(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_row_addr_list_inner(scanner, row_ids, len, RowAddrList::Allow)
+    })
+}
+
+/// Exclude rows whose `_rowid` is in `row_ids` from the scan or search.
+///
+/// Same `_rowid` space, timing, and replacement semantics as
+/// `lance_scanner_set_row_addr_allowlist`. `len == 0` blocks no rows.
+///
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_row_addr_blocklist(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_row_addr_list_inner(scanner, row_ids, len, RowAddrList::Block)
+    })
+}
+
+enum RowAddrList {
+    Allow,
+    Block,
+}
+
+unsafe fn scanner_set_row_addr_list_inner(
+    scanner: *mut LanceScanner,
+    row_ids: *const u64,
+    len: usize,
+    list: RowAddrList,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if row_ids.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "row_ids is NULL but len > 0".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started(match list {
+        RowAddrList::Allow => "row_addr_allowlist",
+        RowAddrList::Block => "row_addr_blocklist",
+    })?;
+    let ids = if len > 0 {
+        unsafe { std::slice::from_raw_parts(row_ids, len) }
+    } else {
+        &[]
+    };
+    let tree_map: RowAddrTreeMap = ids.iter().collect();
+    match list {
+        RowAddrList::Allow => s.row_addr_allowlist = Some(tree_map),
+        RowAddrList::Block => s.row_addr_blocklist = Some(tree_map),
+    }
     Ok(0)
 }
 
@@ -780,6 +2742,111 @@ unsafe fn scanner_set_substrait_filter_inner(
     let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
     let s = unsafe { &mut *scanner };
     s.substrait_filter = Some(slice.to_vec());
+    Ok(0)
+}
+
+/// Set a Substrait aggregate plan on the scanner.
+///
+/// `bytes` must point to a serialized Substrait `Plan` whose first relation is
+/// an `AggregateRel`, either directly or through a `RelRoot`. Field references
+/// use positions in the dataset schema. The plan is validated immediately
+/// against the dataset schema on a temporary native scanner, and the previous
+/// aggregate is retained when validation fails.
+///
+/// - `scanner`: An open `LanceScanner*`.
+/// - `bytes`: Pointer to serialized Substrait `Plan` bytes. NULL is accepted
+///   only when `len` is zero, in which case the empty byte string reaches
+///   native plan validation. The bytes are copied into the scanner.
+/// - `len`: Length of the byte buffer.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_substrait_aggregate(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_substrait_aggregate_inner(scanner, bytes, len)
+    })
+}
+
+unsafe fn scanner_set_substrait_aggregate_inner(
+    scanner: *mut LanceScanner,
+    bytes: *const u8,
+    len: usize,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("substrait_aggregate")?;
+    if len > isize::MAX as usize {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("substrait aggregate len {len} exceeds isize::MAX").into(),
+        ));
+    }
+    if bytes.is_null() && len > 0 {
+        return Err(lance_core::Error::invalid_input_source(
+            "bytes is NULL but len > 0".into(),
+        ));
+    }
+    let slice = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    let bytes = slice.to_vec();
+    let mut validation_scanner = s.dataset.scan();
+    validation_scanner.aggregate(AggregateExpr::substrait(bytes.clone()))?;
+    s.substrait_aggregate = Some(bytes);
+    Ok(0)
+}
+
+/// Add an SQL filter that is combined with the scanner's selected primary filter using AND.
+///
+/// The primary filter is the Substrait filter when one is set, otherwise it is the SQL filter
+/// passed to `lance_scanner_new`. Multiple additional SQL filters are also combined using AND.
+/// This must be called before the scan starts. The string is copied into the scanner.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_additional_sql_filter(
+    scanner: *mut LanceScanner,
+    filter: *const c_char,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_additional_sql_filter_inner(scanner, filter)
+    })
+}
+
+unsafe fn scanner_additional_sql_filter_inner(
+    scanner: *mut LanceScanner,
+    filter: *const c_char,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let filter = unsafe { helpers::parse_c_string(filter)? }
+        .ok_or_else(|| lance_core::Error::invalid_input_source("filter must not be NULL".into()))?;
+    if filter.is_empty() {
+        return Err(lance_core::Error::invalid_input_source(
+            "additional SQL filter must be non-empty".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    if scanner.scan_started.load(Ordering::Acquire) {
+        return Err(lance_core::Error::invalid_input_source(
+            "additional SQL filter must be set before the scan starts".into(),
+        ));
+    }
+    scanner.additional_sql_filters.push(filter.to_string());
     Ok(0)
 }
 
@@ -875,6 +2942,147 @@ pub unsafe extern "C" fn lance_scanner_close(scanner: *mut LanceScanner) {
     }
 }
 
+/// Export the configured scanner output schema without starting a scan.
+///
+/// `out` must point to an empty ArrowSchema (release callback NULL). Planning
+/// may perform read-only index metadata and candidate work required by the
+/// configured execution path, but it never advances a scanner-owned or
+/// exported stream. The scanner remains configurable after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_schema(
+    scanner: *const LanceScanner,
+    out: *mut FFI_ArrowSchema,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe { scanner_schema_inner(scanner, out) })
+}
+
+unsafe fn scanner_schema_inner(
+    scanner: *const LanceScanner,
+    out: *mut FFI_ArrowSchema,
+) -> Result<i32> {
+    if scanner.is_null() || out.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner and out must not be NULL".into(),
+        ));
+    }
+    if unsafe { &*out }.release.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "out must be an empty ArrowSchema (release callback must be NULL)".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    let schema = block_on(scanner.build_scanner()?.schema())?;
+    let ffi_schema = FFI_ArrowSchema::try_from(schema.as_ref())?;
+    unsafe {
+        ptr::write_unaligned(out, ffi_schema);
+    }
+    Ok(0)
+}
+
+/// Explain the configured scanner plan without executing it.
+///
+/// `verbose` selects the native DataFusion tree formatting. The returned
+/// string is owned by the caller and must be freed with `lance_free_string()`.
+/// Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_explain_plan(
+    scanner: *const LanceScanner,
+    verbose: bool,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::Explain(verbose))
+    })
+}
+
+/// Execute and format the configured scanner plan with native runtime metrics.
+///
+/// This executes the same plan a scan from this configuration would use,
+/// including binding-required scalar-segment, multi-vector, and prepared FTS
+/// transformations. It does not consume or advance any existing stream. The
+/// returned string is owned by the caller and must be freed with
+/// `lance_free_string()`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_analyze_plan(scanner: *const LanceScanner) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::Analyze)
+    })
+}
+
+/// Count rows matched by the configured scanner.
+///
+/// This applies the native `COUNT(*)` aggregate to the configured scanner
+/// plan and executes that count plan. Planning rejects any configured limit,
+/// offset, or ordering with the native aggregate error. It does not count
+/// batches from a stream. Returns 0 on error; an empty match also returns 0,
+/// so check `lance_last_error_code()`. The scanner remains configurable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_count_rows(scanner: *const LanceScanner) -> u64 {
+    scanner_poison_check!(scanner, 0);
+    scanner_ffi_try_value!(scanner, 0, unsafe { scanner_count_rows_inner(scanner) })
+}
+
+unsafe fn scanner_count_rows_inner(scanner: *const LanceScanner) -> Result<u64> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    block_on(scanner.build_count_scanner()?.count_rows())
+}
+
+/// Execute and format the configured native `COUNT(*)` plan.
+///
+/// This is the plan used by `lance_scanner_count_rows`, not the ordinary scan
+/// plan. The returned string is owned by the caller and must be freed with
+/// `lance_free_string()`. Returns NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_analyze_count_plan(
+    scanner: *const LanceScanner,
+) -> *const c_char {
+    scanner_poison_check!(scanner, ptr::null());
+    scanner_ffi_try_value!(scanner, ptr::null(), unsafe {
+        scanner_plan_string_inner(scanner, ScannerPlanString::AnalyzeCount)
+    })
+}
+
+enum ScannerPlanString {
+    Explain(bool),
+    Analyze,
+    AnalyzeCount,
+}
+
+unsafe fn scanner_plan_string_inner(
+    scanner: *const LanceScanner,
+    operation: ScannerPlanString,
+) -> Result<*const c_char> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &*scanner };
+    let value = match operation {
+        ScannerPlanString::Explain(verbose) => {
+            block_on(scanner.build_scanner()?.explain_plan(verbose))?
+        }
+        ScannerPlanString::Analyze => block_on(scanner.build_scanner()?.analyze_plan())?,
+        ScannerPlanString::AnalyzeCount => {
+            block_on(scanner.build_count_scanner()?.analyze_count_plan())?
+        }
+    };
+    CString::new(value)
+        .map(|value| value.into_raw() as *const c_char)
+        .map_err(|error| {
+            lance_core::Error::internal(format!(
+                "scanner plan output contains an embedded NUL: {error}"
+            ))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Sync stream: ArrowArrayStream export
 // ---------------------------------------------------------------------------
@@ -947,6 +3155,7 @@ unsafe fn scanner_to_arrow_stream_inner(
     s: &LanceScanner,
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<i32> {
+    s.begin_scan();
     let built_scanner = s.build_scanner()?;
     let stream = block_on(built_scanner.try_into_stream())?;
     let schema = stream.schema();
@@ -1116,8 +3325,9 @@ unsafe fn scan_async_guarded(
     } else {
         Some(unsafe { &*scanner }.poison_flag())
     };
-    let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup(scanner, completion)));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        setup(scanner, completion.clone())
+    }));
     if let Err(payload) = outcome {
         if let Some(flag) = poison_flag {
             flag.store(true, Ordering::SeqCst);
@@ -1167,6 +3377,7 @@ unsafe fn scan_async_setup(scanner: *const LanceScanner, completion: Completion)
         return;
     }
 
+    s.begin_scan();
     let built_scanner = match s.build_scanner() {
         Ok(sc) => sc,
         Err(err) => {
@@ -1529,9 +3740,279 @@ macro_rules! scanner_set_u32 {
     };
 }
 
-scanner_set_u32!(lance_scanner_set_nprobes, nprobes);
-scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
+/// Configure refinement without exceeding a batch query's candidate budget.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_refine_factor(
+    scanner: *mut LanceScanner,
+    value: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(
+        scanner,
+        (|| -> Result<i32> {
+            let s = unsafe { scanner.as_mut() }
+                .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+            if let Some(NearestQuery {
+                mode: NearestMode::Batch { num_queries },
+                k,
+                ..
+            }) = &s.nearest
+            {
+                s.ensure_scan_not_started("refine_factor")?;
+                validate_batch_candidates(*num_queries, *k, Some(value))?;
+            }
+            s.refine_factor = Some(value);
+            Ok(0)
+        })()
+    )
+}
 scanner_set_u32!(lance_scanner_set_ef, ef);
+
+/// Set inclusive lower and exclusive upper distance bounds on a single-vector query.
+///
+/// NULL bounds are unbounded. Values are copied and must be finite, with lower < upper
+/// when both are present. Call after nearest and before scanning; k still caps results.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_distance_range(
+    scanner: *mut LanceScanner,
+    lower_bound: *const f32,
+    upper_bound: *const f32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_distance_range_inner(scanner, lower_bound, upper_bound)
+    })
+}
+
+unsafe fn scanner_set_distance_range_inner(
+    scanner: *mut LanceScanner,
+    lower_bound: *const f32,
+    upper_bound: *const f32,
+) -> Result<i32> {
+    let invalid = |message: String| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() {
+        return Err(invalid("scanner is NULL".into()));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("distance_range")?;
+    let nearest = scanner
+        .nearest
+        .as_mut()
+        .ok_or_else(|| invalid("distance_range requires nearest() to be configured".into()))?;
+    // Range bounds are currently a single-query contract. Both batch and
+    // multi-vector queries use matrices, so check the explicit mode.
+    if nearest.mode != NearestMode::Single {
+        return Err(invalid(
+            "distance_range requires a single-vector nearest query".into(),
+        ));
+    }
+    let lower_bound = unsafe { lower_bound.as_ref() }.copied();
+    let upper_bound = unsafe { upper_bound.as_ref() }.copied();
+    for (name, bound) in [("lower_bound", lower_bound), ("upper_bound", upper_bound)] {
+        if let Some(value) = bound
+            && !value.is_finite()
+        {
+            return Err(invalid(format!("{name} must be finite, got {value}")));
+        }
+    }
+    if let (Some(lower), Some(upper)) = (lower_bound, upper_bound)
+        && lower >= upper
+    {
+        return Err(invalid(format!(
+            "lower_bound ({lower}) must be less than upper_bound ({upper})"
+        )));
+    }
+    nearest.lower_bound = lower_bound;
+    nearest.upper_bound = upper_bound;
+    Ok(0)
+}
+
+/// Set both vector-index partition-search bounds to the same value.
+///
+/// This replaces any values previously configured through
+/// `minimum_nprobes` or `maximum_nprobes`. The value must be greater than zero
+/// and must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_nprobes(
+    scanner: *mut LanceScanner,
+    nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_nprobes_inner(scanner, nprobes)
+    })
+}
+
+unsafe fn scanner_set_nprobes_inner(scanner: *mut LanceScanner, nprobes: u32) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("nprobes")?;
+    let next = scanner.probe.with_nprobes(nprobes)?;
+    scanner.probe = next;
+    Ok(0)
+}
+
+/// Set the minimum number of vector-index partitions to search.
+///
+/// The value must be greater than zero and no greater than an explicit
+/// `maximum_nprobes`. A conflict with only a fixed `nprobes` count is reported
+/// when the nearest scan is prepared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_minimum_nprobes(
+    scanner: *mut LanceScanner,
+    minimum_nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_minimum_nprobes_inner(scanner, minimum_nprobes)
+    })
+}
+
+unsafe fn scanner_set_minimum_nprobes_inner(
+    scanner: *mut LanceScanner,
+    minimum_nprobes: u32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("minimum_nprobes")?;
+    let next = scanner.probe.with_minimum(minimum_nprobes)?;
+    scanner.probe = next;
+    Ok(0)
+}
+
+/// Set the maximum number of vector-index partitions to search.
+///
+/// The value must be greater than zero and no less than an explicit
+/// `minimum_nprobes`. A conflict with only a fixed `nprobes` count is reported
+/// when the nearest scan is prepared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_maximum_nprobes(
+    scanner: *mut LanceScanner,
+    maximum_nprobes: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_maximum_nprobes_inner(scanner, maximum_nprobes)
+    })
+}
+
+unsafe fn scanner_set_maximum_nprobes_inner(
+    scanner: *mut LanceScanner,
+    maximum_nprobes: u32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("maximum_nprobes")?;
+    let next = scanner.probe.with_maximum(maximum_nprobes)?;
+    scanner.probe = next;
+    Ok(0)
+}
+
+/// Set the native continuous IVF search effort.
+///
+/// The value must be finite and in `[0, 1]`. Any explicit effort, including
+/// `0.5`, ignores a previously configured fixed nprobes count while preserving
+/// explicit minimum and maximum probe bounds, regardless of setter order.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_search_effort(
+    scanner: *mut LanceScanner,
+    effort: f64,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_search_effort_inner(scanner, effort)
+    })
+}
+
+unsafe fn scanner_set_search_effort_inner(scanner: *mut LanceScanner, effort: f64) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("search_effort")?;
+    scanner.probe = scanner.probe.with_effort(effort)?;
+    Ok(0)
+}
+
+/// Configure the speed / accuracy tradeoff for approximate vector search.
+///
+/// Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_approx_mode(
+    scanner: *mut LanceScanner,
+    approx_mode: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_approx_mode_inner(scanner, approx_mode)
+    })
+}
+
+unsafe fn scanner_set_approx_mode_inner(
+    scanner: *mut LanceScanner,
+    approx_mode: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let approx_mode = LanceApproxMode::from_i32(approx_mode)?;
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("approx_mode")?;
+    scanner.approx_mode = Some(approx_mode);
+    Ok(0)
+}
+
+/// Set vector index partition-search concurrency for each query.
+///
+/// `-1` uses the CPU pool size, `0` selects Lance's automatic policy, and
+/// positive values request that many workers. Values below `-1` are invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_query_parallelism(
+    scanner: *mut LanceScanner,
+    query_parallelism: i32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_query_parallelism_inner(scanner, query_parallelism)
+    })
+}
+
+unsafe fn scanner_set_query_parallelism_inner(
+    scanner: *mut LanceScanner,
+    query_parallelism: i32,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    if query_parallelism < -1 {
+        return Err(lance_core::Error::invalid_input_source(
+            format!("query_parallelism must be -1, 0, or greater than 0, got {query_parallelism}")
+                .into(),
+        ));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("query_parallelism")?;
+    scanner.query_parallelism = Some(query_parallelism);
+    Ok(0)
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_scanner_set_metric(scanner: *mut LanceScanner, metric: i32) -> i32 {
@@ -1584,6 +4065,40 @@ unsafe fn scanner_set_use_index_inner(scanner: *mut LanceScanner, enable: bool) 
     unsafe {
         (*scanner).use_index = Some(enable);
     }
+    Ok(0)
+}
+
+/// Configure native indexed-only fast search.
+///
+/// This weak-consistency mode applies to vector queries, scalar-indexed filters
+/// and full-text search. Index-backed paths can omit unindexed data. Ordinary
+/// scans and non-indexable expressions follow native planning.
+///
+/// Lance's native `fast_search()` is applied before the nearest query and
+/// explicit `use_index` setting. For vector queries, unindexed fragments are
+/// omitted and the result is empty without a usable index, including when
+/// `use_index=false`. Disabling restores the default native behavior.
+/// Disabled by default. Must be set before the scan starts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fast_search(
+    scanner: *mut LanceScanner,
+    enable: bool,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fast_search_inner(scanner, enable)
+    })
+}
+
+unsafe fn scanner_set_fast_search_inner(scanner: *mut LanceScanner, enable: bool) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner is NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("fast_search")?;
+    s.fast_search = enable;
     Ok(0)
 }
 
@@ -1719,18 +4234,194 @@ unsafe fn scanner_nearest_inner(
     }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
 
-    let dtype = match element_type {
-        0 => LanceDataType::Float32,
-        1 => LanceDataType::Float16,
-        2 => LanceDataType::Float64,
-        3 => LanceDataType::UInt8,
-        4 => LanceDataType::Int8,
+    let query = unsafe { decode_query_values(query_data, query_len, element_type)? };
+
+    s.nearest = Some(NearestQuery {
+        mode: NearestMode::Single,
+        column: column_str.to_string(),
+        query,
+        k,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    Ok(0)
+}
+
+/// Set independent nearest-neighbor queries copied from a row-major matrix.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest_batch(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_queries: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        nearest_batch_inner(
+            scanner,
+            column,
+            query_data,
+            dimension,
+            num_queries,
+            element_type,
+            k,
+        )
+    })
+}
+
+unsafe fn nearest_batch_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_queries: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
+    use arrow_schema::{DataType, Field};
+    let invalid = |message: String| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(invalid(
+            "scanner, column, and query_data must not be NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("nearest_batch")?;
+    if dimension == 0 || dimension > i32::MAX as usize || k == 0 {
+        return Err(invalid(format!(
+            "dimension ({dimension}) and k ({k}) must be positive; dimension must fit int32"
+        )));
+    }
+    if num_queries == 0 || num_queries > MAX_BATCH_QUERIES {
+        return Err(invalid(format!(
+            "num_queries ({num_queries}) must be in 1..={MAX_BATCH_QUERIES}"
+        )));
+    }
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(invalid(
+            "batch nearest and full-text search are mutually exclusive".into(),
+        ));
+    }
+    if s.limit.is_some() || s.offset.is_some() {
+        return Err(invalid("batch nearest does not support global limit/offset; apply windows per query_index in the caller".into()));
+    }
+    validate_batch_candidates(num_queries, k, s.refine_factor)?;
+    let (data_type, width) = match element_type {
+        0 => (DataType::Float32, 4),
+        1 => (DataType::Float16, 2),
+        2 => (DataType::Float64, 8),
+        3 => (DataType::UInt8, 1),
+        4 => (DataType::Int8, 1),
+        _ => {
+            return Err(invalid(format!(
+                "batch element_type ({element_type}) must be float16, float32, float64, uint8, or int8"
+            )));
+        }
+    };
+    let count = batch_query_value_count(dimension, num_queries, width)?;
+    let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
+    if s.dataset.schema().field("query_index").is_some() {
+        return Err(invalid(
+            "batch nearest reserves the dataset column name query_index".into(),
+        ));
+    }
+    let field = s
+        .dataset
+        .schema()
+        .field(column)
+        .ok_or_else(|| invalid(format!("batch vector column {column:?} does not exist")))?;
+    match field.data_type() {
+        DataType::FixedSizeList(element, dim)
+            if dim == dimension as i32 && *element.data_type() == data_type => {}
+        actual => {
+            return Err(invalid(format!(
+                "batch column {column:?} must be FixedSizeList<{data_type}, {dimension}>, got {actual}"
+            )));
+        }
+    }
+    let values = unsafe { decode_query_values(query_data, count, element_type)? };
+    let finite = match values.data_type() {
+        DataType::Float16 => values
+            .as_any()
+            .downcast_ref::<Float16Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(|v| v.is_finite())),
+        DataType::Float32 => values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(f32::is_finite)),
+        DataType::Float64 => values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(f64::is_finite)),
+        DataType::UInt8 | DataType::Int8 => true,
+        actual => {
+            // A future decoder type must return an input error instead of poisoning the scanner.
+            return Err(invalid(format!(
+                "unsupported batch query data type {actual} for element_type={element_type}"
+            )));
+        }
+    };
+    if !finite {
+        return Err(invalid(
+            "batch query values must be finite and non-null".into(),
+        ));
+    }
+    // Keep the matrix shape even for one query: Lance uses it to emit query_index.
+    let query = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", data_type, false)),
+        dimension as i32,
+        values,
+        None,
+    )?;
+    s.nearest = Some(NearestQuery {
+        mode: NearestMode::Batch { num_queries },
+        column: column.to_string(),
+        query: Arc::new(query),
+        k,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    Ok(0)
+}
+
+unsafe fn decode_query_values(
+    query_data: *const c_void,
+    query_len: usize,
+    element_type: i32,
+) -> Result<arrow_array::ArrayRef> {
+    let (dtype, alignment) = match element_type {
+        0 => (LanceDataType::Float32, std::mem::align_of::<f32>()),
+        1 => (LanceDataType::Float16, std::mem::align_of::<half::f16>()),
+        2 => (LanceDataType::Float64, std::mem::align_of::<f64>()),
+        3 => (LanceDataType::UInt8, std::mem::align_of::<u8>()),
+        4 => (LanceDataType::Int8, std::mem::align_of::<i8>()),
         _ => {
             return Err(lance_core::Error::invalid_input_source(
                 format!("invalid element_type: {}", element_type).into(),
             ));
         }
     };
+
+    // from_raw_parts requires alignment even when the caller supplies raw bytes.
+    // Validate here so single, multi-vector, and batch queries share the same guard.
+    if !(query_data as usize).is_multiple_of(alignment) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "query_data must be aligned to {alignment} bytes for element_type={element_type}"
+            )
+            .into(),
+        ));
+    }
 
     let query: arrow_array::ArrayRef = match dtype {
         LanceDataType::Float32 => {
@@ -1757,10 +4448,116 @@ unsafe fn scanner_nearest_inner(
         }
     };
 
+    Ok(query)
+}
+
+/// Set one multi-vector query, supplied as a row-major matrix of floating-point values.
+/// The caller must supply dimension * num_vectors aligned elements matching the column type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest_multivector(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_vectors: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        nearest_multivector_inner(
+            scanner,
+            column,
+            query_data,
+            dimension,
+            num_vectors,
+            element_type,
+            k,
+        )
+    },)
+}
+
+unsafe fn nearest_multivector_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_vectors: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    use arrow_schema::{DataType, Field};
+    let invalid = |message: &str| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(invalid("scanner, column, and query_data must not be NULL"));
+    }
+    if dimension == 0 || dimension > i32::MAX as usize || num_vectors == 0 || k == 0 {
+        return Err(invalid(
+            "dimension, num_vectors, and k must be positive; dimension must fit int32",
+        ));
+    }
+    if num_vectors > crate::multivector::MAX_QUERY_VECTORS
+        || num_vectors > crate::multivector::MAX_QUERY_VECTOR_CANDIDATES / k as usize
+    {
+        return Err(invalid(
+            "multi-vector query exceeds 128 subvectors or 100000 subvector-candidates",
+        ));
+    }
+    let (data_type, width) = match element_type {
+        0 => (DataType::Float32, 4),
+        1 => (DataType::Float16, 2),
+        2 => (DataType::Float64, 8),
+        _ => {
+            return Err(invalid(
+                "multi-vector queries require float16, float32, or float64",
+            ));
+        }
+    };
+    let count = dimension
+        .checked_mul(num_vectors)
+        .filter(|count| *count <= isize::MAX as usize / width)
+        .ok_or_else(|| invalid("query matrix byte size overflows"))?;
+    let s = unsafe { &mut *scanner };
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(invalid(
+            "nearest and full-text search are mutually exclusive",
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
+    let field = s
+        .dataset
+        .schema()
+        .field(column)
+        .ok_or_else(|| invalid("multi-vector column does not exist"))?;
+    match field.data_type() {
+        DataType::List(child) if !child.is_nullable() => match child.data_type() {
+            DataType::FixedSizeList(element, dim)
+                if *dim == dimension as i32 && *element.data_type() == data_type => {}
+            _ => return Err(invalid("multi-vector dimension/type mismatch")),
+        },
+        _ => {
+            return Err(invalid(
+                "multi-vector column must be List of non-nullable FixedSizeList",
+            ));
+        }
+    }
+    // A primitive array is interpreted as one vector by Lance. Preserve matrix shape even
+    // for a single subvector. Lance does not preserve element nullability in its schema.
+    let values = unsafe { decode_query_values(query_data, count, element_type)? };
+    crate::multivector::validate_query(values.as_ref())?;
+    let query = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", data_type, false)),
+        dimension as i32,
+        values,
+        None,
+    )?;
     s.nearest = Some(NearestQuery {
-        column: column_str.to_string(),
-        query,
+        mode: NearestMode::MultiVector,
+        column: column.to_string(),
+        query: Arc::new(query),
         k,
+        lower_bound: None,
+        upper_bound: None,
     });
     Ok(0)
 }
@@ -1768,6 +4565,53 @@ unsafe fn scanner_nearest_inner(
 // ---------------------------------------------------------------------------
 // Full-text search (Phase 2)
 // ---------------------------------------------------------------------------
+
+/// Set a native MinHash LSH text-similarity query on the scanner.
+///
+/// The column and text are copied. A valid earlier query remains attached when
+/// validation fails. The column must be non-empty; an empty text is accepted by
+/// native Lance and produces no matching signatures. The scan must have an
+/// explicit limit before planning; the native scanner limit controls the number
+/// of result rows. Native planning adds `_distance`, equal to one minus the
+/// estimated Jaccard similarity.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_minhash_query(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    text: *const c_char,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_minhash_query_inner(scanner, column, text)
+    })
+}
+
+unsafe fn scanner_set_minhash_query_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    text: *const c_char,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("MinHash column must not be NULL".into())
+    })?;
+    let text = unsafe { helpers::parse_c_string(text)? }.ok_or_else(|| {
+        lance_core::Error::invalid_input_source("MinHash text must not be NULL".into())
+    })?;
+    let query = MinHashQuery::new(text.to_string(), column.to_string());
+    let scanner = unsafe { &mut *scanner };
+    // Reuse the public native builder for its validation phase without
+    // disturbing this scanner's existing query state.
+    scanner.dataset.scan().minhash_search(query.clone())?;
+    scanner.minhash_query = Some(query);
+    Ok(0)
+}
 
 /// Set a BM25 full-text search query on the scanner.
 ///
@@ -1836,6 +4680,50 @@ unsafe fn fts_inner(
     }
 
     s.fts_query = Some(fts);
+    Ok(0)
+}
+
+/// Attach an immutable typed full-text query tree to this scanner.
+///
+/// The scanner snapshots the query value, so the query handle and every source
+/// child handle may be closed after this function returns successfully.
+///
+/// Returns 0 on success, -1 on error (check `lance_last_error_*`). This is
+/// mutually exclusive with nearest search and prepared FTS query contexts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_fts_query(
+    scanner: *mut LanceScanner,
+    query: *const LanceFtsQuery,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_fts_query_inner(scanner, query)
+    })
+}
+
+unsafe fn scanner_set_fts_query_inner(
+    scanner: *mut LanceScanner,
+    query: *const LanceFtsQuery,
+) -> Result<i32> {
+    if scanner.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "scanner must not be NULL".into(),
+        ));
+    }
+    let query = unsafe { clone_query(query)? };
+    let scanner = unsafe { &mut *scanner };
+    if scanner.nearest.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach a typed FTS query after nearest; they are mutually exclusive".into(),
+        ));
+    }
+    if scanner.fts_context.is_some() {
+        return Err(lance_core::Error::invalid_input_source(
+            "cannot attach a typed FTS query after an FTS query context; the context already owns the query"
+                .into(),
+        ));
+    }
+    scanner.fts_query = Some(FullTextSearchQuery::new_query(query));
     Ok(0)
 }
 
@@ -1918,6 +4806,10 @@ mod tests {
     use super::*;
     use crate::dataset::{lance_dataset_close, lance_dataset_open};
     use crate::error::{lance_last_error_code, lance_last_error_message};
+    use crate::fts_query::{
+        LanceFtsCoverageMode, LanceFtsMatchOperator, lance_dataset_prepare_fts_match_query,
+        lance_fts_query_context_close,
+    };
     use std::ffi::{CStr, CString};
     use std::sync::atomic::{AtomicI32, AtomicUsize};
     use std::sync::{Barrier, mpsc};
@@ -1925,6 +4817,139 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use lance::index::DatasetIndexExt;
+    use lance::io::exec::PreFilterSource;
+    use lance_index::{IndexType, scalar::InvertedIndexParams};
+
+    #[test]
+    fn batch_query_sizes_distinguish_overflow_from_byte_limit() {
+        for (dimension, num_queries, width) in [(usize::MAX, 2, 1), (usize::MAX / 2 + 1, 1, 2)] {
+            let error = batch_query_value_count(dimension, num_queries, width)
+                .unwrap_err()
+                .to_string();
+            for detail in [
+                "overflows usize".to_string(),
+                format!("dimension={dimension}"),
+                format!("num_queries={num_queries}"),
+                format!("element_width={width}"),
+            ] {
+                assert!(error.contains(&detail), "{error} lacks {detail}");
+            }
+        }
+        assert_eq!(
+            batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8, 1, 8).unwrap(),
+            MAX_BATCH_QUERY_BYTES / 8
+        );
+        let error = batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8 + 1, 1, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds limit"), "{error}");
+        assert!(!error.contains("overflows"), "{error}");
+    }
+
+    #[test]
+    fn query_decoder_rejects_unaligned_typed_buffers() {
+        let storage = [0u64; 4];
+        let unaligned = unsafe { storage.as_ptr().cast::<u8>().add(1) }.cast();
+        for element_type in [0, 1, 2] {
+            let error = unsafe { decode_query_values(unaligned, 2, element_type) }
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("query_data must be aligned"), "{error}");
+        }
+    }
+
+    #[test]
+    fn batch_matrix_does_not_enter_multivector_scoring() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+        use futures::TryStreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("batch.lance");
+        let element = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors = FixedSizeListArray::try_new(
+            element.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![0., 0., 1., 0., 4., 0., 5., 0.])),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("embedding", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        block_on(Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri.to_str().unwrap(),
+            None,
+        ))
+        .unwrap();
+        let (dataset, scanner) = open_dataset_and_scanner(uri.to_str().unwrap());
+        unsafe {
+            (*scanner).nearest = Some(NearestQuery {
+                mode: NearestMode::Batch { num_queries: 2 },
+                column: "embedding".to_string(),
+                query: Arc::new(
+                    FixedSizeListArray::try_new(
+                        element,
+                        2,
+                        Arc::new(Float32Array::from(vec![0., 0., 4., 0.])),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+            });
+            (*scanner).use_index = Some(false);
+            let result = block_on(async {
+                (*scanner)
+                    .build_scanner()?
+                    .try_into_stream()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await
+            });
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+            let batches =
+                result.expect("independent batch queries must not use multivector scoring");
+            let mut rows = Vec::new();
+            for batch in batches {
+                let queries = batch
+                    .column_by_name("query_index")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let distances = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((queries.value(row), ids.value(row), distances.value(row)));
+                }
+            }
+            rows.sort_by_key(|row| (row.0, row.1));
+            assert_eq!(rows, vec![(0, 0, 0.), (0, 1, 1.), (1, 2, 0.), (1, 3, 1.)]);
+        }
+    }
 
     /// Write a 3-row dataset to a tempdir, returning (tempdir, uri).
     fn create_test_dataset() -> (tempfile::TempDir, String) {
@@ -1969,6 +4994,209 @@ mod tests {
             .store(true, Ordering::SeqCst);
     }
 
+    fn prepared_fts_plan_shape(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize) {
+        let mut match_query_execs = 0;
+        let mut flat_match_query_execs = 0;
+        let mut filtered_row_id_prefilters = 0;
+        if let Some(exec) = plan.downcast_ref::<MatchQueryExec>() {
+            match_query_execs += 1;
+            if matches!(exec.prefilter_source(), PreFilterSource::FilteredRowIds(_)) {
+                filtered_row_id_prefilters += 1;
+            }
+        }
+        if plan.downcast_ref::<FlatMatchQueryExec>().is_some() {
+            flat_match_query_execs += 1;
+        }
+        for child in plan.children() {
+            let (child_match, child_flat, child_filtered) =
+                prepared_fts_plan_shape(&Arc::clone(child));
+            match_query_execs += child_match;
+            flat_match_query_execs += child_flat;
+            filtered_row_id_prefilters += child_filtered;
+        }
+        (
+            match_query_execs,
+            flat_match_query_execs,
+            filtered_row_id_prefilters,
+        )
+    }
+
+    #[test]
+    fn nprobes_setters_share_one_validated_range() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let assert_range = |minimum, maximum| {
+            assert_eq!(
+                unsafe { &*scanner }.probe,
+                ProbeConfig {
+                    minimum,
+                    maximum,
+                    ..ProbeConfig::default()
+                }
+            );
+        };
+
+        assert_range(None, None);
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, 0);
+        assert_range(Some(2), None);
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 5) }, 0);
+        assert_range(Some(2), Some(5));
+
+        // The combined setter replaces both bounds.
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 4) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(4).unwrap()
+        );
+
+        // A fixed count and an explicit minimum can be staged before the
+        // explicit maximum. Their no-effort conflict is checked when the
+        // nearest scan is prepared, not while the range is still incomplete.
+        assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 5) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(4),
+                minimum: Some(5),
+                maximum: None,
+                search_effort: None,
+            }
+        );
+        assert!(unsafe { &*scanner }.probe.validate_for_scan().is_err());
+
+        // An explicit maximum completes the range without changing the
+        // staged minimum.
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 6) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(4),
+                minimum: Some(5),
+                maximum: Some(6),
+                search_effort: None,
+            }
+        );
+        unsafe { &*scanner }.probe.validate_for_scan().unwrap();
+
+        // A later combined call deterministically replaces the widened range.
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 3) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig::default().with_nprobes(3).unwrap()
+        );
+        assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+        assert!(unsafe { &*scanner }.probe.validate_for_scan().is_err());
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
+
+        // The combined setter clears explicit bounds but never discards an
+        // effort supplied before it.
+        assert_eq!(unsafe { lance_scanner_set_search_effort(scanner, 0.5) }, 0);
+        assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+        assert_eq!(
+            unsafe { &*scanner }.probe,
+            ProbeConfig {
+                nprobes: Some(2),
+                search_effort: Some(0.5),
+                ..ProbeConfig::default()
+            }
+        );
+        unsafe { &*scanner }.probe.validate_for_scan().unwrap();
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn prepared_fts_index_only_plan_does_not_scan_indexed_fragment_row_ids() {
+        let (_tmp, uri) = create_test_dataset();
+        block_on(async {
+            let mut dataset = Dataset::open(&uri).await.unwrap();
+            dataset
+                .create_index(
+                    &["name"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![4])),
+                    Arc::new(StringArray::from(vec!["a"])),
+                ],
+            )
+            .unwrap();
+            dataset
+                .append(
+                    arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+                    None,
+                )
+                .await
+                .unwrap();
+        });
+
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let column = CString::new("name").unwrap();
+        let query = CString::new("a").unwrap();
+        let context = unsafe {
+            lance_dataset_prepare_fts_match_query(
+                dataset,
+                column.as_ptr(),
+                query.as_ptr(),
+                LanceFtsMatchOperator::Or as i32,
+                0,
+                LanceFtsCoverageMode::IndexOnly as i32,
+            )
+        };
+        assert!(!context.is_null());
+        assert_eq!(
+            unsafe { lance_scanner_set_fts_query_context(scanner, context) },
+            0
+        );
+
+        let prepared = unsafe { &*scanner }.build_scanner().unwrap();
+        let distributed = prepared.distributed_fts.as_ref().unwrap();
+        let segments = distributed.segments.clone();
+        let plan = block_on(prepared.scanner.create_plan()).unwrap();
+        assert_eq!(
+            prepared_fts_plan_shape(&plan),
+            (1, 1, 0),
+            "an unfiltered prepared FTS plan must not materialize selected fragment row IDs"
+        );
+
+        let has_current_fragments =
+            !selected_current_fts_fragments(&distributed.context.dataset, &segments)
+                .unwrap()
+                .is_empty();
+        let (rewritten, counts) = rewrite_prepared_fts_plan(
+            plan,
+            &segments,
+            &distributed.context.prepared,
+            has_current_fragments,
+            None,
+        )
+        .unwrap();
+        assert_eq!(counts.indexed_query_execs, 1);
+        assert_eq!(counts.flat_match_query_execs, 1);
+        assert_eq!(prepared_fts_plan_shape(&rewritten), (1, 0, 0));
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_fts_query_context_close(context);
+            lance_dataset_close(dataset);
+        }
+    }
+
     /// Assert the pending thread-local error is `Panic` carrying the poison
     /// message; consumes it so the next assertion starts from a clean slate.
     fn assert_poison_error_pending() {
@@ -2001,6 +5229,192 @@ mod tests {
         assert!(msg.contains("callback must not be NULL"), "got: {msg}");
         unsafe { crate::error::lance_free_string(msg_ptr) };
         assert!(!unsafe { &*scanner }.is_poisoned());
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn set_blob_handling_stores_the_matching_upstream_variant() {
+        // A scan cannot tell AllDescriptions from BlobsDescriptions on lance
+        // v11, so check the stored variant directly.
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+
+        assert_eq!(
+            unsafe { &*scanner }.blob_handling,
+            None,
+            "blob handling should be unset until the setter is called"
+        );
+
+        for (handling, expected) in [
+            (0, BlobHandling::BlobsDescriptions),
+            (1, BlobHandling::AllBinary),
+            (2, BlobHandling::AllDescriptions),
+        ] {
+            assert_eq!(
+                unsafe { lance_scanner_set_blob_handling(scanner, handling) },
+                0
+            );
+            assert_eq!(
+                unsafe { &*scanner }.blob_handling,
+                Some(expected),
+                "blob handling {handling} stored the wrong variant"
+            );
+        }
+
+        // A rejected value leaves the last accepted mode in place.
+        assert_eq!(unsafe { lance_scanner_set_blob_handling(scanner, 3) }, -1);
+        assert_eq!(
+            unsafe { &*scanner }.blob_handling,
+            Some(BlobHandling::AllDescriptions)
+        );
+
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn scanner_materialization_and_fast_search_setters_preserve_state_on_errors() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        let name = CString::new("name").unwrap();
+        let missing = CString::new("missing").unwrap();
+        let name_id = unsafe { (*dataset).snapshot() }
+            .schema()
+            .field("name")
+            .unwrap()
+            .id as u32;
+
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::Heuristic
+        ));
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [name.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            0
+        );
+        match &unsafe { &*scanner }.materialization_style {
+            MaterializationStyle::AllEarlyExcept(ids) => assert_eq!(ids, &vec![name_id]),
+            _ => panic!("unexpected materialization style"),
+        }
+
+        let empty: [*const c_char; 0] = [];
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    empty.as_ptr(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllEarlyExcept(ids) if ids.is_empty()
+        ));
+
+        // Invalid names, NULL entries, non-EXCEPT column lists, and unknown enum
+        // tags are rejected without replacing the accepted empty exception list.
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [missing.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarlyExcept as i32,
+                    [ptr::null()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllLate as i32,
+                    [name.as_ptr()].as_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { lance_scanner_set_materialization_style(scanner, 99, ptr::null(), 0) },
+            -1
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllEarlyExcept(ids) if ids.is_empty()
+        ));
+
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllLate as i32,
+                    ptr::null(),
+                    0,
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllLate
+        ));
+
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, 0);
+        assert!(unsafe { &*scanner }.fast_search);
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, false) }, 0);
+        assert!(!unsafe { &*scanner }.fast_search);
+
+        let mut batch = ptr::null_mut();
+        assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 0);
+        assert!(!batch.is_null());
+        unsafe { crate::batch::lance_batch_free(batch) };
+        assert_eq!(unsafe { lance_scanner_set_fast_search(scanner, true) }, -1);
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_materialization_style(
+                    scanner,
+                    LanceMaterializationStyle::AllEarly as i32,
+                    ptr::null(),
+                    0,
+                )
+            },
+            -1
+        );
+        assert!(matches!(
+            &unsafe { &*scanner }.materialization_style,
+            MaterializationStyle::AllLate
+        ));
+        assert!(!unsafe { &*scanner }.fast_search);
 
         unsafe {
             lance_scanner_close(scanner);
@@ -2200,6 +5614,18 @@ mod tests {
         assert_eq!(rc, -1);
         assert_poison_error_pending();
 
+        let rc = unsafe { lance_scanner_set_projection(scanner, ptr::null(), 0) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_disable_scoring_autoprojection(scanner) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
+        let rc = unsafe { lance_scanner_set_substrait_aggregate(scanner, ptr::null(), 0) };
+        assert_eq!(rc, -1);
+        assert_poison_error_pending();
+
         // to_arrow_stream also dereferences the handle: same rejection.
         let mut ffi_stream = FFI_ArrowArrayStream::empty();
         let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) };
@@ -2207,6 +5633,31 @@ mod tests {
         assert_poison_error_pending();
 
         // Close must still free a poisoned handle (no poison check there).
+        unsafe {
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+        }
+    }
+
+    #[test]
+    fn poisoned_scanner_rejects_planning_and_count_with_panic_code() {
+        let (_tmp, uri) = create_test_dataset();
+        let (dataset, scanner) = open_dataset_and_scanner(&uri);
+        poison(scanner);
+
+        let mut schema = FFI_ArrowSchema::empty();
+        assert_eq!(unsafe { lance_scanner_schema(scanner, &mut schema) }, -1);
+        assert_poison_error_pending();
+
+        assert!(unsafe { lance_scanner_explain_plan(scanner, false) }.is_null());
+        assert_poison_error_pending();
+        assert!(unsafe { lance_scanner_analyze_plan(scanner) }.is_null());
+        assert_poison_error_pending();
+        assert_eq!(unsafe { lance_scanner_count_rows(scanner) }, 0);
+        assert_poison_error_pending();
+        assert!(unsafe { lance_scanner_analyze_count_plan(scanner) }.is_null());
+        assert_poison_error_pending();
+
         unsafe {
             lance_scanner_close(scanner);
             lance_dataset_close(dataset);
@@ -2390,6 +5841,48 @@ mod tests {
             code,
             message,
         });
+    }
+
+    /// Passing a NULL scanner must report on both channels promised by issue
+    /// #61: the caller thread's TLS for the synchronous path, and the
+    /// dispatched completion for the callback thread. This covers the
+    /// validation branch that previously had no C entry-point test.
+    #[test]
+    fn scan_async_null_scanner_reports_on_caller_and_callback_threads() {
+        let (tx, rx) = std::sync::mpsc::channel::<SetupPanicObservation>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        unsafe { lance_scanner_scan_async(ptr::null(), Some(record_setup_panic), ctx) };
+
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let caller_msg_ptr = lance_last_error_message();
+        assert!(!caller_msg_ptr.is_null());
+        let caller_msg = unsafe { CStr::from_ptr(caller_msg_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::error::lance_free_string(caller_msg_ptr) };
+        assert_eq!(caller_msg, "scanner is NULL");
+
+        let obs = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a NULL scanner must still dispatch a completion");
+        assert_eq!(obs.status, -1);
+        assert_eq!(obs.code, LanceErrorCode::InvalidArgument);
+        assert_eq!(obs.message.as_deref(), Some("scanner is NULL"));
+
+        // Exactly one completion: the caller-thread report must not also
+        // schedule a second callback.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a NULL scanner must dispatch exactly one completion"
+        );
+
+        unsafe {
+            drop(Box::from_raw(
+                ctx as *mut std::sync::mpsc::Sender<SetupPanicObservation>,
+            ));
+        }
     }
 
     /// Regression for the review finding that the spawned task's

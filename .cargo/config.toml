@@ -1,0 +1,7 @@
+# Windows packages use MSVC link.exe. The shim invokes link.exe directly;
+# lld-link is not covered because it treats object export directives differently.
+[target.x86_64-pc-windows-msvc]
+linker = ".github/scripts/limit-windows-exports.cmd"
+
+[target.aarch64-pc-windows-msvc]
+linker = ".github/scripts/limit-windows-exports.cmd"

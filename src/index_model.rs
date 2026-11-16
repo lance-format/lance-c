@@ -4,28 +4,31 @@
 //! Standalone vector model training C API.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_char;
+use std::ffi::{CString, c_char};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, to_ffi};
-use arrow_array::{Array, FixedSizeListArray};
-use arrow_schema::{DataType, Field};
+use arrow_array::{Array, FixedSizeListArray, types::Float32Type};
+use arrow_schema::Field;
 use lance::Dataset;
 use lance::index::vector::ivf::build_ivf_model;
 use lance::index::vector::pq::build_pq_model_in_fragments;
 use lance::index::vector::utils::{get_vector_dim, get_vector_type, validate_distance_type_for};
 use lance_core::{Error, Result};
 use lance_index::progress::noop_progress;
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_rq_num_bits};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::quantizer::Quantization;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
 use crate::helpers;
-use crate::index::LanceMetricType;
+use crate::index::{LanceMetricType, LanceOptionalU64};
 use crate::index_segment::{
     IVF_MODEL_ID_KEY, MODEL_DIMENSION_KEY, MODEL_KIND_KEY, MODEL_METRIC_KEY, PQ_BITS_KEY,
     PQ_SUB_VECTORS_KEY, borrow_model_array, fixed_size_list_model, model_provenance,
@@ -34,6 +37,92 @@ use crate::runtime::block_on;
 
 fn invalid_input(message: impl Into<String>) -> Error {
     Error::invalid_input(message)
+}
+
+/// Additive standalone trainer controls. An absent option preserves the
+/// native trainer default; a present value, including zero, is forwarded.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceIndexTrainerOptions {
+    pub sample_rate: LanceOptionalU64,
+    pub max_iters: LanceOptionalU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ParsedTrainerOptions {
+    sample_rate: Option<usize>,
+    max_iters: Option<usize>,
+}
+
+unsafe fn parse_trainer_options(
+    options: *const LanceIndexTrainerOptions,
+) -> Result<ParsedTrainerOptions> {
+    let Some(options) = (unsafe { options.as_ref() }) else {
+        return Ok(ParsedTrainerOptions::default());
+    };
+    let parse = |field: LanceOptionalU64, name: &str| -> Result<Option<usize>> {
+        if !field.is_set {
+            return Ok(None);
+        }
+        let value = usize::try_from(field.value).map_err(|_| {
+            invalid_input(format!(
+                "{name}={} cannot be represented as usize on this platform",
+                field.value
+            ))
+        })?;
+        Ok(Some(value))
+    };
+    Ok(ParsedTrainerOptions {
+        sample_rate: parse(options.sample_rate, "sample_rate")?,
+        max_iters: parse(options.max_iters, "max_iters")?,
+    })
+}
+
+/// Build a deterministic-shape fast RaBitQ rotation and return its native
+/// `RabitQuantizationMetadata` JSON. `num_bits == 0` selects the native RQ
+/// default of 5. JSON is the portable model form: dense matrix rotations carry
+/// a `#[serde(skip)]` matrix and are not representable by this helper.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_build_rq_model(
+    dimension: u32,
+    num_bits: u32,
+) -> *const c_char {
+    ffi_try!(
+        (|| -> Result<*const c_char> {
+            let dimension = i32::try_from(dimension).map_err(|_| {
+                invalid_input(format!(
+                    "dimension={dimension} cannot be represented as the native i32 dimension"
+                ))
+            })?;
+            if dimension <= 0 || dimension % (u8::BITS as i32) != 0 {
+                return Err(invalid_input(format!(
+                    "dimension must be positive and divisible by 8 for IVF_RQ, got {dimension}"
+                )));
+            }
+            let num_bits = if num_bits == 0 {
+                RQBuildParams::default().num_bits
+            } else {
+                u8::try_from(num_bits).map_err(|_| {
+                    invalid_input(format!(
+                        "num_bits={num_bits} cannot be represented as the native u8 bit width"
+                    ))
+                })?
+            };
+            validate_rq_num_bits(num_bits)?;
+            let quantizer = RabitQuantizer::new_with_rotation::<Float32Type>(
+                num_bits,
+                dimension,
+                RQRotationType::Fast,
+            );
+            let json = serde_json::to_string(&quantizer.metadata(None)).map_err(|error| {
+                Error::internal(format!("failed to serialize RQ model JSON: {error}"))
+            })?;
+            let json = CString::new(json)
+                .map_err(|_| Error::internal("RQ model JSON contains an embedded NUL byte"))?;
+            Ok(json.into_raw().cast_const())
+        })(),
+        ptr::null()
+    )
 }
 
 type CommonTrainerInput = (Dataset, String, usize, LanceMetricType, Option<Vec<u32>>);
@@ -114,11 +203,6 @@ unsafe fn parse_common(
     let dataset = unsafe { &*dataset }.snapshot().as_ref().clone();
     let dim = get_vector_dim(dataset.schema(), &column)?;
     let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
-    if element_type != DataType::Float32 {
-        return Err(invalid_input(format!(
-            "column '{column}' must have Float32 vector elements, got {element_type:?}"
-        )));
-    }
     validate_distance_type_for(metric.to_distance(), &element_type)?;
     let fragments = unsafe { parse_fragments(&dataset, fragment_ids, fragment_count)? };
     Ok((dataset, column, dim, metric, fragments))
@@ -163,6 +247,7 @@ pub unsafe extern "C" fn lance_index_train_ivf_model(
                 metric,
                 fragment_ids,
                 fragment_count,
+                ptr::null(),
                 out_array,
                 out_schema,
             )
@@ -179,6 +264,7 @@ unsafe fn train_ivf_model_inner(
     metric: i32,
     fragment_ids: *const u32,
     fragment_count: usize,
+    options: *const LanceIndexTrainerOptions,
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> Result<i32> {
@@ -196,7 +282,14 @@ unsafe fn train_ivf_model_inner(
             out_schema,
         )?
     };
-    let params = IvfBuildParams::new(num_partitions as usize);
+    let trainer = unsafe { parse_trainer_options(options)? };
+    let mut params = IvfBuildParams::new(num_partitions as usize);
+    if let Some(sample_rate) = trainer.sample_rate {
+        params.sample_rate = sample_rate;
+    }
+    if let Some(max_iters) = trainer.max_iters {
+        params.max_iters = max_iters;
+    }
     let model = block_on(build_ivf_model(
         &dataset,
         &column,
@@ -226,6 +319,38 @@ unsafe fn train_ivf_model_inner(
         uuid::Uuid::new_v4().to_string(),
     );
     unsafe { export_model(centroids, metadata, out_array, out_schema) }
+}
+
+/// Train IVF centroids with native trainer controls.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_train_ivf_model_with_options(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    num_partitions: u32,
+    metric: i32,
+    fragment_ids: *const u32,
+    fragment_count: usize,
+    options: *const LanceIndexTrainerOptions,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            train_ivf_model_inner(
+                dataset,
+                column,
+                num_partitions,
+                metric,
+                fragment_ids,
+                fragment_count,
+                options,
+                out_array,
+                out_schema,
+            )
+        },
+        neg
+    )
 }
 
 /// Train a PQ codebook and export it as
@@ -258,6 +383,7 @@ pub unsafe extern "C" fn lance_index_train_pq_model(
                 fragment_count,
                 ivf_centroids,
                 ivf_centroids_schema,
+                ptr::null(),
                 out_array,
                 out_schema,
             )
@@ -277,6 +403,7 @@ unsafe fn train_pq_model_inner(
     fragment_count: usize,
     ivf_centroids: *mut FFI_ArrowArray,
     ivf_centroids_schema: *const FFI_ArrowSchema,
+    options: *const LanceIndexTrainerOptions,
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> Result<i32> {
@@ -316,18 +443,22 @@ unsafe fn train_pq_model_inner(
     let centroids =
         unsafe { borrow_model_array(ivf_centroids, ivf_centroids_schema, "ivf_centroids")? };
     let centroids = fixed_size_list_model(centroids, "ivf_centroids")?;
-    if centroids.len() == 0
-        || centroids.value_length() != dim as i32
-        || centroids.value_type() != DataType::Float32
-    {
+    if centroids.len() == 0 || centroids.value_length() != dim as i32 {
         return Err(invalid_input(format!(
-            "ivf_centroids must be a non-empty FixedSizeList<Float32> with list_size {dim}, got length {}, type {:?}",
+            "ivf_centroids must be a non-empty FixedSizeList with list_size {dim}, got length {}, type {:?}",
             centroids.len(),
             centroids.data_type()
         )));
     }
     let ivf = IvfModel::new(centroids, None);
-    let params = PQBuildParams::new(num_sub_vectors, num_bits as usize);
+    let trainer = unsafe { parse_trainer_options(options)? };
+    let mut params = PQBuildParams::new(num_sub_vectors, num_bits as usize);
+    if let Some(sample_rate) = trainer.sample_rate {
+        params.sample_rate = sample_rate;
+    }
+    if let Some(max_iters) = trainer.max_iters {
+        params.max_iters = max_iters;
+    }
     let ivf_residual = match metric {
         LanceMetricType::L2 | LanceMetricType::Cosine => Some(&ivf),
         LanceMetricType::Dot | LanceMetricType::Hamming => None,
@@ -367,4 +498,42 @@ unsafe fn train_pq_model_inner(
     metadata.insert(PQ_SUB_VECTORS_KEY.to_string(), num_sub_vectors.to_string());
     metadata.insert(PQ_BITS_KEY.to_string(), num_bits.to_string());
     unsafe { export_model(codebook, metadata, out_array, out_schema) }
+}
+
+/// Train a PQ codebook with native trainer controls.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_index_train_pq_model_with_options(
+    dataset: *const LanceDataset,
+    column: *const c_char,
+    num_sub_vectors: u32,
+    num_bits: u32,
+    metric: i32,
+    fragment_ids: *const u32,
+    fragment_count: usize,
+    ivf_centroids: *mut FFI_ArrowArray,
+    ivf_centroids_schema: *const FFI_ArrowSchema,
+    options: *const LanceIndexTrainerOptions,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> i32 {
+    ffi_try!(
+        unsafe {
+            train_pq_model_inner(
+                dataset,
+                column,
+                num_sub_vectors,
+                num_bits,
+                metric,
+                fragment_ids,
+                fragment_count,
+                ivf_centroids,
+                ivf_centroids_schema,
+                options,
+                out_array,
+                out_schema,
+            )
+        },
+        neg
+    )
 }

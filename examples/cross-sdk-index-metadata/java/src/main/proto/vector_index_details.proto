@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+//
+// Field-for-field subset of protos/index.proto at Lance commit
+// 40f15ed1b71b66950961b175829fdf17a763f108. Keep IDs, types, presence, and
+// wire semantics identical to the authoritative schema.
+
+syntax = "proto3";
+
+package lance.index.pb;
+
+option java_package = "org.lance.crosssdk.proto";
+option java_outer_classname = "VectorIndexDetailsProto";
+
+// Metric Type for Vector Index
+enum VectorMetricType {
+  L2 = 0;
+  Cosine = 1;
+  Dot = 2;
+  Hamming = 3;
+}
+
+// Details for vector indexes, stored in the manifest's index_details field.
+message VectorIndexDetails {
+  VectorMetricType metric_type = 1;
+
+  uint64 target_partition_size = 2;
+
+  optional HnswParameters hnsw_index_config = 3;
+
+  message ProductQuantization {
+    uint32 num_bits = 1;
+    uint32 num_sub_vectors = 2;
+  }
+  message ScalarQuantization {
+    uint32 num_bits = 1;
+  }
+  message RabitQuantization {
+    enum RotationType {
+      FAST = 0;
+      MATRIX = 1;
+    }
+    uint32 num_bits = 1;
+    RotationType rotation_type = 2;
+  }
+
+  message FlatCompression {}
+
+  oneof compression {
+    ProductQuantization pq = 4;
+    ScalarQuantization sq = 5;
+    RabitQuantization rq = 6;
+    FlatCompression flat = 8;
+  }
+
+  map<string, string> runtime_hints = 9;
+}
+
+message HnswParameters {
+  uint32 max_connections = 1;
+  uint32 construction_ef = 2;
+  uint32 max_level = 3;
+}
