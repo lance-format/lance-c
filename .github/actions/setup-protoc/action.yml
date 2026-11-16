@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+name: Set up protoc
+description: Install checksum-verified protoc for Linux x86_64 or aarch64
+runs:
+  using: composite
+  steps:
+    - name: Install protoc
+      shell: bash
+      env:
+        PROTOC_VERSION: "25.3"
+      run: bash "$GITHUB_ACTION_PATH/install.sh"
