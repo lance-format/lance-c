@@ -57,7 +57,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -67,19 +67,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          ARCH=$(uname -m)
-          case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
-          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
-          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+      - uses: ./.github/actions/setup-protoc
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
   test-linux:
     name: Tests (Linux)
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     env:
       CC: clang
@@ -92,12 +87,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Clang 20
         run: manylinux-install-clang -v 20.1.8.0
-      - name: Install dependencies
-        run: |
-          ARCH=$(uname -m)
-          case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
-          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
-          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+      - uses: ./.github/actions/setup-protoc
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
@@ -396,7 +386,7 @@ jobs:
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -404,19 +394,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          ARCH=$(uname -m)
-          case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
-          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
-          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+      - uses: ./.github/actions/setup-protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
   msrv:
     name: MSRV (1.94.0)
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -424,12 +409,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          ARCH=$(uname -m)
-          case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
-          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
-          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+      - uses: ./.github/actions/setup-protoc
       - name: Check MSRV
         run: cargo check --all-targets
 

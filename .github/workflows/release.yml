@@ -33,11 +33,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            container: quay.io/pypa/manylinux_2_28_x86_64
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
             target: x86_64-unknown-linux-gnu
             artifact_suffix: ""
           - os: ubuntu-24.04-arm
-            container: quay.io/pypa/manylinux_2_28_aarch64
+            container: quay.io/pypa/manylinux_2_28_aarch64@sha256:34a5e614a4eb26f73f8bf44cbbf2acf8011620453d03ea35a58537bb3cde44de
             target: aarch64-unknown-linux-gnu
             artifact_suffix: ""
           # Debian 12 (bookworm) ships glibc 2.36. Building inside the image
@@ -47,12 +47,12 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             os_label: linux
-            container: "debian:12"
+            container: "debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8"
             artifact_suffix: "-debian12"
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             os_label: linux
-            container: "debian:12"
+            container: "debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8"
             artifact_suffix: "-debian12"
           # macos-15-intel is GitHub's current standard x64 macOS runner.
           # Keep this row native so both libraries and the consumer exercise
@@ -98,6 +98,7 @@ jobs:
             perl \
             pkg-config \
             protobuf-compiler \
+            unzip \
             xz-utils \
             zstd
           # TLS stays on rustls; Cargo.lock has no openssl-sys or native-tls.
@@ -129,15 +130,11 @@ jobs:
           key: ${{ matrix.target }}${{ matrix.artifact_suffix }}
       - name: Install protobuf (Linux)
         if: runner.os == 'Linux'
-        run: |
-          ARCH=$(uname -m)
-          case "${ARCH}" in x86_64) PA="linux-x86_64" ;; aarch64) PA="linux-aarch_64" ;; esac
-          curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-${PA}.zip" -o /tmp/protoc.zip
-          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && rm /tmp/protoc.zip
+        uses: ./.github/actions/setup-protoc
       - name: Install Clang 20 (Linux)
         if: runner.os == 'Linux'
         run: |
-            manylinux-install-clang -v 20.1.8.0
+          manylinux-install-clang -v 20.1.8.0
       - name: Install protobuf (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
