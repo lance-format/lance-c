@@ -20,7 +20,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
     replace_children_if_necessary,
 };
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::fragment::FileFragment;
 use lance::dataset::scanner::{
