@@ -179,6 +179,30 @@ pub(crate) fn dispatch_callback(
     );
 }
 
+/// Wait until callbacks already queued on the test dispatcher have returned.
+/// Receiving an observation from inside a callback does not establish that its
+/// borrowed context can be reclaimed. Call this only after that observation.
+#[cfg(test)]
+pub(crate) fn wait_for_callbacks() {
+    unsafe extern "C" fn acknowledge(ctx: *mut c_void, _: i32, _: *mut c_void) {
+        let tx = unsafe { Box::from_raw(ctx as *mut mpsc::Sender<()>) };
+        let _ = tx.send(());
+    }
+
+    let dispatcher = DISPATCHER.as_ref().expect("tests require a dispatcher");
+    let (tx, rx) = mpsc::channel();
+    let message = DispatcherMessage {
+        callback: acknowledge,
+        callback_ctx: Box::into_raw(Box::new(tx)).cast(),
+        status: 0,
+        result: std::ptr::null_mut(),
+        error: None,
+    };
+    assert!(dispatcher.send(message).is_ok());
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("dispatcher must retire preceding callbacks");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +255,7 @@ mod tests {
     }
 
     unsafe fn reclaim(ctx: *mut c_void) {
+        wait_for_callbacks();
         unsafe {
             drop(Box::from_raw(ctx as *mut CallbackProbe));
         }

@@ -119,8 +119,11 @@ mod tests {
     }
 
     fn receive(rx: &mpsc::Receiver<Observation>) -> Observation {
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("async bridge must deliver completion")
+        let observation = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("async bridge must deliver completion");
+        crate::async_dispatcher::wait_for_callbacks();
+        observation
     }
 
     #[test]

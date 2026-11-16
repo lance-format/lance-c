@@ -5878,6 +5878,7 @@ mod tests {
             "a NULL scanner must dispatch exactly one completion"
         );
 
+        crate::async_dispatcher::wait_for_callbacks();
         unsafe {
             drop(Box::from_raw(
                 ctx as *mut std::sync::mpsc::Sender<SetupPanicObservation>,
@@ -5932,6 +5933,7 @@ mod tests {
             "a setup panic must dispatch exactly one callback completion"
         );
 
+        crate::async_dispatcher::wait_for_callbacks();
         unsafe {
             drop(Box::from_raw(
                 ctx as *mut std::sync::mpsc::Sender<SetupPanicObservation>,
