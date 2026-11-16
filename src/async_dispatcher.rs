@@ -19,6 +19,54 @@ use crate::error::{LanceErrorCode, clear_last_error, panic_payload_message, set_
 /// - `result`: operation-specific result pointer (e.g., `*mut ArrowArrayStream`)
 pub type LanceCallback = unsafe extern "C" fn(ctx: *mut c_void, status: i32, result: *mut c_void);
 
+/// A cloneable async completion endpoint whose raw context is owned by the host.
+///
+/// This centralizes the unsafe `void *` transport and status/error mapping used
+/// by spawned FFI futures. The caller must keep `callback_ctx` valid until the
+/// callback returns.
+///
+/// This is not an exactly-once token. `Clone` exists only so a fallback copy
+/// can survive while the original is moved into a spawned task; cloning for
+/// any other purpose can deliver a second completion.
+#[derive(Clone)]
+pub(crate) struct Completion {
+    callback: LanceCallback,
+    callback_ctx: *mut c_void,
+}
+
+// Safety: construction requires the caller to uphold the public callback
+// contract: the callback is thread-safe and callback_ctx remains valid until
+// completion delivery returns.
+unsafe impl Send for Completion {}
+
+impl Completion {
+    /// Construct a completion endpoint from a validated callback and context.
+    ///
+    /// # Safety
+    /// `callback_ctx` must remain valid until `callback` returns, and
+    /// `callback` must be safe to invoke from any completion-delivery thread.
+    pub(crate) unsafe fn new(callback: LanceCallback, callback_ctx: *mut c_void) -> Self {
+        Self {
+            callback,
+            callback_ctx,
+        }
+    }
+
+    pub(crate) fn succeed(self, result: *mut c_void) {
+        dispatch_callback(self.callback, self.callback_ctx, 0, result, None);
+    }
+
+    pub(crate) fn fail(self, code: LanceErrorCode, message: impl Into<String>) {
+        dispatch_callback(
+            self.callback,
+            self.callback_ctx,
+            -1,
+            std::ptr::null_mut(),
+            Some((code, message.into())),
+        );
+    }
+}
+
 // Safety: LanceCallback is a C function pointer (Send by definition for FFI).
 // The ctx pointer is transferred to the dispatcher thread which calls the callback.
 unsafe impl Send for DispatcherMessage {}
@@ -131,6 +179,30 @@ pub(crate) fn dispatch_callback(
     );
 }
 
+/// Wait until callbacks already queued on the test dispatcher have returned.
+/// Receiving an observation from inside a callback does not establish that its
+/// borrowed context can be reclaimed. Call this only after that observation.
+#[cfg(test)]
+pub(crate) fn wait_for_callbacks() {
+    unsafe extern "C" fn acknowledge(ctx: *mut c_void, _: i32, _: *mut c_void) {
+        let tx = unsafe { Box::from_raw(ctx as *mut mpsc::Sender<()>) };
+        let _ = tx.send(());
+    }
+
+    let dispatcher = DISPATCHER.as_ref().expect("tests require a dispatcher");
+    let (tx, rx) = mpsc::channel::<()>();
+    let message = DispatcherMessage {
+        callback: acknowledge,
+        callback_ctx: Box::into_raw(Box::new(tx)).cast(),
+        status: 0,
+        result: std::ptr::null_mut(),
+        error: None,
+    };
+    assert!(dispatcher.send(message).is_ok());
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("dispatcher must retire preceding callbacks");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +255,7 @@ mod tests {
     }
 
     unsafe fn reclaim(ctx: *mut c_void) {
+        wait_for_callbacks();
         unsafe {
             drop(Box::from_raw(ctx as *mut CallbackProbe));
         }
