@@ -190,7 +190,7 @@ pub(crate) fn wait_for_callbacks() {
     }
 
     let dispatcher = DISPATCHER.as_ref().expect("tests require a dispatcher");
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<()>();
     let message = DispatcherMessage {
         callback: acknowledge,
         callback_ctx: Box::into_raw(Box::new(tx)).cast(),
