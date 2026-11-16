@@ -11,7 +11,8 @@ LabelList query values should match the array element type, for example
 `array_contains(int32_labels, CAST(42 AS INT))`; a cast on the indexed column
 can prevent the planner from finding an index driver and cause fallback.
 `AtMost` and `AtLeast` results still fall back; this mode does not enable FMIndex,
-NGram, BloomFilter, ZoneMap, or Inverted indices.
+NGram, BloomFilter, ZoneMap, Inverted, or RTree indices. RTree is inherently
+inexact, so it always takes the full-filtered, fragment-scoped fallback.
 
 ## Configuring a task
 

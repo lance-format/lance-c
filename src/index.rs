@@ -55,6 +55,7 @@ pub enum LanceScalarIndexType {
     ZoneMap = 6,
     BloomFilter = 7,
     MinHashLsh = 8,
+    RTree = 9,
 }
 
 impl LanceScalarIndexType {
@@ -68,6 +69,7 @@ impl LanceScalarIndexType {
             6 => Ok(Self::ZoneMap),
             7 => Ok(Self::BloomFilter),
             8 => Ok(Self::MinHashLsh),
+            9 => Ok(Self::RTree),
             _ => Err(lance_core::Error::invalid_input_source(
                 format!("invalid scalar index type: {}", v).into(),
             )),
@@ -85,6 +87,7 @@ impl LanceScalarIndexType {
             "ZoneMapIndexDetails" => Some(Self::ZoneMap),
             "BloomFilterIndexDetails" => Some(Self::BloomFilter),
             "MinHashLshIndexDetails" => Some(Self::MinHashLsh),
+            "RTreeIndexDetails" => Some(Self::RTree),
             _ => None,
         }
     }
@@ -99,6 +102,7 @@ impl LanceScalarIndexType {
             Self::ZoneMap => BuiltinIndexType::ZoneMap,
             Self::BloomFilter => BuiltinIndexType::BloomFilter,
             Self::MinHashLsh => BuiltinIndexType::MinHashLsh,
+            Self::RTree => BuiltinIndexType::RTree,
         }
     }
 
@@ -112,6 +116,7 @@ impl LanceScalarIndexType {
             Self::ZoneMap => IndexType::ZoneMap,
             Self::BloomFilter => IndexType::BloomFilter,
             Self::MinHashLsh => IndexType::MinHashLsh,
+            Self::RTree => IndexType::RTree,
         }
     }
 }
@@ -208,9 +213,11 @@ unsafe fn create_scalar_index_inner(
         ));
     }
     let ds = unsafe { &*dataset };
-    let column_str = unsafe { helpers::parse_c_string(column)? }.ok_or_else(|| {
-        lance_core::Error::invalid_input_source("column must not be empty".into())
-    })?;
+    let column_str = unsafe { helpers::parse_c_string(column)? }
+        .filter(|column| !column.is_empty())
+        .ok_or_else(|| {
+            lance_core::Error::invalid_input_source("column must not be empty".into())
+        })?;
     let name = unsafe { helpers::parse_c_string(index_name)? }.map(|s| s.to_string());
     let params_str = unsafe { helpers::parse_c_string(params_json)? };
 

@@ -35,7 +35,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Full-text search | FTS queries through scanner interface |
 | [x] | MinHash text search | Native MinHash LSH index and scanner similarity search with `_distance` |
 | [x] | Vector index creation | IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ and HNSW variants, with native build options |
-| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List, NGram, ZoneMap, BloomFilter, MinHash LSH indexes |
+| [x] | Scalar index creation | BTree, Bitmap, Inverted, Label-List, NGram, ZoneMap, BloomFilter, MinHash LSH, RTree indexes |
 | [x] | Index management | List and drop index operations |
 | [x] | Distributed index build | Share IVF/PQ/RQ models, build uncommitted fragment-scoped segments, and exchange protobuf metadata |
 | [x] | C++ wrappers | `create_vector_index[_with_options]()` and `create_scalar_index()` methods |

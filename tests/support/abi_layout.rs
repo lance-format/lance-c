@@ -1172,6 +1172,7 @@ fn manifest() -> AbiManifest {
         LANCE_SCALAR_ZONE_MAP => ZoneMap,
         LANCE_SCALAR_BLOOM_FILTER => BloomFilter,
         LANCE_SCALAR_MINHASH_LSH => MinHashLsh,
+        LANCE_SCALAR_RTREE => RTree,
     });
     abi_enum!(manifest, LanceMetricType {
         LANCE_METRIC_L2 => L2,

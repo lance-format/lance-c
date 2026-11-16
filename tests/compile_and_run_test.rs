@@ -29,7 +29,7 @@ use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 
-use common::create_config_base_files_fixture;
+use common::{create_config_base_files_fixture, create_rtree_geometry_fixture};
 use std::ffi::CString;
 
 #[path = "support/abi_layout.rs"]
@@ -1248,8 +1248,8 @@ fn compile_cpp_test(sources: &[&Path], output: &Path, include_dir: &Path, lib_pa
 /// Run a compiled test binary with the source dataset URI, a destination URI
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
 /// cache dataset, separate non-stable/stable fragment-deletion datasets, the
-/// cleanup fixture and the config/base/file fixture. The destination path must
-/// not pre-exist.
+/// cleanup and RTree geometry fixtures, the aggregate plan, and the
+/// config/base/file fixture. The destination path must not pre-exist.
 #[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
@@ -1261,6 +1261,7 @@ fn run_test_binary(
     fragment_uri: &str,
     fragment_read_uri: &str,
     cleanup_uri: &str,
+    rtree_geometry_uri: &str,
     aggregate_plan_path: &Path,
     config_base_files: &common::ConfigBaseFilesFixture,
 ) {
@@ -1273,6 +1274,7 @@ fn run_test_binary(
         .arg(fragment_uri)
         .arg(fragment_read_uri)
         .arg(cleanup_uri)
+        .arg(rtree_geometry_uri)
         .arg(aggregate_plan_path)
         .arg(&config_base_files.uri)
         .arg(&config_base_files.alternate_base_uri)
@@ -1376,6 +1378,7 @@ fn test_c_compilation_and_execution() {
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
+    let rtree_geometry = create_rtree_geometry_fixture();
     let config_base_files = create_config_base_files_fixture();
     let build_dir = tempfile::tempdir().unwrap();
 
@@ -1401,6 +1404,7 @@ fn test_c_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
+        &rtree_geometry.uri,
         &aggregate_plan_path,
         &config_base_files,
     );
@@ -1423,6 +1427,7 @@ fn test_cpp_compilation_and_execution() {
     let (_fragment_tmp, fragment_uri) = create_fragment_dataset_on_disk(false);
     let (_fragment_read_tmp, fragment_read_uri) = create_fragment_dataset_on_disk(true);
     let (_cleanup_tmp, cleanup_uri) = create_cleanup_dataset_on_disk();
+    let rtree_geometry = create_rtree_geometry_fixture();
     let config_base_files = create_config_base_files_fixture();
     let build_dir = tempfile::tempdir().unwrap();
 
@@ -1448,6 +1453,7 @@ fn test_cpp_compilation_and_execution() {
         &fragment_uri,
         &fragment_read_uri,
         &cleanup_uri,
+        &rtree_geometry.uri,
         &aggregate_plan_path,
         &config_base_files,
     );

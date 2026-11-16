@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use geo_types::{LineString, coord};
+use geoarrow_array::{GeoArrowArray, builder::LineStringBuilder};
+use geoarrow_schema::{Dimension, LineStringType};
 use lance::Dataset;
 use lance::dataset::write::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
@@ -22,6 +25,97 @@ pub struct ConfigBaseFilesFixture {
     #[allow(dead_code)]
     pub source_uri: String,
     pub alternate_base_uri: String,
+}
+
+/// Three-fragment GeoArrow LineString fixture for native RTree tests.
+///
+/// Stable IDs 100..=114 are split into fragments of five rows. Rows 103 and
+/// 108 are NULL; rows 104 and 112 are empty LineStrings. Queries used by both
+/// Rust and C/C++ consumers distinguish bounding-box candidates from exact
+/// geometry matches:
+/// - `POINT (0 10)` intersects ids 101 and 114. Id 100's diagonal bounding box
+///   also contains the point, but the line does not.
+/// - `LINESTRING (25 25, 26 26)` intersects only id 106. Id 105 is a closed
+///   rectangle boundary whose bounding box contains the query line, but the
+///   boundary itself does not intersect it.
+/// - `geometry IS NULL` returns ids 103 and 108.
+pub struct RTreeGeometryFixture {
+    pub _tmp: tempfile::TempDir,
+    pub uri: String,
+}
+
+pub fn create_rtree_geometry_fixture() -> RTreeGeometryFixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("rtree_geometry_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let line = |coords: &[(f64, f64)]| {
+        LineString::new(coords.iter().map(|&(x, y)| coord! { x: x, y: y }).collect())
+    };
+    let empty = || LineString::new(Vec::new());
+    let geometries = vec![
+        Some(line(&[(0.0, 0.0), (10.0, 10.0)])),
+        Some(line(&[(0.0, 10.0), (10.0, 10.0)])),
+        Some(line(&[(2.0, 0.0), (2.0, 10.0)])),
+        None,
+        Some(empty()),
+        Some(line(&[
+            (20.0, 20.0),
+            (30.0, 20.0),
+            (30.0, 30.0),
+            (20.0, 30.0),
+            (20.0, 20.0),
+        ])),
+        Some(line(&[(20.0, 20.0), (30.0, 30.0)])),
+        Some(line(&[(40.0, 40.0), (50.0, 50.0)])),
+        None,
+        Some(line(&[(60.0, 60.0), (61.0, 61.0)])),
+        Some(line(&[(0.0, 5.0), (5.0, 0.0)])),
+        Some(line(&[(100.0, 100.0), (101.0, 101.0)])),
+        Some(empty()),
+        Some(line(&[(2.0, 2.0), (3.0, 2.0)])),
+        Some(line(&[(0.0, 10.0), (5.0, 10.0)])),
+    ];
+
+    let geometry_type = LineStringType::new(Dimension::XY, Default::default());
+    let mut builder = LineStringBuilder::new(geometry_type.clone());
+    for geometry in &geometries {
+        builder.push_line_string(geometry.as_ref()).unwrap();
+    }
+    let geometry_array = builder.finish();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        geometry_type.to_field("geometry", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(100..115)),
+            geometry_array.to_array_ref(),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        let dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 5,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+    });
+
+    RTreeGeometryFixture { _tmp: tmp, uri }
 }
 
 /// Create a multi-version, multi-fragment dataset.
