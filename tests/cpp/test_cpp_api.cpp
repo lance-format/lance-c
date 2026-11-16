@@ -25,6 +25,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -3907,6 +3908,96 @@ static void test_merge_and_batch_udf(const std::string& dst_uri) {
     assert(schema_after_udf.n_children == fields_before + 3);
     schema_after_udf.release(&schema_after_udf);
 
+    // Schema-aware checkpoint replay: the first call stores one batch
+    // checkpoint and throws before persisting the fragment checkpoint; the
+    // second call must restore that batch from its array plus native schema and
+    // skip the mapper for it.
+    ArrowSchema udf_v2_column{};
+    ArrowSchema* udf_v2_children[1] = {&udf_v2_column};
+    udf_v2_column.format = "l";
+    udf_v2_column.name = "c_udf_cpp_v2";
+    udf_v2_column.flags = ARROW_FLAG_NULLABLE;
+    udf_v2_column.release = test_noop_schema_release;
+    ArrowSchema udf_v2_schema{};
+    udf_v2_schema.format = "+s";
+    udf_v2_schema.n_children = 1;
+    udf_v2_schema.children = udf_v2_children;
+    udf_v2_schema.release = test_noop_schema_release;
+
+    struct StoredV2Batch {
+        ArrowArray array{};
+        ArrowSchema schema{};
+    };
+    std::map<std::pair<uint32_t, std::size_t>, StoredV2Batch> v2_batches;
+    std::atomic<int> v2_mapper_calls{0};
+    std::atomic<int> v2_batch_hits{0};
+    std::atomic<int> v2_insert_fragment_calls{0};
+    std::atomic<bool> v2_interrupt_once{true};
+
+    lance::UDFCheckpointStoreV2 store_v2;
+    store_v2.get_batch = [&](const lance::BatchUDFInfo& info, ArrowArray& out,
+                             ArrowSchema& out_schema) {
+        auto entry = v2_batches.find({info.fragment_id, info.batch_index});
+        if (entry == v2_batches.end()) {
+            return false;
+        }
+        out = entry->second.array;
+        out_schema = entry->second.schema;
+        v2_batches.erase(entry);
+        v2_batch_hits.fetch_add(1);
+        return true;
+    };
+    store_v2.insert_batch = [&](const lance::BatchUDFInfo& info, ArrowArray& batch,
+                                ArrowSchema& batch_schema) {
+        v2_batches[{info.fragment_id, info.batch_index}] =
+            StoredV2Batch{batch, batch_schema};
+        batch.release = nullptr;
+        batch_schema.release = nullptr;
+    };
+    store_v2.get_fragment = [](uint32_t) -> std::optional<std::string> {
+        return std::nullopt;
+    };
+    store_v2.insert_fragment = [&](uint64_t, const std::string&) {
+        if (v2_interrupt_once.exchange(false)) {
+            throw std::runtime_error("interrupted before the fragment checkpoint");
+        }
+        v2_insert_fragment_calls.fetch_add(1);
+    };
+
+    auto make_udf_v2 = [&]() {
+        lance::BatchUDFV2 udf_v2;
+        udf_v2.output_schema = &udf_v2_schema;
+        udf_v2.mapper = [&](const ArrowArray& input, const ArrowSchema&, ArrowArray& out) {
+            v2_mapper_calls.fetch_add(1);
+            auto* batch = new CppInt64Batch(input.length, 13000);
+            out = batch->top;
+        };
+        udf_v2.checkpoint_store = store_v2;
+        return udf_v2;
+    };
+
+    const uint64_t v2_version = ds.version();
+    bool v2_seed_failed = false;
+    try {
+        auto seed = make_udf_v2();
+        ds.add_columns_batch_udf(seed, std::vector<std::string>{});
+    } catch (const lance::Error&) {
+        v2_seed_failed = true;
+    }
+    assert(v2_seed_failed);
+    assert(ds.version() == v2_version);
+    assert(!v2_batches.empty());
+
+    const int v2_seed_mapper_calls = v2_mapper_calls.load();
+    auto resume = make_udf_v2();
+    ds.add_columns_batch_udf(resume, std::vector<std::string>{});
+    assert(ds.version() > v2_version);
+    assert(v2_insert_fragment_calls.load() > 0);
+    // The stored schema carries native's checkpoint marker, so the resume must
+    // restore the cached batch instead of mapping it again.
+    assert(v2_batch_hits.load() > 0);
+    assert(v2_mapper_calls.load() == v2_seed_mapper_calls);
+
     PASS();
 }
 
@@ -5382,6 +5473,173 @@ static void test_dataset_deep_clone(const std::string& feature_uri) {
     PASS();
 }
 
+static std::vector<int32_t> cpp_scan_ids(lance::Dataset& dataset) {
+    auto scanner = dataset.scan();
+    scanner.project(std::vector<lance::ProjectionColumn>{{"id", "id"}});
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+
+    std::vector<int32_t> ids;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        const int rc = stream.get_next(&stream, &array);
+        if (rc != 0) {
+            const char* error = stream.get_last_error
+                ? stream.get_last_error(&stream)
+                : nullptr;
+            std::string message = error ? error : "Arrow stream get_next failed";
+            if (stream.release) stream.release(&stream);
+            throw std::runtime_error(message);
+        }
+        if (!array.release) break;
+        assert(array.n_children == 1);
+        const ArrowArray* column = array.children[0];
+        assert(column->n_buffers >= 2 && column->buffers[1] != nullptr);
+        const auto* values = static_cast<const int32_t*>(column->buffers[1]);
+        for (int64_t row = 0; row < array.length; ++row) {
+            ids.push_back(values[row]);
+        }
+        array.release(&array);
+    }
+    if (stream.release) stream.release(&stream);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+static std::string cpp_clone_base_path(lance::Dataset& dataset) {
+    const std::string json = dataset.base_paths_json();
+    const std::string marker = "\"path\":\"";
+    auto start = json.find(marker);
+    if (start == std::string::npos) {
+        throw std::runtime_error("base_paths_json has no base path");
+    }
+    start += marker.size();
+    const auto end = json.find('"', start);
+    if (end == std::string::npos) {
+        throw std::runtime_error("base_paths_json base path is unterminated");
+    }
+    return json.substr(start, end - start);
+}
+
+static void test_dataset_shallow_clone_base_store_params(
+    const std::string& feature_uri) {
+    TEST(test_dataset_shallow_clone_base_store_params);
+
+    const std::string suffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string target =
+        "shared-memory://cpp-shallow-" + suffix + "/target.lance";
+
+    lance::StorageOptionsAccessor source_accessor(
+        std::optional<lance::StorageOptions>{
+            lance::StorageOptions{{"local_fsync", "true"}}},
+        nullptr);
+    lance::StorageOptionsAccessor invalid_target_accessor(
+        std::optional<lance::StorageOptions>{
+            lance::StorageOptions{{"local_fsync", "invalid"}}},
+        nullptr);
+
+    lance::DatasetOpenOptions source_options;
+    source_options.storage_options_accessor = &source_accessor;
+
+    uint64_t source_version = 0;
+    std::string source_base;
+    std::vector<int32_t> source_ids;
+    std::unique_ptr<lance::Dataset> cloned;
+    {
+        auto source =
+            lance::Dataset::open_with_options(feature_uri, source_options);
+        source_version = source.version();
+        source_ids = cpp_scan_ids(source);
+        assert(!source_ids.empty());
+
+        // The target accepts the static options (shared-memory ignores them),
+        // while the clone keeps the source's valid params for the local base.
+        cloned = std::make_unique<lance::Dataset>(source.shallow_clone(
+            target, nullptr, &invalid_target_accessor));
+        assert(cloned->version() == source_version);
+        assert(cpp_scan_ids(*cloned) == source_ids);
+        source_base = cpp_clone_base_path(*cloned);
+    }
+
+    // The returned handle retains runtime base params after the source closes.
+    assert(cpp_scan_ids(*cloned) == source_ids);
+
+    // Without per-base bindings the local base falls back to the target's
+    // invalid dataset-level accessor and fails when it rebuilds that store.
+    lance::DatasetOpenOptions reopen_target_options;
+    reopen_target_options.storage_options_accessor = &invalid_target_accessor;
+    {
+        auto missing =
+            lance::Dataset::open_with_options(target, reopen_target_options);
+        bool failed = false;
+        try {
+            (void)cpp_scan_ids(missing);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        assert(failed && "reading the local base without bindings must fail");
+    }
+
+    // A non-matching key does not bind the local base.
+    lance::DatasetBaseStoreParams wrong;
+    wrong.base_path = "shared-memory://unrelated/base";
+    lance::DatasetOpenOptions wrong_options;
+    wrong_options.storage_options_accessor = &invalid_target_accessor;
+    wrong_options.base_store_params =
+        std::vector<lance::DatasetBaseStoreParams>{wrong};
+    {
+        auto wrong_open =
+            lance::Dataset::open_with_options(target, wrong_options);
+        bool failed = false;
+        try {
+            (void)cpp_scan_ids(wrong_open);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        assert(failed && "a non-matching base path must not bind the base");
+    }
+
+    // An exact valid binding restores reads through a fresh handle.
+    lance::DatasetBaseStoreParams binding;
+    binding.base_path = source_base;
+    binding.storage_options_accessor = &source_accessor;
+    lance::DatasetOpenOptions reopen_options;
+    reopen_options.storage_options_accessor = &invalid_target_accessor;
+    reopen_options.base_store_params =
+        std::vector<lance::DatasetBaseStoreParams>{binding};
+    {
+        auto reopened =
+            lance::Dataset::open_with_options(target, reopen_options);
+        assert(reopened.version() == source_version);
+        assert(cpp_scan_ids(reopened) == source_ids);
+    }
+
+    // Explicit invalid target options fail in native policy before the local
+    // target is published; the wrapper surfaces the native message.
+    const std::string rejected =
+        feature_uri + ".cpp-shallow-rejected-" + suffix;
+    bool rejected_error = false;
+    try {
+        (void)cloned->shallow_clone(
+            rejected, nullptr, &invalid_target_accessor);
+    } catch (const lance::Error& error) {
+        rejected_error =
+            std::string(error.what()).find("local_fsync") != std::string::npos;
+    }
+    assert(rejected_error && "invalid target options must throw");
+
+    // A NULL accessor inherits native source params for the chained target and
+    // keeps the original shared base binding for reads.
+    auto inherited = cloned->shallow_clone(target + ".inherited");
+    assert(inherited.version() == source_version);
+    assert(cpp_scan_ids(inherited) == source_ids);
+
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 12) {
         fprintf(stderr,
@@ -5451,6 +5709,7 @@ int main(int argc, char** argv) {
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_dataset_deep_clone(fragment_read_uri);
+    test_dataset_shallow_clone_base_store_params(fragment_read_uri);
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
     test_native_write_base_and_presence(uri, write_uri);

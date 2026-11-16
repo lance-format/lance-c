@@ -11,6 +11,7 @@ use std::ffi::c_char;
 use std::sync::Arc;
 
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource};
 use lance_core::Result;
 
@@ -314,13 +315,20 @@ unsafe fn merge_insert_inner(
                 }
             };
 
-            let mut builder = MergeInsertBuilder::try_new(snapshot, keys)?;
+            let mut builder = MergeInsertBuilder::try_new(snapshot.clone(), keys)?;
             builder
                 .when_matched(resolved.when_matched)
                 .when_not_matched(resolved.when_not_matched)
                 .when_not_matched_by_source(when_not_matched_by_source);
             if !compacted_sstables.is_empty() {
-                builder.mark_sstables_as_compacted(compacted_sstables.clone());
+                // The C API has no dir_id parameter on this path. Resolve the
+                // dataset's MemWAL identity so compaction progress targets the
+                // same MemWAL the rows belong to; the commit revalidates it.
+                let dir_id = snapshot
+                    .mem_wal_index_details()
+                    .await?
+                    .map_or_else(String::new, |details| details.dir_id);
+                builder.mark_sstables_as_compacted(dir_id, compacted_sstables.clone());
             }
             let job = builder.try_build()?;
             let (new_dataset, stats) = job.execute_reader(reader).await?;

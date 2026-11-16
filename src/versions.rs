@@ -40,6 +40,7 @@ impl LanceVersion {
             version,
             timestamp,
             metadata,
+            manifest_size: _,
         } = version;
         Ok(Self {
             id: version,

@@ -2484,6 +2484,8 @@ mod tests {
             created_at: None,
             base_id: Some(13),
             files: Some(Vec::new()),
+            clustering_id: None,
+            metadata: std::collections::HashMap::new(),
         };
         let original = metadata_handle(metadata.clone()).unwrap();
         let cloned = unsafe { lance_index_segment_metadata_clone(original) };
@@ -2520,12 +2522,16 @@ mod tests {
                 lance_table::format::IndexFile {
                     path: "index.idx".to_string(),
                     size_bytes: 11,
+                    file_metadata_size_bytes: None,
                 },
                 lance_table::format::IndexFile {
                     path: "metadata.idx".to_string(),
                     size_bytes: 22,
+                    file_metadata_size_bytes: None,
                 },
             ]),
+            clustering_id: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -2630,6 +2636,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: Some(Vec::new()),
+            clustering_id: None,
+            metadata: std::collections::HashMap::new(),
         };
         let empty_source = metadata_handle(empty_value.clone()).unwrap();
         let empty_copy = unsafe {

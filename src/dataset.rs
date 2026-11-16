@@ -20,6 +20,7 @@ use crate::data_file::LanceDataFile;
 use crate::error::{ffi_try, swallow_unwind};
 use crate::file_session::LanceObjectStoreIoStats;
 use crate::helpers;
+use crate::native_write_options::{LanceBaseStoreParamsList, parse_base_store_params};
 use crate::runtime::block_on;
 use crate::session::LanceSession;
 use crate::storage_options::{LanceStorageOptionsAccessor, storage_options_accessor_from_ffi};
@@ -161,7 +162,16 @@ pub unsafe extern "C" fn lance_dataset_open(
     version: u64,
 ) -> *mut LanceDataset {
     ffi_try!(
-        unsafe { open_dataset_inner(uri, storage_options, version, None, ptr::null()) },
+        unsafe {
+            open_dataset_inner(
+                uri,
+                storage_options,
+                version,
+                None,
+                ptr::null(),
+                ptr::null(),
+            )
+        },
         null
     )
 }
@@ -195,7 +205,16 @@ unsafe fn open_dataset_with_session_inner(
         ));
     }
     let session = unsafe { &*session };
-    unsafe { open_dataset_inner(uri, storage_options, version, Some(session), ptr::null()) }
+    unsafe {
+        open_dataset_inner(
+            uri,
+            storage_options,
+            version,
+            Some(session),
+            ptr::null(),
+            ptr::null(),
+        )
+    }
 }
 
 unsafe fn open_dataset_with_options_inner(
@@ -217,7 +236,81 @@ unsafe fn open_dataset_with_options_inner(
         // SAFETY: non-NULL session points to a live handle for this call.
         Some(unsafe { &*session })
     };
-    unsafe { open_dataset_inner(uri, ptr::null(), version, session, accessor) }
+    unsafe { open_dataset_inner(uri, ptr::null(), version, session, accessor, ptr::null()) }
+}
+
+/// Open a Lance dataset with per-base store parameters for its shared bases.
+///
+/// `options` and `session` have the same meaning and ownership behavior as
+/// [`lance_dataset_open_with_options`]. `base_store_params` binds native
+/// `ObjectStoreParams` to exact `BasePath.path` keys from the dataset manifest:
+///
+/// - NULL selects native `None` (no per-base bindings).
+/// - A non-NULL list with `count == 0` selects native `Some(empty)`, which adds
+///   no bindings.
+/// - Entries are matched by the exact stored base path, not by base ID, base
+///   name, or URI normalization. Later duplicate keys overwrite earlier ones.
+///
+/// These bindings are runtime-only. Lance does not persist accessors,
+/// credentials, or other store parameters into the dataset, so a later reopen
+/// must supply them again when the base needs them. An exact binding takes
+/// precedence over dataset-level storage options; otherwise native base store
+/// resolution falls back to the dataset-level parameters scoped to that base.
+/// The returned dataset retains the accessor owners, so closing the C accessors
+/// after this call does not invalidate it.
+///
+/// Malformed lists are rejected before the native dataset is opened. Returns
+/// NULL on error; call `lance_last_error_code()` / `lance_last_error_message()`.
+///
+/// # Safety
+///
+/// Every non-NULL pointer must be valid for the duration of this call. String
+/// and entry arrays must contain `count` readable entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_open_with_base_store_params(
+    uri: *const c_char,
+    options: *const LanceDatasetOpenOptions,
+    session: *const LanceSession,
+    base_store_params: *const LanceBaseStoreParamsList,
+) -> *mut LanceDataset {
+    ffi_try!(
+        unsafe {
+            open_dataset_with_base_store_params_inner(uri, options, session, base_store_params)
+        },
+        null
+    )
+}
+
+unsafe fn open_dataset_with_base_store_params_inner(
+    uri: *const c_char,
+    options: *const LanceDatasetOpenOptions,
+    session: *const LanceSession,
+    base_store_params: *const LanceBaseStoreParamsList,
+) -> Result<*mut LanceDataset> {
+    let (version, accessor) = if options.is_null() {
+        (0, ptr::null())
+    } else {
+        // SAFETY: the caller guarantees a non-NULL options pointer is valid
+        // for the duration of this call.
+        let options = unsafe { &*options };
+        (options.version, options.storage_options_accessor)
+    };
+    let session = if session.is_null() {
+        None
+    } else {
+        // SAFETY: non-NULL session points to a live handle for this call.
+        Some(unsafe { &*session })
+    };
+    unsafe {
+        open_dataset_inner(
+            uri,
+            ptr::null(),
+            version,
+            session,
+            accessor,
+            base_store_params,
+        )
+    }
 }
 
 /// Open a dataset through a foreign commit lock and optional dynamic storage
@@ -304,6 +397,7 @@ unsafe fn open_dataset_inner(
     version: u64,
     session: Option<&LanceSession>,
     storage_options_accessor: *const LanceStorageOptionsAccessor,
+    base_store_params: *const LanceBaseStoreParamsList,
 ) -> Result<*mut LanceDataset> {
     let uri_str = unsafe { helpers::parse_c_string(uri)? }
         .ok_or_else(|| lance_core::Error::invalid_input_source("uri must not be NULL".into()))?;
@@ -327,6 +421,11 @@ unsafe fn open_dataset_inner(
     }
     if let Some(session) = session {
         builder = builder.with_session(session.inner.clone());
+    }
+    if let Some(base_store_params) = unsafe { parse_base_store_params(base_store_params)? } {
+        for (base_path, store_params) in base_store_params {
+            builder = builder.with_base_store_params(base_path, store_params);
+        }
     }
 
     let dataset = block_on(builder.load())?;

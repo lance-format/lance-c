@@ -145,6 +145,92 @@ const char *label_at(const ArrowArray &array, int64_t index) {
     return output;
 }
 
+const char *const blob_v2_descriptor_children[] = {
+    "kind", "position", "size", "blob_id", "blob_uri"};
+
+bool blob_descriptor_schema(const ArrowSchema *field, const char *label) {
+    if (!field || !field->format || std::strcmp(field->format, "+s") != 0) {
+        std::cerr << "FAIL " << label << " is not a struct" << std::endl;
+        return false;
+    }
+    if (field->n_children != 5) {
+        std::cerr << "FAIL " << label << " children=" << field->n_children
+                  << std::endl;
+        return false;
+    }
+    for (int64_t index = 0; index < field->n_children; index++) {
+        const ArrowSchema *child = field->children[index];
+        if (!child->name ||
+            std::strcmp(child->name, blob_v2_descriptor_children[index]) != 0) {
+            std::cerr << "FAIL " << label << " child[" << index << "]="
+                      << (child->name ? child->name : "null") << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool struct_is_valid(const ArrowArray &array, int64_t row) {
+    const auto *validity = static_cast<const uint8_t *>(array.buffers[0]);
+    return validity == nullptr ||
+           ((validity[row / 8] >> (row % 8)) & 1) != 0;
+}
+
+int64_t descriptor_size_at(const ArrowArray &descriptor, int64_t row) {
+    const auto *values =
+        static_cast<const int64_t *>(descriptor.children[2]->buffers[1]);
+    return values[row];
+}
+
+bool verify_released_blob_v2_stream(lance::ArrowStream &stream) {
+    ArrowSchema schema{};
+    if (stream->get_schema(stream.get(), &schema) != 0) return false;
+    const bool valid_schema =
+        std::strcmp(schema.format, "+s") == 0 && schema.n_children == 4;
+    if (schema.release) schema.release(&schema);
+    if (!valid_schema) return false;
+
+    static const int32_t expected_ids[] = {10, 20, 30};
+    int rows = 0;
+    bool blob_a_valid[3] = {false, false, false};
+    bool blob_b_valid[3] = {false, false, false};
+    bool payload_valid[3] = {false, false, false};
+    int64_t blob_a_size[3] = {-1, -1, -1};
+    while (true) {
+        ArrowArray batch{};
+        if (stream->get_next(stream.get(), &batch) != 0) return false;
+        if (!batch.release) break;
+        if (batch.n_children != 4) {
+            batch.release(&batch);
+            return false;
+        }
+        const auto *ids =
+            static_cast<const int32_t *>(batch.children[0]->buffers[1]);
+        const ArrowArray &blob_a = *batch.children[1];
+        const ArrowArray &blob_b = *batch.children[2];
+        const ArrowArray &payload = *batch.children[3]->children[0];
+        for (int64_t row = 0; row < batch.length; row++) {
+            const int index = rows + static_cast<int>(row);
+            if (index >= 3 || ids[row] != expected_ids[index]) {
+                batch.release(&batch);
+                return false;
+            }
+            blob_a_valid[index] = struct_is_valid(blob_a, row);
+            blob_b_valid[index] = struct_is_valid(blob_b, row);
+            payload_valid[index] = struct_is_valid(payload, row);
+            if (blob_a_valid[index]) {
+                blob_a_size[index] = descriptor_size_at(blob_a, row);
+            }
+        }
+        rows += static_cast<int>(batch.length);
+        batch.release(&batch);
+    }
+    return rows == 3 && blob_a_valid[0] && !blob_a_valid[1] &&
+           blob_a_valid[2] && blob_b_valid[0] && blob_b_valid[1] &&
+           !blob_b_valid[2] && payload_valid[0] && !payload_valid[1] &&
+           payload_valid[2] && blob_a_size[0] == 5 && blob_a_size[2] == 0;
+}
+
 bool verify_stream(
     lance::ArrowStream &stream,
     int expected_rows,
@@ -529,6 +615,56 @@ int main(int argc, char **argv) {
     CHECK(dynamic.has_value(), "provider snapshot has value");
     CHECK(dynamic && dynamic->at("block_size") == "8192",
           "provider snapshot value");
+
+    {
+        lance::FileSession blob_session(base_uri, &storage);
+        lance::FileReader blob_reader = blob_session.open_reader(
+            "blob_v2_raw_reader/blob_v2_raw.lance", lance::FileReaderOptions{});
+        CHECK(blob_reader.num_rows() == 3, "released Blob v2 raw rows");
+        const auto blob_metadata = blob_reader.metadata();
+        const auto blob_schema = blob_metadata.schema();
+        CHECK(blob_schema.get()->n_children == 4,
+              "released Blob v2 raw root fields");
+        CHECK(std::strcmp(blob_schema.get()->children[1]->name, "blob_a") == 0,
+              "released Blob v2 raw top-level field");
+        CHECK(blob_descriptor_schema(blob_schema.get()->children[1], "blob_a"),
+              "released Blob v2 raw blob_a descriptor");
+        CHECK(blob_descriptor_schema(blob_schema.get()->children[2], "blob_b"),
+              "released Blob v2 raw blob_b descriptor");
+        const ArrowSchema *info_field = blob_schema.get()->children[3];
+        CHECK(info_field->n_children == 1 &&
+                  std::strcmp(info_field->children[0]->name, "payload") == 0,
+              "released Blob v2 raw nested field");
+        CHECK(blob_descriptor_schema(info_field->children[0], "info.payload"),
+              "released Blob v2 raw nested descriptor");
+        lance::ArrowStream blob_stream = blob_reader.read_all(2, 2);
+        blob_reader.reset();
+        CHECK(verify_released_blob_v2_stream(blob_stream),
+              "released Blob v2 raw stream");
+
+        lance::FileReaderOptions blob_projection;
+        blob_projection.columns =
+            std::vector<std::string>{"blob_b", "info.payload"};
+        auto projected = blob_session.open_reader(
+            "blob_v2_raw_reader/blob_v2_raw.lance", blob_projection);
+        auto projected_stream = projected.read_all(3, 2);
+        projected.reset();
+        ArrowSchema projected_schema{};
+        const bool projected_ok =
+            projected_stream->get_schema(projected_stream.get(),
+                                         &projected_schema) == 0 &&
+            std::strcmp(projected_schema.format, "+s") == 0 &&
+            projected_schema.n_children == 2 &&
+            std::strcmp(projected_schema.children[0]->name, "blob_b") == 0 &&
+            std::strcmp(projected_schema.children[1]->name, "info") == 0 &&
+            projected_schema.children[1]->n_children == 1 &&
+            std::strcmp(projected_schema.children[1]->children[0]->name,
+                        "payload") == 0 &&
+            blob_descriptor_schema(projected_schema.children[1]->children[0],
+                                   "projected info.payload");
+        if (projected_schema.release) projected_schema.release(&projected_schema);
+        CHECK(projected_ok, "released Blob v2 projected stream schema");
+    }
 
     return failures == 0 ? 0 : 1;
 }

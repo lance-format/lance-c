@@ -12,7 +12,7 @@ readme = "README.md"
 description = "C/C++ bindings for the Lance columnar data format"
 keywords = ["lance", "ffi", "c", "cpp", "arrow"]
 categories = ["database-implementations", "external-ffi-bindings"]
-rust-version = "1.94.0"
+rust-version = "1.95.0"
 
 [build-dependencies]
 cc = "1"
@@ -26,29 +26,29 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # transitively via lance-index.
 async-trait = "0.1"
 bytes = "1"
-# Keep every Lance crate on the upstream v14.0.2 release commit.
-lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
+# Keep every Lance crate on the upstream v15.0.0-beta.20 release commit.
+lance = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["substrait"] }
 # Direct to reuse the native Binary/LargeBinary/BinaryView/FixedSizeBinary iterator.
-lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-core = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-index = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-io = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
+lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-core = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-index = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-io = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
 # Native namespace trait, models, directory/REST implementations and REST adapter.
 # Same upstream pin as every other Lance crate; credential-vendor features stay off.
-lance-namespace = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-namespace-impls = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["rest", "rest-adapter", "dir-goosefs"] }
+lance-namespace = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-namespace-impls = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["rest", "rest-adapter", "dir-goosefs"] }
 # Direct to name `NullableIndexExprResult` in the segment-scoped
 # `ScalarIndexLoader` adapter; already in the graph transitively via lance-index.
-lance-select = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-table = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
-datafusion = { version = "54.0.0", default-features = false }
-arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
-arrow-array = "58.0.0"
-arrow-schema = "58.0.0"
+lance-select = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-table = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["substrait"] }
+datafusion = { version = "55.0.0", default-features = false }
+arrow = { version = "59.2.0", features = ["prettyprint", "ffi"] }
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
 # Direct to name `chrono::TimeDelta` (the field type of lance's public
 # `AutoCleanupParams`) and `chrono::DateTime`/`Utc` (index metadata
 # timestamps); already in the graph transitively via lance.
@@ -75,13 +75,13 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-lance-file = { git = "https://github.com/lancedb/lance.git", rev = "40f15ed1b71b66950961b175829fdf17a763f108" }
-datafusion-substrait = { version = "=54.1.0", default-features = false }
+lance = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+datafusion-substrait = { version = "=55.0.0", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-arrow-array = "58.0.0"
-arrow-schema = "58.0.0"
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
 tempfile = "3"
 # Direct for `libc::SIGABRT` in the panic-guard test's child-process assertions;
 # already in the graph transitively via tokio/lance.

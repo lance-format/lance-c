@@ -1408,20 +1408,44 @@ fn test_delta_deleted_ids_require_stable_row_ids() {
         "native unsupported-case error should surface, got: {message}"
     );
 
-    // Row-change streams filter on row-version lineage, which a write without
-    // stable row ids does not record, so this dataset reports no changes —
-    // the native reader agrees.
-    let inserted = c_delta_stream(delta, DeltaStream::Inserted);
-    let native_inserted = native_delta(
-        &uri,
-        |builder| builder.with_begin_version(1).with_end_version(2),
-        DeltaStream::Inserted,
-    );
-    assert_eq!(ids_of(&native_inserted), ids_of(&inserted));
-    assert!(
-        ids_of(&inserted).is_empty(),
-        "row changes need row lineage, which a plain write does not record"
-    );
+    // v15 requires stable row ids for every row-change stream, not only for
+    // deleted-row ids. The native reader rejects the same request.
+    for (kind, getter) in [
+        (
+            DeltaStream::Inserted,
+            lance_dataset_delta_get_inserted_rows
+                as unsafe extern "C" fn(*const LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
+        ),
+        (
+            DeltaStream::Updated,
+            lance_dataset_delta_get_updated_rows
+                as unsafe extern "C" fn(*const LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
+        ),
+        (
+            DeltaStream::Upserted,
+            lance_dataset_delta_get_upserted_rows
+                as unsafe extern "C" fn(*const LanceDatasetDelta, *mut FFI_ArrowArrayStream) -> i32,
+        ),
+    ] {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(unsafe { getter(delta, &mut stream) }, -1, "{kind:?}");
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(message.contains("stable row ids"), "{kind:?}: {message}");
+    }
+    let native_error = lance_c::runtime::block_on(async {
+        let native_dataset = Dataset::open(&uri).await.unwrap();
+        NativeDeltaBuilder::new(native_dataset)
+            .with_begin_version(1)
+            .with_end_version(2)
+            .build()
+            .unwrap()
+            .get_inserted_rows()
+            .await
+    })
+    .err()
+    .expect("v15 native reader must reject row changes without stable row ids");
+    assert!(native_error.to_string().contains("stable row ids"));
 
     unsafe {
         lance_dataset_delta_close(delta);

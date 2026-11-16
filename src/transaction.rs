@@ -21,7 +21,7 @@ use lance::dataset::transaction::{
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
-use lance_table::format::{BasePath, Fragment, IndexFile, IndexMetadata, pb};
+use lance_table::format::{BasePath, Fragment, IndexFile, IndexMetadata, pb, pb_actions};
 use lance_table::transaction::{DataOverlayGroup, DataReplacementGroup, UpdateMap};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -59,6 +59,9 @@ pub struct LanceOperation {
     config_upserts: Vec<Result<(CString, CString)>>,
     /// Owned C-string storage backing borrowed Clone string views.
     clone_strings: CloneStrings,
+    /// Owned C-string storage for a MemWAL directory identifier carried by an
+    /// Update or UpdateMemWalState operation.
+    mem_wal_dir_id: Option<Result<CString>>,
 }
 
 /// Owned C-string conversions for the native Clone string fields.
@@ -121,11 +124,22 @@ impl LanceOperation {
             _ => Vec::new(),
         };
         let clone_strings = CloneStrings::from_native(&inner);
+        let mem_wal_dir_id = match &inner {
+            Operation::Update {
+                mem_wal_dir_id: Some(dir_id),
+                ..
+            } => Some(owned_c_string(dir_id, "Update mem_wal_dir_id")),
+            Operation::UpdateMemWalState { dir_id, .. } => {
+                Some(owned_c_string(dir_id, "UpdateMemWalState dir_id"))
+            }
+            _ => None,
+        };
         Self {
             inner,
             base_paths,
             config_upserts,
             clone_strings,
+            mem_wal_dir_id,
         }
     }
 }
@@ -3993,7 +4007,7 @@ fn parse_key_existence_filter(
     label: &str,
 ) -> Result<KeyExistenceFilter> {
     let bytes = unsafe { helpers::required_slice(bytes, len, label, "len") }?;
-    let message = pb::transaction::KeyExistenceFilter::decode(bytes).map_err(|error| {
+    let message = pb_actions::KeyExistenceFilter::decode(bytes).map_err(|error| {
         lance_core::Error::invalid_input_source(
             format!("{label} is not a native key-existence filter: {error}").into(),
         )
@@ -4338,7 +4352,7 @@ pub unsafe extern "C" fn lance_key_existence_filter_to_proto(
                 ));
             }
             let filter = unsafe { &*filter };
-            let message: pb::transaction::KeyExistenceFilter = (&filter.inner).into();
+            let message: pb_actions::KeyExistenceFilter = (&filter.inner).into();
             let encoded = message.encode_to_vec();
             let len = encoded.len();
             let allocation = if len == 0 {
@@ -4376,8 +4390,23 @@ pub unsafe extern "C" fn lance_key_existence_filter_to_proto(
 pub unsafe extern "C" fn lance_operation_update_new(
     options: *const LanceUpdateOperationOptions,
 ) -> *mut LanceOperation {
+    unsafe { lance_operation_update_new_with_mem_wal_dir_id(options, ptr::null()) }
+}
+
+/// Construct an Update operation that names its MemWAL directory.
+///
+/// Identical to `lance_operation_update_new()` except that `mem_wal_dir_id`
+/// maps to native `Some(...)`; NULL maps to `None`. Native code requires the
+/// identifier when `compacted_sstables` carries compaction progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_new_with_mem_wal_dir_id(
+    options: *const LanceUpdateOperationOptions,
+    mem_wal_dir_id: *const c_char,
+) -> *mut LanceOperation {
     ffi_try!(
         (|| -> Result<*mut LanceOperation> {
+            let mem_wal_dir_id =
+                unsafe { helpers::parse_c_string(mem_wal_dir_id)? }.map(str::to_string);
             if options.is_null() {
                 return Err(lance_core::Error::invalid_input_source(
                     "options must not be NULL".into(),
@@ -4457,6 +4486,7 @@ pub unsafe extern "C" fn lance_operation_update_new(
                     update_mode,
                     inserted_rows_filter,
                     updated_fragment_offsets,
+                    mem_wal_dir_id,
                 },
             ))))
         })(),
@@ -5175,6 +5205,7 @@ pub unsafe extern "C" fn lance_rewritten_index_new(
                     files.push(IndexFile {
                         path: path.to_string(),
                         size_bytes: entry.size_bytes,
+                        file_metadata_size_bytes: None,
                     });
                 }
                 Some(files)
@@ -5742,6 +5773,48 @@ pub unsafe extern "C" fn lance_operation_rewrite_frag_reuse_index(
     )
 }
 
+/// Borrow the MemWAL directory identifier named by an Update operation.
+///
+/// Writes `false` and NULL when native `mem_wal_dir_id` is `None`. The string
+/// remains valid until the operation is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mem_wal_dir_id(
+    operation: *const LanceOperation,
+    out_present: *mut bool,
+    out_dir_id: *mut *const c_char,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_present.is_null() || out_dir_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_present and out_dir_id must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::Update { mem_wal_dir_id, .. } = &operation.inner else {
+                return Err(update_kind_error(&operation.inner));
+            };
+            let value = match mem_wal_dir_id {
+                None => ptr::null(),
+                Some(_) => match operation.mem_wal_dir_id.as_ref() {
+                    Some(Ok(value)) => value.as_ptr(),
+                    Some(Err(_)) | None => {
+                        return Err(lance_core::Error::internal(String::from(
+                            "Update mem_wal_dir_id contains an embedded NUL byte",
+                        )));
+                    }
+                },
+            };
+            unsafe {
+                ptr::write(out_present, mem_wal_dir_id.is_some());
+                ptr::write(out_dir_id, value);
+            }
+            Ok(0)
+        })(),
+        neg
+    )
+}
+
 // ─── UpdateMemWalState operation ────────────────────────────────────────────
 
 /// Construct an owned native UpdateMemWalState operation.
@@ -5754,8 +5827,29 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new(
     compacted_sstables: *const LanceCompactedSsTable,
     compacted_sstable_count: usize,
 ) -> *mut LanceOperation {
+    unsafe {
+        lance_operation_update_mem_wal_state_new_with_dir_id(
+            compacted_sstables,
+            compacted_sstable_count,
+            c"".as_ptr(),
+        )
+    }
+}
+
+/// Construct an UpdateMemWalState operation for a specific MemWAL directory.
+///
+/// `dir_id` is required; pass an empty string for a legacy MemWAL created
+/// before directory identifiers existed. Native commit rejects a stale or
+/// removed identifier.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new_with_dir_id(
+    compacted_sstables: *const LanceCompactedSsTable,
+    compacted_sstable_count: usize,
+    dir_id: *const c_char,
+) -> *mut LanceOperation {
     ffi_try!(
         (|| -> Result<*mut LanceOperation> {
+            let dir_id = required_c_string(dir_id, "dir_id")?.to_string();
             let compacted_sstables = unsafe {
                 crate::mem_wal::parse_compacted_sstables(
                     compacted_sstables,
@@ -5763,10 +5857,47 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_new(
                 )?
             };
             Ok(Box::into_raw(Box::new(LanceOperation::from_native(
-                Operation::UpdateMemWalState { compacted_sstables },
+                Operation::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                },
             ))))
         })(),
         null
+    )
+}
+
+/// Borrow the MemWAL directory identifier named by an UpdateMemWalState
+/// operation. An empty string denotes the legacy `_mem_wal` directory. The
+/// string remains valid until the operation is closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_operation_update_mem_wal_state_dir_id(
+    operation: *const LanceOperation,
+    out_dir_id: *mut *const c_char,
+) -> i32 {
+    ffi_try!(
+        (|| -> Result<i32> {
+            if out_dir_id.is_null() {
+                return Err(lance_core::Error::invalid_input_source(
+                    "out_dir_id must not be NULL".into(),
+                ));
+            }
+            let operation = operation_at(operation)?;
+            let Operation::UpdateMemWalState { .. } = &operation.inner else {
+                return Err(update_mem_wal_state_kind_error(&operation.inner));
+            };
+            let value = match operation.mem_wal_dir_id.as_ref() {
+                Some(Ok(value)) => value.as_ptr(),
+                Some(Err(_)) | None => {
+                    return Err(lance_core::Error::internal(String::from(
+                        "UpdateMemWalState dir_id contains an embedded NUL byte",
+                    )));
+                }
+            };
+            unsafe { ptr::write(out_dir_id, value) };
+            Ok(0)
+        })(),
+        neg
     )
 }
 
@@ -5779,7 +5910,10 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_compacted_sstable_
     ffi_try!(
         (|| -> Result<i32> {
             let operation = operation_at(operation)?;
-            let Operation::UpdateMemWalState { compacted_sstables } = &operation.inner else {
+            let Operation::UpdateMemWalState {
+                compacted_sstables, ..
+            } = &operation.inner
+            else {
                 return Err(update_mem_wal_state_kind_error(&operation.inner));
             };
             count_out(compacted_sstables.len(), out_count, "out_count")
@@ -5803,7 +5937,10 @@ pub unsafe extern "C" fn lance_operation_update_mem_wal_state_compacted_sstable_
                 ));
             }
             let operation = operation_at(operation)?;
-            let Operation::UpdateMemWalState { compacted_sstables } = &operation.inner else {
+            let Operation::UpdateMemWalState {
+                compacted_sstables, ..
+            } = &operation.inner
+            else {
                 return Err(update_mem_wal_state_kind_error(&operation.inner));
             };
             let sstable = compacted_sstables.get(index).ok_or_else(|| {

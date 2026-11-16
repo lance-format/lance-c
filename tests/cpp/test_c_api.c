@@ -6107,6 +6107,24 @@ static void test_compact_files(const char *write_uri) {
         lance_compaction_options_v2_from_dataset(ds);
     ASSERT(v2_from_dataset != NULL, "from-dataset compaction options failed");
 
+    /* v15 rejects an explicit zero thread count at the native entry point
+     * instead of silently running with no workers. The setter still stores the
+     * explicit value so callers can observe the validation. */
+    memset(&metrics, 0, sizeof(metrics));
+    rc = lance_dataset_compact_files_v2(ds, v2, &metrics);
+    ASSERT(rc == -1, "zero threads must be rejected");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "zero threads is invalid input");
+    {
+        const char *message = lance_last_error_message();
+        ASSERT(message != NULL &&
+                   strstr(message, "num_threads must be greater than 0") != NULL,
+               "native zero-thread error surfaces");
+        lance_free_string(message);
+    }
+    ASSERT(lance_compaction_options_v2_set_num_threads(v2, false, 0) == 0,
+           "clear explicit zero threads failed");
+
     memset(&metrics, 0, sizeof(metrics));
     rc = lance_dataset_compact_files_v2(ds, v2, &metrics);
     ASSERT(rc == 0, "compact_files_v2 failed");

@@ -1194,10 +1194,34 @@ fn data_overlay_native_constructor_restrictions() {
         .unwrap();
         let source_fragment = native_source.get_fragments().remove(0);
         let source_schema = source_fragment.schema().project(&["a"]).unwrap();
-        let native_error =
-            lance_c::runtime::block_on(source_fragment.write_overlay(&source_schema))
-                .err()
-                .expect("native overlay constructor must reject this schema or format");
+        let overlay = lance_c::runtime::block_on(source_fragment.write_overlay(&source_schema));
+        if expected_variant == "NullableStructAncestor" {
+            // v15 lifted the v14 restriction on overlays under nullable struct
+            // ancestors. Both the native oracle and the C constructor must
+            // accept the same schema instead of preserving the old rejection.
+            overlay.expect("v15 supports overlays under nullable struct ancestors");
+            let uri = c_string(uri);
+            let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+            assert!(!dataset.is_null());
+            let source = open_fragment(dataset, 0);
+            let schema = projected_schema(source, &["a"]);
+            let mut output = ptr::null_mut();
+            assert_eq!(
+                unsafe { lance_fragment_overlay_writer_new(source, schema, &mut output) },
+                0
+            );
+            assert!(!output.is_null());
+            unsafe {
+                lance_fragment_overlay_writer_close(output);
+                lance_schema_close(schema);
+                lance_fragment_close(source);
+                lance_dataset_close(dataset);
+            }
+            continue;
+        }
+        let native_error = overlay
+            .err()
+            .expect("native overlay constructor must reject this schema or format");
         assert!(
             format!("{native_error:?}").starts_with(expected_variant),
             "expected {expected_variant}, got {native_error:?}"

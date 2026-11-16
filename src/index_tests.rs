@@ -21,6 +21,8 @@ fn segment(id: u128, field_id: Option<i32>) -> IndexMetadata {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: HashMap::new(),
     }
 }
 

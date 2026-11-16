@@ -19,7 +19,7 @@ use lance_core::{Error, Result};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::MetricsExt;
 use lance_index::IndexType;
-use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr, ScalarIndexLoader};
+use lance_index::scalar::expression::{ScalarIndexExpr, ScalarIndexLoader, create_filter_plan};
 use lance_index::scalar::{MetricsCollector, ScalarIndex};
 use lance_select::NullableIndexExprResult;
 use uuid::Uuid;
@@ -313,7 +313,8 @@ impl PreparedScalarSegment {
         }
         let planner = Planner::new(Arc::new(stored_schema));
         let index_info = self.dataset.scalar_index_info().await?;
-        let filter_plan = planner.create_filter_plan(filter, &index_info, true)?;
+        let filter = planner.optimize_expr(filter)?;
+        let filter_plan = create_filter_plan(filter, &index_info, true)?;
         let Some(expr) = filter_plan.index_query.as_ref() else {
             return Ok(Some("no_driver"));
         };

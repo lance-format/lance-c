@@ -19,8 +19,15 @@ tags. It is not part of the v0.1.9 assets. Add an `x64-osx` mapping and its
 release SHA512 only after that asset is published.
 
 The `x64-linux` and `x64-linux-dynamic` mappings select the Debian 12 x86_64
-archive so the default prebuilt keeps the lower Debian 12 libc floor. The
-`arm64-linux` mapping remains on the standard release archive until its exact
-libc floor is verified.
+`v0.1.9` archive so the default prebuilt keeps the lower Debian 12 libc floor.
+The `arm64-linux` mapping selects the standard `v0.1.9` release archive; static
+inspection of its shared library records `GLIBC_2.39` there and `GLIBC_2.35` in
+the Debian 12 archive.
+
+These mappings and hashes stay pinned to the `v0.1.9` assets. Future releases
+publish one generic Linux archive per architecture targeting glibc 2.28 and no
+Debian 12 variants; change the mappings and hashes only after such an archive
+is published. See [Linux baseline for future
+packages](../README.md#linux-baseline-for-future-packages).
 
 After each release, the contents are mirrored into `microsoft/vcpkg` via PR.

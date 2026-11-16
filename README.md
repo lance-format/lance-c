@@ -525,14 +525,18 @@ The batch API does not guarantee shared execution or a particular speedup.
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.
-Building this source tree requires Rust 1.94.0 or newer. The `from-source`
+Building this source tree requires Rust 1.95.0 or newer. The `from-source`
 recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
 `rust-version = "1.91.0"`. Prebuilt archives do not require a Rust toolchain.
 
 ### Published prebuilt archives
 
-The v0.1.9 release publishes five archives. vcpkg and Conan currently select
-three of them:
+This subsection describes the five `v0.1.9` archives. Candidate results appear
+only where they are labelled as such, and none of them is part of a release.
+vcpkg and Conan select three of the five archives. Future releases publish one
+glibc 2.28 archive per Linux architecture instead of the four `v0.1.9` Linux
+archives; see [Linux baseline for future
+packages](#linux-baseline-for-future-packages).
 
 | Archive | Selected by |
 | --- | --- |
@@ -566,15 +570,20 @@ Static inspection of the published Linux shared libraries found:
 | aarch64 Debian 12 | `GLIBC_2.35` | `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` |
 
 None of the Linux libraries records GLIBCXX or CXXABI version requirements.
-The macOS dylib is a thin `arm64` Mach-O binary with install name
-`@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
+The published v0.1.9 macOS dylib is a thin `arm64` Mach-O binary with install
+name `@rpath/liblance_c.dylib`, `minos 11.0`, SDK `14.5`, and dependencies on
 `SystemConfiguration`, `libobjc.A.dylib`, `IOKit`, `CoreFoundation`,
-`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`.
+`Security`, `libiconv.2.dylib`, and `libSystem.B.dylib`. Its static archive
+is not uniform: 416 of 3,298 Mach-O members declare `minos 14.5`, above the
+dylib's `11.0`, so the archive-level maximum is `14.5`. This split prevents
+treating the dylib value as a whole-package numeric runtime floor, but does
+not by itself prove that a static consumer fails below 14.5. No runtime
+execution of this published archive was retained.
 
 Linux and macOS release builds produced by the current workflow strip the
 staged shared library and restrict its defined dynamic exports to the public
-`lance_*` C ABI. Windows verifies that every header-declared symbol is exported
-and currently permits additional dependency exports. The static archive is not
+`lance_*` C ABI. Windows requires both the DLL and import library to expose
+exactly the header-declared symbols, with no additional dependency exports. The static archive is not
 stripped: it keeps the symbol table required for static linking. Archive names and layout above are unchanged, and no
 standalone shared-only artifact is added.
 
@@ -601,18 +610,55 @@ entries before the consumer and archive steps. Only glibc/toolchain SONAMEs
 `libssl` and `libcrypto` are rejected.
 
 The highest GLIBC symbol reference records a dynamic-loader requirement.
-The Mach-O `minos` field records the binary's declared deployment target.
-Runtime compatibility requires consumer verification on the intended OS.
-Static archive inspection established object architecture. The complete
+Mach-O `minos` values record each dylib's or object's declared target; they
+are build metadata, not a whole-package runtime guarantee. The complete
 binary metadata is recorded in the [artifact
 audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103/RESULTS.md).
-Runtime consumer evidence covers Linux x86_64 and is recorded in the
+Runtime consumer evidence for Linux x86_64 remains recorded in the
 [issue 100 validation
 record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
-The candidate Intel macOS row is built and executed on the hosted macOS 15
-Intel runner. Its dylib `minos` value is build metadata, not proof that macOS 11
-can run the complete static distribution; the exercised runner OS and build SDK
-are recorded in the workflow log.
+Current macOS checks and their limits are:
+
+| Build | Declared macOS metadata | Retained runtime check |
+| --- | --- | --- |
+| [Published v0.1.9 ARM64](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) | Dylib `11.0`; static archive maximum `14.5` (416 of 3,298 members above `11.0`) | None for the published archive; the metadata split alone does not prove failure below 14.5 |
+| [#208 Intel Release candidate](https://github.com/lance-format/lance-c/pull/208) ([job](https://github.com/lance-format/lance-c/actions/runs/43137215582/job/130915319083)) | Dylib and all static archive members `<= 11.0` | macOS 15.7.9: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. Candidate archive only, not published recipe availability |
+| [ARM64 current-source Release candidate at `62fbc0f`](https://github.com/lance-format/lance-c/commit/62fbc0fd69d66b184643e47ce93f7f3a6525598b) ([job](https://github.com/lance-format/lance-c/actions/runs/43181220854/job/131057410886)) | Dylib and all 3,855 static archive members: arm64, `minos 11.0` | macOS 15.8.2: installed static and shared dataset reads and Arrow, error and clone ownership acceptance passed. Candidate archive only, not published recipe availability; no older-macOS run |
+
+No numeric minimum macOS version is declared. The macOS 15.x versions above
+are exercised baselines, not a support floor; older macOS versions remain
+unverified, with no implied requirement to test every older release.
+
+### Linux baseline for future packages
+
+The GLIBC maxima above describe the four published Linux `v0.1.9` archives; they are
+not the baseline for future Linux packages. For future tags, the generic
+`x86_64` and `aarch64` archives target **glibc 2.28** (`manylinux_2_28`).
+Future releases do not publish separate Debian 12 variants.
+This is a packaging decision, not a change to any downloadable asset:
+
+- The Debian 12 variants, whose `v0.1.9` shared libraries reference
+  `GLIBC_2.35`, remain published with their current hashes and recipe
+  selections. They are historical assets; no future tag adds another one.
+- Keep the physical `lib/` install layout, with no `lib64` and no
+  compatibility symlinks, and keep the C++17 consumer requirement.
+- Runtime evidence is limited to the glibc 2.28 containers that were executed
+  (AlmaLinux 8.10) on `x86_64` and native `aarch64`, with installed and
+  archive-extracted static/shared C++17 dataset consumers. It is not a promise
+  for every glibc 2.28 distribution, and no glibc 2.28 archive has been
+  published.
+- The workflow change that would produce these archives is author-maintained
+  in [#50](https://github.com/lance-format/lance-c/pull/50). It is not part of
+  `release.yml` on `main` yet, which still builds the two Debian 12 rows next
+  to the generic Linux rows. Until packages built with this baseline are
+  published and the recipe hashes are updated, the recipes keep selecting the
+  `v0.1.9` archives listed above: `x64-linux`, `x64-linux-dynamic` and
+  `Linux/x86_64` use the Debian 12 x86_64 archive, while `arm64-linux`,
+  `arm64-linux-dynamic` and `Linux/armv8` use the standard aarch64 archive
+  (`GLIBC_2.39`).
+
+A source build is unaffected by this baseline; it links against the build
+host's libc.
 
 ### From source via cargo (Rust developers)
 
@@ -631,6 +677,21 @@ cmake --build build --parallel
 cmake --install build --prefix /your/prefix
 ```
 
+On macOS, `MACOSX_DEPLOYMENT_TARGET` must be in the environment that invokes
+the CMake build. With the pinned Corrosion 0.5.1, setting only
+`CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts. To
+set the same deployment target for CMake and Cargo:
+
+```bash
+export MACOSX_DEPLOYMENT_TARGET=11.0
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+cmake --build build
+cmake --install build --prefix /your/prefix
+```
+
+The value selects a build target; it is not a runtime support promise.
+
 Installs headers, both linkages, a `LanceCConfig.cmake` package config, and
 a `lance-c.pc` pkg-config file. Consumers then:
 
@@ -646,11 +707,19 @@ Baseline values are defined once in [`.github/baseline.env`](.github/baseline.en
 
 ### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
 
-The Windows package path uses the same CMake entry point:
+`v0.1.9` published no Windows archive. The current release workflow is
+configured to build both Windows archives for future tags, with candidate
+consumer validation already accepted. No current vcpkg or Conan mapping
+selects these archives.
+
+The Windows CMake build links the MSVC C runtime statically by default for
+both the DLL and static archive. Release and Windows CI pass
+`-DLANCE_C_CRT_STATIC=ON` explicitly; a source build can opt into the dynamic
+CRT with `-DLANCE_C_CRT_STATIC=OFF`.
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
 cmake --build build --config Release
 cmake --install build --prefix C:\path\to\prefix --config Release
 ```
@@ -659,7 +728,7 @@ For a native ARM64 build, select the Visual Studio 2026 ARM64 platform:
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 18 2026" -A ARM64 -T ClangCL `
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release -DLANCE_C_CRT_STATIC=ON
 cmake --build build --config Release
 cmake --install build --prefix C:\path\to\prefix --config Release
 ```
@@ -674,26 +743,65 @@ headers. `find_package(LanceC)` selects the static library by default; set
 The installed shared consumer must have `lance_c.dll` beside its executable or
 on its DLL search path.
 
+The DLL and archive are built with the static CRT. The DLL therefore has no
+redistributable `VCRUNTIME*`, `MSVCP*`, `MSVCR*`, `CONCRT*`, or `VCOMP*`
+direct or delay-load dependency. It still requires the stated Windows OS
+baseline and loads `lance_c.dll` from the consumer's DLL search path.
+Windows OS components such as `msvcp_win.dll`, `msvcrt.dll`, and `ucrtbase.dll`
+can still appear in the process's loaded modules; they are part of that OS
+baseline, not an additional VC Redistributable prerequisite.
+
+The static archive is a Release `/MT` archive. Its consumer must use the same
+static CRT, and the package config declares
+`set(LanceC_STATIC_CRT ON)` for this build. An imported library cannot
+propagate `CMAKE_MSVC_RUNTIME_LIBRARY`, so each consuming target must select it
+from that metadata:
+
+```cmake
+find_package(LanceC 0.1 REQUIRED)
+if(WIN32 AND LanceC_STATIC_CRT)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+```
+
+Do not link a `/MD` consumer against this archive. The release archive is not
+a `/MTd` debug library, and mixing `/MTd` with it is not supported. A shared
+consumer may use either CRT; the package's acceptance example also builds the
+shared consumer with `/MT` so its own executables do not depend on a
+redistributable runtime.
+
+The CMake option does not configure a direct Cargo build. For Cargo, select
+the same Rust target feature explicitly for the Windows target:
+
+```powershell
+$env:RUSTFLAGS = '-Ctarget-feature=+crt-static'
+cargo build --release --target x86_64-pc-windows-msvc
+```
+
+Cargo exposes that target feature to build scripts, which lets `cc` and
+AWS-LC's CMake configuration select the static CRT for native dependencies.
+
+When staging existing Windows libraries with `LANCE_C_USE_PREBUILT=ON`, also
+set `LANCE_C_CRT_STATIC=ON` for Release `/MT` inputs or `OFF` for dynamic-CRT
+inputs. This explicit declaration controls the installed package metadata;
+prebuilt mode copies the supplied libraries unchanged and cannot convert their
+CRT. Omitting the declaration in a fresh prebuilt configuration is an error.
+
 The Windows package link is restricted through a wrapper around MSVC
 `link.exe`. Overriding the linker with `lld-link` is not supported for this
 export policy.
 
-Windows CI builds this layout with Rust 1.94.0. The x64 job uses
+Windows CI builds this layout with Rust 1.95.0. The x64 job uses
 `windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies
-the PE32+ machine, public `lance_*` exports, and resolved runtime DLL
-dependencies, then runs static and shared C++17 consumers with `PATH`
-restricted to the Windows system directories. The ARM64 job builds both the
-package and installed consumers with the ClangCL toolset and verifies the PE
-machine of both acceptance executables before running them. The hosted Windows
-11 ARM64 baseline does not establish Windows 10 ARM64 or Windows Server ARM64
-support.
-
-The current Windows DLLs import `VCRUNTIME140.dll`, which the hosted images
-provide in `System32`. A system-only `PATH` does not prove that the package is
-self-contained on a machine without the Visual C++ Runtime. The distribution
-contract for that deployment is tracked in
-[#215](https://github.com/lance-format/lance-c/issues/215).
+the PE32+ machine, public `lance_*` exports, absence of redistributable CRT
+imports, static archive directives, and installed static/shared C++17
+consumers. The consumers run with `PATH` restricted to the Windows system
+directories and write their loaded-module lists; `LNK4098` and `LNK2038` are
+failures. The hosted images already contain a VC Runtime under `System32`, so
+this is import-table and loaded-module evidence on the named hosted OS, not a
+fresh-machine lab. The Windows 11 ARM64 baseline does not establish Windows 10
+ARM64 or Windows Server ARM64 support.
 
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
@@ -1197,7 +1305,10 @@ back.
 ## Releasing
 
 Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds eight prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
-Before the consumer smoke test and archive upload, the Linux and macOS build rows strip the staged shared library and verify its exports. Linux rows also verify direct runtime dependencies; Windows verifies PE architecture, public exports, and DLL loading through its installed consumers.
+
+The two Debian 12 rows belong to this current workflow, not to the future Linux baseline. The glibc 2.28-only policy replaces them with a single generic archive per Linux architecture, pending in the author-maintained [#50](https://github.com/lance-format/lance-c/pull/50); `main` still builds all eight tarballs until that change lands.
+
+Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports. Linux rows also verify direct runtime dependencies. Windows verifies PE architecture, exact DLL and import-library export sets, absence of redistributable CRT imports, compatible static-CRT archive and consumer directives, and installed static/shared consumers.
 
 ### Recommended: cut a release via Actions UI
 
@@ -1241,7 +1352,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the seven prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the eight prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 

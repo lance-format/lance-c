@@ -11,7 +11,7 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$expectedVersion = '1.94.0'
+$expectedVersion = '1.95.0'
 $expectedHost = 'aarch64-pc-windows-msvc'
 
 if ($env:RUNNER_ARCH -ne 'ARM64') {

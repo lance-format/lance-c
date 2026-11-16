@@ -612,6 +612,55 @@ LanceDataset* lance_dataset_open_with_options(
     const LanceSession* session
 );
 
+/* Defined with the native write-options declarations below; forward-declared
+ * here so the source-store open entry point can take it by pointer. */
+typedef struct LanceBaseStoreParamsList LanceBaseStoreParamsList;
+
+/**
+ * Open a dataset with additive options, an optional shared session, and
+ * per-base store parameters for its shared bases.
+ *
+ * `options` and `session` have the same meaning and ownership behavior as
+ * lance_dataset_open_with_options: NULL options means latest version and native
+ * storage defaults, and NULL session means the default session. A non-NULL
+ * accessor is retained natively and closing the C accessor does not invalidate
+ * the dataset.
+ *
+ * `base_store_params` binds native `ObjectStoreParams` to exact
+ * `BasePath.path` keys from the dataset manifest:
+ *
+ * - NULL selects native `None` (no per-base bindings).
+ * - A non-NULL list with `count == 0` selects native `Some(empty)`, which adds
+ *   no bindings.
+ * - Entries match the exact stored base path, not a base id or name and with no
+ *   URI normalization. Duplicate keys use the last entry.
+ *
+ * An exact binding takes precedence over the dataset-level storage options.
+ * Without one, native base store resolution falls back to the dataset-level
+ * accessor/options scoped to that base. These bindings are runtime-only:
+ * Lance does not persist accessors, credentials, or other store parameters in
+ * the dataset, so reopening the dataset later must supply them again when the
+ * base needs them. This call adds no second parser, credential cache, or store
+ * manager.
+ *
+ * Malformed lists are rejected before the native dataset is opened. A NULL
+ * `items` with a non-zero `count`, a NULL or non-UTF-8 base path, an
+ * out-of-range block size, or invalid S3 refresh nanoseconds returns NULL with
+ * LANCE_ERR_INVALID_ARGUMENT.
+ *
+ * @param uri               Dataset path (file://, s3://, memory://, etc.)
+ * @param options           Additive open options, or NULL
+ * @param session           Shared session, or NULL for the default session
+ * @param base_store_params Per-base bindings, or NULL for native None
+ * @return Dataset handle, or NULL on error
+ */
+LanceDataset* lance_dataset_open_with_base_store_params(
+    const char* uri,
+    const LanceDatasetOpenOptions* options,
+    const LanceSession* session,
+    const LanceBaseStoreParamsList* base_store_params
+);
+
 /**
  * Open a Lance dataset through a foreign commit lock and an optional dynamic
  * storage-options accessor.
@@ -1430,6 +1479,69 @@ int32_t lance_dataset_deep_clone(
     LanceDataset** out
 );
 
+/**
+ * Shallow clone a dataset snapshot into a new dataset at `target_path`.
+ *
+ * The whole operation is performed by Lance's native
+ * `Dataset::shallow_clone` on a private clone of the source handle's snapshot.
+ * The source handle is not modified and no source write lock is held while the
+ * clone is committed. Native shallow clone publishes a metadata-only target
+ * whose manifest reuses the source base paths instead of copying data files.
+ *
+ * `reference == NULL` clones the source handle's current snapshot: its branch
+ * and version id are pinned into `Ref::Version(branch, Some(version))`. Treat
+ * it as "clone this exact snapshot", not "clone the latest head". Pass an
+ * explicit `LanceRef` from `lance_ref_version(NULL, false, 0)` to clone the
+ * current head of the default branch. Source location, reference resolution,
+ * and the published version are native-defined by the selected reference and
+ * manifest.
+ *
+ * `target_storage_options` is an existing storage-options accessor, or NULL.
+ * Its native accessor Arc is forwarded into `ObjectStoreParams` without
+ * resolving, snapshotting, or copying credentials, so a dynamic provider keeps
+ * its refresh behavior. NULL passes native `None`, which makes the target
+ * inherit the source dataset's dataset-level store parameters as native
+ * shallow clone does. A non-NULL accessor that holds static options and/or a
+ * provider contributes its native `Arc`; an accessor created with neither
+ * contributes native `None`, while an accessor with an engaged static map,
+ * even an empty one, contributes `Some` and selects explicit target
+ * parameters.
+ *
+ * Native shallow clone resolves the target through the source dataset's
+ * session and object-store registry, captured when the source handle was
+ * opened. Schemes visible only to another registry are not available here.
+ *
+ * The returned dataset retains the source store parameters for its base paths
+ * as a runtime binding, so it can read shared source files after the source
+ * handle is closed. Those bindings and accessor owners are not persisted in
+ * the target manifest. Reopening the clone in a new dataset handle requires
+ * supplying them again through lance_dataset_open_with_base_store_params when
+ * the default store configuration cannot read a base. This call does not
+ * reopen the target, persist credentials, or add a custom ObjectStore API.
+ *
+ * The out handle is written only on success. A target that already contains a
+ * published dataset is rejected by the native preflight before clone writes.
+ * Later native failures may leave partial files, including tagged index files,
+ * under `target_path`; they are not rolled back. Remote/cloud behavior is
+ * whatever the configured native providers return; this binding makes no
+ * additional availability or persistence guarantee.
+ *
+ * Caller closes the returned handle with lance_dataset_close().
+ * @param dataset source dataset handle (must not be NULL)
+ * @param target_path UTF-8 target dataset URI (must not be NULL)
+ * @param reference snapshot ref, or NULL for the source handle's snapshot
+ * @param target_storage_options target accessor, or NULL for native None
+ * @param out receives the new dataset handle on success (must not be NULL)
+ * @return 0 on success, -1 on error; the out handle is not written on error
+ */
+int32_t lance_dataset_shallow_clone(
+    const LanceDataset* dataset,
+    const char* target_path,
+    const LanceRef* reference,
+    const LanceStorageOptionsAccessor* target_storage_options,
+    LanceDataset** out
+);
+
 /* ─── Branches ─── */
 
 /**
@@ -2218,7 +2330,9 @@ int32_t lance_dataset_merge_insert(
  * The source field named by `right_on` is the join key and is not appended.
  * Every other top-level RHS field must be new to the dataset. Native owns key
  * matching, duplicate and NULL semantics, schema compatibility, field IDs,
- * physical writes, and commit conflicts.
+ * physical writes, and commit conflicts. The pinned native implementation
+ * rejects duplicate right-side join keys, including duplicate NULL keys,
+ * with LANCE_ERR_INVALID_ARGUMENT.
  *
  * The non-NULL `source` stream is consumed on every return path, including
  * invalid dataset/key arguments and native failures. After this call the
@@ -2320,6 +2434,25 @@ typedef int32_t (*LanceUDFCheckpointGetBatch)(
 );
 
 /**
+ * Retrieve a checkpointed output batch together with its schema.
+ *
+ * Return 1 with both `output` and `output_schema` initialized to owned Arrow C
+ * Data values, 0 with both slots left zero-initialized, or -1 with `error`
+ * initialized. The schema is authoritative: native stores a checkpoint context
+ * marker in its metadata, so the callback must retain and return the exact
+ * schema received through `LanceUDFCheckpointInsertBatch`. Rebuilding a batch
+ * from the declared output schema drops that metadata and native rejects the
+ * hit as incompatible.
+ */
+typedef int32_t (*LanceUDFCheckpointGetBatchV2)(
+    void* callback_ctx,
+    const LanceUDFBatchInfo* info,
+    struct ArrowArray* output,
+    struct ArrowSchema* output_schema,
+    LanceCallbackError* error
+);
+
+/**
  * Retain a checkpoint batch.
  *
  * `batch` and `batch_schema` are owned, movable Arrow C Data Interface values.
@@ -2393,6 +2526,34 @@ typedef struct LanceBatchUDF {
 } LanceBatchUDF;
 
 /**
+ * Schema-aware foreign UDFCheckpointStore adapter.
+ *
+ * Same contract as `LanceUDFCheckpointStore`, but `get_batch` returns the batch
+ * schema alongside the batch. Insert and fragment callbacks are shared with the
+ * original struct. All four callbacks are required when engaged.
+ */
+typedef struct LanceUDFCheckpointStoreV2 {
+    LanceUDFCheckpointGetBatchV2 get_batch;
+    LanceUDFCheckpointInsertBatch insert_batch;
+    LanceUDFCheckpointGetFragment get_fragment;
+    LanceUDFCheckpointInsertFragment insert_fragment;
+    void* callback_ctx;
+} LanceUDFCheckpointStoreV2;
+
+/**
+ * Schema-aware foreign BatchUDF declaration.
+ *
+ * `output_schema` is the complete schema of every mapper output batch and is
+ * borrowed for this call. `checkpoint_store` may be NULL.
+ */
+typedef struct LanceBatchUDFV2 {
+    LanceBatchUDFMapper mapper;
+    void* mapper_ctx;
+    const struct ArrowSchema* output_schema;
+    const LanceUDFCheckpointStoreV2* checkpoint_store;
+} LanceBatchUDFV2;
+
+/**
  * Add columns through native `NewColumnTransform::BatchUDF`.
  *
  * `read_columns` NULL maps to native None. A non-NULL NULL-terminated array
@@ -2411,6 +2572,24 @@ typedef struct LanceBatchUDF {
 int32_t lance_dataset_add_columns_batch_udf(
     LanceDataset* dataset,
     const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size
+);
+
+/**
+ * Add columns through a schema-aware native `NewColumnTransform::BatchUDF`.
+ *
+ * Identical to `lance_dataset_add_columns_batch_udf` except that batch
+ * checkpoints are restored from an owned ArrowArray plus the schema that
+ * carries native schema metadata. Use this entry when replaying cached batches;
+ * the original entry remains ABI-stable and honestly rejects markerless batch
+ * hits through native validation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_add_columns_batch_udf_v2(
+    LanceDataset* dataset,
+    const LanceBatchUDFV2* udf,
     const char* const* read_columns,
     const uint32_t* batch_size
 );
@@ -2641,6 +2820,11 @@ int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
     LanceCompactionOptionsV2* options,
     float value
 );
+/**
+ * Store an optional thread-count override. `has_value = false` selects the
+ * native default. An explicit zero is stored by this setter but rejected
+ * with LANCE_ERR_INVALID_ARGUMENT when native compaction executes.
+ */
 int32_t lance_compaction_options_v2_set_num_threads(
     LanceCompactionOptionsV2* options,
     bool has_value,
@@ -3849,6 +4033,27 @@ int32_t lance_fragment_add_columns_stream(
 int32_t lance_fragment_add_columns_batch_udf(
     const LanceFragment* fragment,
     const LanceBatchUDF* udf,
+    const char* const* read_columns,
+    const uint32_t* batch_size,
+    LanceFragment** out_fragment,
+    LanceSchema** out_schema
+);
+
+/**
+ * Add columns through a schema-aware borrowed BatchUDF declaration.
+ *
+ * Identical to `lance_fragment_add_columns_batch_udf` except that batch
+ * checkpoints are restored from an owned ArrowArray plus the schema that
+ * carries native schema metadata. The original entry remains ABI-stable and
+ * honestly rejects markerless batch hits through native validation.
+ *
+ * Both outputs are success-only. The output slots are unchanged on error.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_fragment_add_columns_batch_udf_v2(
+    const LanceFragment* fragment,
+    const LanceBatchUDFV2* udf,
     const char* const* read_columns,
     const uint32_t* batch_size,
     LanceFragment** out_fragment,
@@ -9885,6 +10090,21 @@ LanceOperation* lance_operation_update_new(
 );
 
 /**
+ * Construct an Update operation that names its MemWAL directory.
+ *
+ * Identical to `lance_operation_update_new()` except that `mem_wal_dir_id`
+ * maps to native `Some(...)`; NULL maps to `None`. Since Lance 15 native code
+ * requires the identifier when `compacted_sstables` carries compaction
+ * progress, and later rejects a stale or removed identifier at commit.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_new_with_mem_wal_dir_id(
+    const LanceUpdateOperationOptions* options,
+    const char* mem_wal_dir_id
+);
+
+/**
  * Read the number of removed fragment IDs in an Update operation.
  *
  * @return 0 on success, -1 on error or a different operation kind.
@@ -10056,6 +10276,22 @@ int32_t lance_operation_update_updated_fragment_offsets(
     const LanceOperation* operation,
     bool* out_present,
     LanceUpdatedFragmentOffsets** out_offsets
+);
+
+/**
+ * Borrow the MemWAL directory identifier named by an Update operation.
+ *
+ * Writes `*out_present = false` and a NULL string when the native field is
+ * `None`. An empty string is a present identifier for a legacy MemWAL.
+ * `*out_dir_id` remains valid until the operation is closed. Both outputs are
+ * written only on success.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_mem_wal_dir_id(
+    const LanceOperation* operation,
+    bool* out_present,
+    const char** out_dir_id
 );
 
 /**
@@ -10362,6 +10598,21 @@ LanceOperation* lance_operation_update_mem_wal_state_new(
 );
 
 /**
+ * Construct an UpdateMemWalState operation for a specific MemWAL directory.
+ *
+ * `dir_id` is required and must be valid UTF-8. Pass an empty string for a
+ * legacy MemWAL created before directory identifiers existed. Native commit
+ * rejects a stale or removed identifier.
+ *
+ * @return the new operation, or NULL on error.
+ */
+LanceOperation* lance_operation_update_mem_wal_state_new_with_dir_id(
+    const LanceCompactedSsTable* compacted_sstables,
+    size_t compacted_sstable_count,
+    const char* dir_id
+);
+
+/**
  * Read the number of compacted SSTables in an UpdateMemWalState operation.
  *
  * @return 0 on success, -1 on error or a different operation kind.
@@ -10380,6 +10631,19 @@ int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
     const LanceOperation* operation,
     size_t index,
     LanceCompactedSsTable* out_sstable
+);
+
+/**
+ * Borrow the MemWAL directory identifier of an UpdateMemWalState operation.
+ *
+ * An empty string denotes the legacy `_mem_wal` directory. The string remains
+ * valid until the operation is closed.
+ *
+ * @return 0 on success, -1 on error or a different operation kind.
+ */
+int32_t lance_operation_update_mem_wal_state_dir_id(
+    const LanceOperation* operation,
+    const char** out_dir_id
 );
 
 /**
@@ -11960,6 +12224,10 @@ void lance_transaction_array_free(
  * valid after the delta and dataset handles close. On error the stream slot
  * is left unchanged.
  *
+ * Native row-change streams require stable row IDs at both nonzero endpoints;
+ * version 0 denotes the empty snapshot. Missing stable row IDs produce
+ * LANCE_ERR_INVALID_ARGUMENT when requesting the stream.
+ *
  * Returns 0 on success, -1 on error.
  */
 int32_t lance_dataset_delta_get_inserted_rows(
@@ -12222,6 +12490,16 @@ int32_t lance_mem_wal_index_details(
 
 /** Free an index-details handle. Safe to call with NULL. */
 void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
+
+/**
+ * Borrow the MemWAL directory identifier recorded in the index details.
+ *
+ * An empty string denotes the legacy `_mem_wal` directory. The string remains
+ * valid until the details handle is freed.
+ */
+const char* lance_mem_wal_index_details_dir_id(
+    const LanceMemWalIndexDetails* details
+);
 
 /** Number of shards recorded for the MemWAL index. */
 uint32_t lance_mem_wal_index_details_num_shards(

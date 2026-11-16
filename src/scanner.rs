@@ -18,15 +18,18 @@ use datafusion::physical_expr::expressions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{
     ExecutionPlan, empty::EmptyExec, projection::ProjectionExec as DFProjectionExec,
+    replace_children_if_necessary,
 };
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use lance::Dataset;
 use lance::dataset::fragment::FileFragment;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
     ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap,
 };
-use lance::io::exec::fts::{FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+use lance::io::exec::fts::{
+    FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorerExec,
+};
 use lance_core::Result;
 use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
 use lance_datafusion::exec::{
@@ -39,7 +42,8 @@ use lance_io::stream::RecordBatchStream;
 use lance_table::format::{Fragment, IndexMetadata};
 use uuid::Uuid;
 
-use crate::async_dispatcher::{self, LanceCallback};
+use crate::async_bridge::spawn_lance_future;
+use crate::async_dispatcher::{Completion, LanceCallback};
 use crate::batch::LanceBatch;
 use crate::dataset::LanceDataset;
 use crate::error::{
@@ -1380,6 +1384,27 @@ fn rewrite_prepared_fts_plan(
     selected_segments_have_current_fragments: bool,
     row_addr_mask: Option<&Arc<RowAddrMask>>,
 ) -> Result<(Arc<dyn ExecutionPlan>, PreparedFtsPlanRewriteCounts)> {
+    // A prepared scan always replaces the flat branch with EmptyExec, so the
+    // v15 corpus owner has no producer left to coordinate with. Drop the owner
+    // and keep the rebuilt indexed leaf, which already carries the prepared
+    // corpus-wide scorer.
+    if plan.downcast_ref::<SharedFtsScorerExec>().is_some() {
+        let children = plan.children();
+        let [input] = children.as_slice() else {
+            return Err(lance_core::Error::internal(format!(
+                "prepared FTS corpus owner must have exactly one input, got {}",
+                children.len()
+            )));
+        };
+        return rewrite_prepared_fts_plan(
+            Arc::clone(input),
+            segments,
+            prepared,
+            selected_segments_have_current_fragments,
+            row_addr_mask,
+        );
+    }
+
     // Lance's ordinary FTS planner adds a flat-search branch for fragments not
     // covered by the logical index. A prepared INDEX_ONLY scan must omit that
     // branch, but using Scanner::with_fragments to do so would turn an
@@ -1412,7 +1437,7 @@ fn rewrite_prepared_fts_plan(
             rewritten.indexed_query_execs += child_rewritten.indexed_query_execs;
             rewritten.flat_match_query_execs += child_rewritten.flat_match_query_execs;
         }
-        plan.with_new_children(new_children).map_err(|error| {
+        replace_children_if_necessary(plan, new_children).map_err(|error| {
             lance_core::Error::internal(format!(
                 "failed to rebuild FTS execution plan children: {error}"
             ))
@@ -3270,9 +3295,10 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
         set_last_error(LanceErrorCode::InvalidArgument, "callback must not be NULL");
         return;
     };
+    let completion = unsafe { Completion::new(callback, callback_ctx) };
     unsafe {
-        scan_async_guarded(scanner, callback, callback_ctx, |s, cb, ctx| {
-            scan_async_setup(s, cb, ctx)
+        scan_async_guarded(scanner, completion, |scanner, completion| {
+            scan_async_setup(scanner, completion);
         });
     }
 }
@@ -3285,13 +3311,12 @@ pub unsafe extern "C" fn lance_scanner_scan_async(
 /// hook.
 ///
 /// # Safety
-/// `scanner` must be NULL or a valid scanner handle; `callback` and
-/// `callback_ctx` follow the same contract as `lance_scanner_scan_async`.
+/// `scanner` must be NULL or a valid scanner handle; `completion` must follow
+/// the callback and context contract of `lance_scanner_scan_async`.
 unsafe fn scan_async_guarded(
     scanner: *const LanceScanner,
-    callback: LanceCallback,
-    callback_ctx: *mut c_void,
-    setup: impl FnOnce(*const LanceScanner, LanceCallback, *mut c_void),
+    completion: Completion,
+    setup: impl FnOnce(*const LanceScanner, Completion),
 ) {
     // Capture the poison flag BEFORE setup runs: a panic during setup must
     // still be able to poison the handle it never finished configuring.
@@ -3301,7 +3326,7 @@ unsafe fn scan_async_guarded(
         Some(unsafe { &*scanner }.poison_flag())
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        setup(scanner, callback, callback_ctx)
+        setup(scanner, completion.clone())
     }));
     if let Err(payload) = outcome {
         if let Some(flag) = poison_flag {
@@ -3312,15 +3337,9 @@ unsafe fn scan_async_guarded(
         // entry point would abort the host, which is what this guard exists
         // to prevent.
         swallow_unwind("lance_scanner_scan_async panic report", || {
-            async_dispatcher::dispatch_callback(
-                callback,
-                callback_ctx,
-                -1,
-                ptr::null_mut(),
-                Some((
-                    LanceErrorCode::Panic,
-                    format!("panic in FFI call: {}", panic_payload_message(&*payload)),
-                )),
+            completion.fail(
+                LanceErrorCode::Panic,
+                format!("panic in FFI call: {}", panic_payload_message(&*payload)),
             );
         });
     }
@@ -3333,23 +3352,13 @@ unsafe fn scan_async_guarded(
 ///
 /// # Safety
 /// `scanner` must be NULL or a valid scanner handle (checked first).
-unsafe fn scan_async_setup(
-    scanner: *const LanceScanner,
-    callback: LanceCallback,
-    callback_ctx: *mut c_void,
-) {
+unsafe fn scan_async_setup(scanner: *const LanceScanner, completion: Completion) {
     // Validation-time failures happen before scan_async returns, so they keep
     // setting the caller thread's TLS AND carry the error inside the dispatch
     // message for the callback thread to observe (issue #61).
     if scanner.is_null() {
         set_last_error(LanceErrorCode::InvalidArgument, "scanner is NULL");
-        async_dispatcher::dispatch_callback(
-            callback,
-            callback_ctx,
-            -1,
-            ptr::null_mut(),
-            Some((LanceErrorCode::InvalidArgument, "scanner is NULL".into())),
-        );
+        completion.fail(LanceErrorCode::InvalidArgument, "scanner is NULL");
         return;
     }
 
@@ -3361,15 +3370,9 @@ unsafe fn scan_async_setup(
             LanceErrorCode::Panic,
             "scanner is poisoned by an earlier panic",
         );
-        async_dispatcher::dispatch_callback(
-            callback,
-            callback_ctx,
-            -1,
-            ptr::null_mut(),
-            Some((
-                LanceErrorCode::Panic,
-                "scanner is poisoned by an earlier panic".into(),
-            )),
+        completion.fail(
+            LanceErrorCode::Panic,
+            "scanner is poisoned by an earlier panic",
         );
         return;
     }
@@ -3379,102 +3382,31 @@ unsafe fn scan_async_setup(
         Ok(sc) => sc,
         Err(err) => {
             set_lance_error(&err);
-            async_dispatcher::dispatch_callback(
-                callback,
-                callback_ctx,
-                -1,
-                ptr::null_mut(),
-                Some((error_code_from_lance(&err), err.to_string())),
-            );
+            completion.fail(error_code_from_lance(&err), err.to_string());
             return;
         }
     };
 
     let handle = RT.handle().clone();
 
-    // Wrap non-Send raw pointers for the async task.
-    // Safety: The C caller guarantees callback_ctx remains valid until callback fires.
-    #[derive(Clone, Copy)]
-    struct SendCallback {
-        callback: LanceCallback,
-        ctx: *mut c_void,
-    }
-    unsafe impl Send for SendCallback {}
-
-    impl SendCallback {
-        fn dispatch(
-            &self,
-            status: i32,
-            result: *mut c_void,
-            error: Option<(LanceErrorCode, String)>,
-        ) {
-            async_dispatcher::dispatch_callback(self.callback, self.ctx, status, result, error);
-        }
-    }
-
-    let send_cb = SendCallback {
-        callback,
-        ctx: callback_ctx,
-    };
-
     // Shared poison flag moved into the task: the GuardedReader below flips
     // it if a panic is caught during the consumer's later `get_next` calls.
     let poisoned = s.poison_flag();
-
-    RT.spawn(async move {
-        // Copies kept outside the inner future (which consumes the originals)
-        // so the panic arm below can still poison the handle and report.
-        let poisoned_on_panic = Arc::clone(&poisoned);
-        let send_cb_on_panic = send_cb;
-        // The whole task body runs under catch_unwind (issue #61): a panic
-        // here would otherwise die as an unobserved JoinError — the callback
-        // would never fire and the C caller would hang forever waiting for a
-        // completion that never arrives.
-        let outcome = std::panic::AssertUnwindSafe(async move {
-            let result = built_scanner.try_into_stream().await;
-            match result {
-                Ok(stream) => {
-                    // Guard the exported stream at the reader level (issue
-                    // #61): a mid-iteration panic — including a
-                    // `Handle::block_on` panic on a consumer thread driving a
-                    // Tokio runtime — becomes one terminal error item per
-                    // the Arrow C stream error contract instead of unwinding
-                    // out of arrow-rs's `get_next`, and cleanup panics on the
-                    // `release` path are contained.
-                    let schema = stream.schema();
-                    let reader = GuardedReader::new(stream, schema, handle, poisoned);
-                    let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
-                    let ptr = Box::into_raw(Box::new(ffi_stream));
-                    send_cb.dispatch(0, ptr as *mut c_void, None);
-                }
-                Err(err) => {
-                    // Runs on a Tokio worker AFTER scan_async returned:
-                    // setting this thread's TLS would be invisible to
-                    // everyone, so the error rides inside the dispatch
-                    // message and the dispatcher installs it on the
-                    // callback thread instead (issue #61).
-                    send_cb.dispatch(
-                        -1,
-                        std::ptr::null_mut(),
-                        Some((error_code_from_lance(&err), err.to_string())),
-                    );
-                }
-            }
-        })
-        .catch_unwind()
-        .await;
-        if let Err(payload) = outcome {
-            poisoned_on_panic.store(true, Ordering::SeqCst);
-            send_cb_on_panic.dispatch(
-                -1,
-                std::ptr::null_mut(),
-                Some((
-                    LanceErrorCode::Panic,
-                    format!("panic in FFI call: {}", panic_payload_message(&*payload)),
-                )),
-            );
-        }
-    });
+    let poisoned_on_panic = Arc::clone(&poisoned);
+    spawn_lance_future(
+        completion,
+        built_scanner.try_into_stream(),
+        move |stream| {
+            // Guard the exported stream at the reader level (issue #61): a
+            // mid-iteration panic becomes one terminal Arrow stream error,
+            // and cleanup panics on the release path are contained.
+            let schema = stream.schema();
+            let reader = GuardedReader::new(stream, schema, handle, poisoned);
+            let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
+            Box::into_raw(Box::new(ffi_stream)).cast()
+        },
+        move || poisoned_on_panic.store(true, Ordering::SeqCst),
+    );
 }
 
 /// Release the heap-allocated Arrow stream container returned through a
@@ -5911,6 +5843,49 @@ mod tests {
         });
     }
 
+    /// Passing a NULL scanner must report on both channels promised by issue
+    /// #61: the caller thread's TLS for the synchronous path, and the
+    /// dispatched completion for the callback thread. This covers the
+    /// validation branch that previously had no C entry-point test.
+    #[test]
+    fn scan_async_null_scanner_reports_on_caller_and_callback_threads() {
+        let (tx, rx) = std::sync::mpsc::channel::<SetupPanicObservation>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        unsafe { lance_scanner_scan_async(ptr::null(), Some(record_setup_panic), ctx) };
+
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let caller_msg_ptr = lance_last_error_message();
+        assert!(!caller_msg_ptr.is_null());
+        let caller_msg = unsafe { CStr::from_ptr(caller_msg_ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crate::error::lance_free_string(caller_msg_ptr) };
+        assert_eq!(caller_msg, "scanner is NULL");
+
+        let obs = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a NULL scanner must still dispatch a completion");
+        assert_eq!(obs.status, -1);
+        assert_eq!(obs.code, LanceErrorCode::InvalidArgument);
+        assert_eq!(obs.message.as_deref(), Some("scanner is NULL"));
+
+        // Exactly one completion: the caller-thread report must not also
+        // schedule a second callback.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a NULL scanner must dispatch exactly one completion"
+        );
+
+        crate::async_dispatcher::wait_for_callbacks();
+        unsafe {
+            drop(Box::from_raw(
+                ctx as *mut std::sync::mpsc::Sender<SetupPanicObservation>,
+            ));
+        }
+    }
+
     /// Regression for the review finding that the spawned task's
     /// `catch_unwind().await` started too late: a panic in *call-time setup*
     /// (validation, `build_scanner`, runtime access, `RT.spawn`) used to
@@ -5926,11 +5901,10 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel::<SetupPanicObservation>();
         let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let completion = unsafe { Completion::new(record_setup_panic, ctx) };
 
         unsafe {
-            scan_async_guarded(scanner, record_setup_panic, ctx, |_, _, _| {
-                panic!("injected setup panic")
-            });
+            scan_async_guarded(scanner, completion, |_, _| panic!("injected setup panic"));
         }
 
         assert!(
@@ -5959,6 +5933,7 @@ mod tests {
             "a setup panic must dispatch exactly one callback completion"
         );
 
+        crate::async_dispatcher::wait_for_callbacks();
         unsafe {
             drop(Box::from_raw(
                 ctx as *mut std::sync::mpsc::Sender<SetupPanicObservation>,

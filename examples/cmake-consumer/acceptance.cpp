@@ -15,9 +15,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 
 namespace {
 
@@ -42,6 +49,47 @@ bool g_release_callback_error = false;
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
 }
+
+#ifdef _WIN32
+void write_loaded_module_report(const char* path) {
+    const HANDLE snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        fail("failed to snapshot loaded modules");
+    }
+
+    MODULEENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Module32First(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        fail("failed to read the first loaded module");
+    }
+
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) {
+        CloseHandle(snapshot);
+        fail("failed to open the loaded module report");
+    }
+    uint64_t count = 0;
+    do {
+        output << entry.szModule << '\n';
+        ++count;
+    } while (Module32Next(snapshot, &entry));
+    const DWORD last_error = GetLastError();
+    CloseHandle(snapshot);
+
+    if (last_error != ERROR_NO_MORE_FILES) {
+        fail("failed while enumerating loaded modules");
+    }
+    output.close();
+    if (!output) {
+        fail("failed to write the loaded module report");
+    }
+    std::printf(
+        "acceptance: loaded_modules count=%llu report=%s\n",
+        static_cast<unsigned long long>(count), path);
+}
+#endif
 
 void counted_schema_release(ArrowSchema* schema) {
     ++g_counts.schema;
@@ -434,6 +482,19 @@ int main(int argc, char** argv) {
 
         verify_clone(uri);
         verify_last_error(uri);
+#ifdef _WIN32
+        char* module_report = nullptr;
+        size_t module_report_length = 0;
+        if (_dupenv_s(
+                &module_report, &module_report_length,
+                "LANCE_C_MODULE_REPORT") != 0) {
+            fail("failed to read LANCE_C_MODULE_REPORT");
+        }
+        if (module_report != nullptr) {
+            write_loaded_module_report(module_report);
+            std::free(module_report);
+        }
+#endif
         std::printf("acceptance: PASS\n");
         return 0;
     } catch (const std::exception& error) {
