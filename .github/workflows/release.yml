@@ -110,7 +110,7 @@ jobs:
           fi
       - name: Configure + build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
@@ -140,8 +140,13 @@ jobs:
           SUFFIX=${{ matrix.artifact_suffix }}
           ARCHIVE="lance-c-v${VERSION}-${TARGET}${SUFFIX}.tar.xz"
           tar -C stage -cJf "${ARCHIVE}" .
-          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          if command -v shasum > /dev/null 2>&1; then
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          else
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            sha512sum "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          fi
           echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
