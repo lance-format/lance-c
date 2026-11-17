@@ -37,6 +37,8 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+# Use lib/ consistently across all platforms (instead of lib64/ on 64-bit systems)
+set(CMAKE_INSTALL_LIBDIR "lib" CACHE PATH "Object code libraries" FORCE)
 include(GNUInstallDirs)
 
 # ─── Options ─────────────────────────────────────────────────────────────────
