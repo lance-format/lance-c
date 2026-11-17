@@ -115,7 +115,9 @@ jobs:
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
       - name: Strip release shared library
-        run: bash .github/scripts/strip-release-shared.sh stage "${{ runner.os }}"
+        run: |
+          OS="${{ runner.os }}"
+          bash .github/scripts/strip-release-shared.sh stage "${OS,,}"
       - name: Verify Linux shared-library exports
         if: runner.os == 'Linux'
         run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance/lance.h linux
