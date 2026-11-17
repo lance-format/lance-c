@@ -396,8 +396,8 @@ p_summary() {
 p_prepare_work() {
     # Start from a clean work tree so recorded artifacts cannot be leftovers.
     local stale
-    for stale in "$WORK/build" "$STAGE" "$WORK/stage-retired" "$WORK/consumers" \
-        "$WORK/datasets" "$WORK/cxx17-consumer" "$WORK/no-shasum"; do
+    for stale in "$WORK/build" "$STAGE" "$WORK/stage-retired" "$WORK/extracted" \
+        "$WORK/consumers" "$WORK/datasets" "$WORK/cxx17-consumer" "$WORK/no-shasum"; do
         if [ -e "$stale" ]; then
             printf 'removing stale %s\n' "$stale"
             rm -rf "$stale"
