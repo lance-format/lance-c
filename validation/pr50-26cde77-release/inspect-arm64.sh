@@ -73,7 +73,7 @@ docker cp "$cid:/opt/_internal/build_scripts/static_clang_versions.txt" "$OUT/st
     printf 'glibc_version_string=%s\n' "$(strings "$OUT/libc.so.6" | grep -m1 -E 'GNU C Library.*release version [0-9]' || echo unknown)"
     printf 'libc_soname=%s\n' "$(readelf -d "$OUT/libc.so.6" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
     printf 'clang_installer_supports_arm64=%s\n' \
-        "$(grep -cE 'ARM64\|aarch64\|arm64\)' "$OUT/install-static-clang-helper.sh")"
+        "$(grep -cE 'ARM64|aarch64|arm64\)' "$OUT/install-static-clang-helper.sh")"
     printf 'clang_installer_arm64_mapping=%s\n' \
         "$(grep -m1 'GO_ARCH=arm64' "$OUT/install-static-clang-helper.sh" || echo missing)"
     printf 'toolchain_path=%s\n' "$(grep -m1 '^TOOLCHAIN_PATH=' "$OUT/install-static-clang-helper.sh")"
