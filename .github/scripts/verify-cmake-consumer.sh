@@ -150,7 +150,8 @@ case "$mode" in
 
         echo "==> Validating CMake + Corrosion configure/generate"
         cmake -S "$repo_root" -B "$work_dir/build-corrosion" \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=lib
         verify_corrosion_macos_linker "$work_dir/build-corrosion"
 
         echo "==> Staging prebuilt artifacts from $target_dir and running cmake --install"
@@ -169,6 +170,7 @@ case "$mode" in
         install_dir="$work_dir/install"
         cmake -S "$repo_root" -B "$work_dir/build-prebuilt" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=lib \
             -DLANCE_C_USE_PREBUILT=ON \
             -DLANCE_C_PREBUILT_DIR="$prebuilt_dir"
         cmake --install "$work_dir/build-prebuilt" --prefix "$install_dir"
