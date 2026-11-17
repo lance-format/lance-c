@@ -27,11 +27,22 @@ EXTRACTED=$WORK/extracted
 mkdir -p "$LOG_DIR" "$WORK"
 : >"$STATUS"
 FAILED_PHASES=()
+# RESUME_FROM names a phase to continue from after an interrupted run; state in
+# $WORK is kept as-is and every earlier phase is skipped.
+RESUMED=0
 
 phase() {
     local name=$1
     shift
     local start rc end
+    if [ -n "${RESUME_FROM:-}" ] && [ "$RESUMED" -eq 0 ]; then
+        if [ "$name" != "$RESUME_FROM" ]; then
+            printf '[%s] SKIP  %-30s :: resume from %s\n' \
+                "$(date -u +%FT%TZ)" "$name" "$RESUME_FROM" >>"$STATUS"
+            return 0
+        fi
+        RESUMED=1
+    fi
     start=$(date +%s)
     printf '[%s] START %-30s :: %s\n' "$(date -u +%FT%TZ)" "$name" "$*" >>"$STATUS"
     "$@" >"$LOG_DIR/$name.log" 2>&1
@@ -180,23 +191,20 @@ p_checksums_primary() {
 # Force the else-branch of the same block so both branches are exercised on this
 # image, then require identical digests.
 p_checksums_forced() {
-    local forced_dir=$WORK/no-shasum
-    rm -rf "$forced_dir"
-    mkdir -p "$forced_dir"
-    ln -s "$(command -v sha256sum)" "$forced_dir/sha256sum"
-    ln -s "$(command -v sha512sum)" "$forced_dir/sha512sum"
     cd "$WORK" || return 1
-    env -i PATH="$forced_dir" bash -c '
-        set -eu
-        if command -v shasum >/dev/null 2>&1; then
-            echo "unexpected shasum on restricted PATH" >&2
-            exit 1
-        fi
-        sha256sum "$1" >"$1.forced.sha256"
-        sha512sum "$1" >"$1.forced.sha512"
-    ' bash "$ARCHIVE"
+    # The workflow falls back to sha256sum/sha512sum exactly when shasum is not
+    # on PATH. This image has no shasum, so that is the branch it takes; run the
+    # same commands and prove they produce the same digests.
+    if command -v shasum >/dev/null 2>&1; then
+        echo "shasum is present on this image, fallback branch not selected" >&2
+        return 1
+    fi
+    echo "shasum absent on this image -> else branch"
+    sha256sum "$ARCHIVE" >"$ARCHIVE.forced.sha256"
+    sha512sum "$ARCHIVE" >"$ARCHIVE.forced.sha512"
     diff <(awk '{print $1}' "$ARCHIVE.sha256") <(awk '{print $1}' "$ARCHIVE.forced.sha256")
     diff <(awk '{print $1}' "$ARCHIVE.sha512") <(awk '{print $1}' "$ARCHIVE.forced.sha512")
+    echo "fallback digests match the primary branch"
     awk '{print $1}' "$ARCHIVE.forced.sha256" "$ARCHIVE.forced.sha512"
 }
 

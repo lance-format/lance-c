@@ -91,6 +91,7 @@ docker exec \
     -e CXX=clang++ \
     -e MACOSX_DEPLOYMENT_TARGET=11.0 \
     -e CLANG_VERSION="$CLANG_VERSION" \
+    -e RESUME_FROM="${RESUME_FROM:-}" \
     -e CONTAINER_IMAGE_REF="$IMAGE" \
     -e CONTAINER_IMAGE_ID="$image_id" \
     -e GIT_CONFIG_COUNT=1 \
