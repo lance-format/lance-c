@@ -13,8 +13,13 @@
 set -euo pipefail
 
 EVID_ROOT=${EVID_ROOT:-$HOME/Code/evidence/lance-c-pr50-final-26cde77}
+SOURCE=${SOURCE:-}
 IMAGE=${IMAGE:-quay.io/pypa/manylinux_2_28_aarch64@sha256:34a5e614a4eb26f73f8bf44cbbf2acf8011620453d03ea35a58537bb3cde44de}
-CLANG_VERSION=${CLANG_VERSION:-public-ip-xoswtxdp}
+if [ -z "${CLANG_VERSION:-}" ] && [ -n "$SOURCE" ]; then
+    CLANG_VERSION=$(grep -oE 'manylinux-install-clang -v [^ ]+' \
+        "$SOURCE/.github/workflows/release.yml" | head -1 | awk '{print $NF}')
+fi
+CLANG_VERSION=${CLANG_VERSION:?set CLANG_VERSION or SOURCE to resolve the pinned clang version}
 OUT=$EVID_ROOT/arm64
 mkdir -p "$OUT"
 
@@ -28,13 +33,14 @@ docker pull --platform linux/arm64 "$IMAGE" 2>&1 | tail -2
     python3 - "$OUT/manifest.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
+print('manifest_mediaType=%s schemaVersion=%s' % (d.get('mediaType'), d.get('schemaVersion')))
 if 'manifests' in d:
     for m in d['manifests']:
         p = m.get('platform', {})
-        print('manifest_platform=%s/%s%s' % (p.get('os'), p.get('architecture'), m.get('digest', '')))
-    print('manifest_mediaType_ok=%s' % ('ok' if d['manifests'] else 'missing'))
+        print('manifest_platform=%s/%s variant=%s digest=%s' % (
+            p.get('os'), p.get('architecture'), p.get('variant', ''), m.get('digest', '')))
 else:
-    print('manifest_single_platform=%s/%s' % (d.get('architecture'), d.get('os')))
+    print('manifest_platform=single-manifest config=%s' % (d.get('config', {}).get('digest', '')))
 PY
 } | tee "$OUT/image-meta.env"
 
@@ -63,9 +69,9 @@ docker cp -L "$cid:/usr/local/bin/manylinux-install-clang" "$OUT/install-static-
 docker cp "$cid:/opt/_internal/build_scripts/static_clang_versions.txt" "$OUT/static_clang_versions.txt"
 
 {
-    printf 'os_release=%s\n' "$(grep '^PRETTY_NAME=' "$OUT/os-release.txt" | cut -d= -f2- | tr -d '"')"
+    printf 'os_release=%s\n' "$(grep -E '^(PRETTY_NAME|VERSION_ID)=' "$OUT/os-release.txt" | cut -d= -f2- | tr -d '\"' | tr '\n' ' ')"
     printf 'glibc_version_string=%s\n' "$(strings "$OUT/libc.so.6" | grep -m1 -E 'GNU C Library.*release version [0-9]' || echo unknown)"
-    printf 'libc_soname=%s\n' "$(readelf -d "$OUT/libc.so.6" | awk '/SONAME/ {print $NF}')"
+    printf 'libc_soname=%s\n' "$(readelf -d "$OUT/libc.so.6" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
     printf 'clang_installer_supports_arm64=%s\n' \
         "$(grep -cE 'ARM64\|aarch64\|arm64\)' "$OUT/install-static-clang-helper.sh")"
     printf 'clang_installer_arm64_mapping=%s\n' \
