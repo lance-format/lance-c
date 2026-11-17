@@ -152,13 +152,14 @@ step cxx17-consumer cxx17_consumer
 # 4. Which build-path strings stay inside the released binaries.
 path_strings() {
     local lib=$1 label=$2
-    local sample
+    local sample hits
     sample=$(grep -a -o -F '/work/' "$lib" | wc -l)
     printf '%s_slash_work_occurrences=%s\n' "$label" "$sample"
     strings -a "$lib" | grep -F '/work/' | sed 's/^[[:space:]]*//' | sort -u |
-        head -5 | sed "s/^/${label}_sample=/" | tee -a "$LOG/path-strings.log"
-    strings -a "$lib" | grep -F '/work/' | grep -cE '/work/(stage|stage-retired|extracted)(/|$)' \
-        | sed "s/^/${label}_install_prefix_hits=/" | tee -a "$LOG/path-strings.log"
+        head -5 | sed "s/^/${label}_sample=/" | tee -a "$LOG/path-strings.log" || true
+    hits=$(strings -a "$lib" | grep -F '/work/' |
+        grep -cE '/work/(stage|stage-retired|extracted)(/|$)' || true)
+    printf '%s_install_prefix_hits=%s\n' "$label" "${hits:-0}" | tee -a "$LOG/path-strings.log"
 }
 path_strings "$EX/lib/liblance_c.so" shared
 path_strings "$EX/lib/liblance_c.a" static
