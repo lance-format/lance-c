@@ -32,11 +32,13 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" --platform linux/amd64 \
     -v "$SOURCE:/source:ro" \
     -v "$EVID/work:/work" \
-    -v "$EVID/supplement:/evidence" \
+    -v "$EVID:/evidence" \
     -v "$HOME/.local/bin/mbx:/home/xuanwo/.local/bin/mbx:ro" \
     -v "$HOME/.local/share/mbx:/home/xuanwo/.local/share/mbx:ro" \
     -v "$HOME/.cargo:/home/xuanwo/.cargo" \
     -v "$HOME/.cache/mbx:/home/xuanwo/.cache/mbx" \
+    -e EVID_ROOT=/evidence \
+    -e SOURCE=/source \
     -e CARGO_HOME=/home/xuanwo/.cargo \
     -e CARGO_BUILD_JOBS=8 \
     -e CARGO_TERM_COLOR=never \
@@ -61,7 +63,7 @@ docker exec --user 1000:1000 "$NAME" bash -lc '
     export HOME=/home/xuanwo
     export PATH=/home/xuanwo/.local/share/mbx/bin:/home/xuanwo/.local/bin:/home/xuanwo/.cargo/bin:$PATH
     export CC=clang CXX=clang++
-    exec bash /evidence/probe.sh
+    exec bash /evidence/supplement/probe.sh
 ' 2>&1 | tee "$OUT/logs/probe-console.log"
 rc=${PIPESTATUS[0]}
 set -e
