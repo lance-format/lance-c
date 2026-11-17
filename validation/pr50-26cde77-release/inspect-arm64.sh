@@ -24,7 +24,7 @@ docker pull --platform linux/arm64 "$IMAGE" 2>&1 | tail -2
 
 {
     printf 'image_ref=%s\n' "$IMAGE"
-    docker image inspect --format 'image_id={{.Id}} arch={{.Architecture}} os={{.Os}} variant={{.Variant}}' "$IMAGE"
+    docker image inspect --format 'image_id={{.Id}} arch={{.Architecture}} os={{.Os}}' "$IMAGE"
     python3 - "$OUT/manifest.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
