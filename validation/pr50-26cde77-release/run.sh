@@ -96,8 +96,8 @@ docker exec \
     -e GIT_CONFIG_COUNT=1 \
     -e GIT_CONFIG_KEY_0=safe.directory \
     -e GIT_CONFIG_VALUE_0='*' \
-    -e PATH=/home/xuanwo/.local/share/mbx/bin:/home/xuanwo/.local/bin:/home/xuanwo/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
-    "$NAME" bash /evidence/driver/body.sh 2>&1 | tee "$EVID_ROOT/logs/body-$RUN_ID.log"
+    "$NAME" bash -lc 'export PATH=/home/xuanwo/.local/share/mbx/bin:/home/xuanwo/.local/bin:/home/xuanwo/.cargo/bin:$PATH; exec bash /evidence/driver/body.sh' \
+    2>&1 | tee "$EVID_ROOT/logs/body-$RUN_ID.log"
 body_rc=${PIPESTATUS[0]}
 set -e
 
