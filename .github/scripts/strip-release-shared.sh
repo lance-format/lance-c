@@ -16,11 +16,11 @@ prefix=$1
 platform=$2
 
 case "$platform" in
-    linux)
+    linux|Linux)
         library="$prefix/lib/liblance_c.so"
         strip_command=(strip --strip-all)
         ;;
-    macos)
+    macos|macOS)
         library="$prefix/lib/liblance_c.dylib"
         strip_command=(strip -x -S)
         ;;
