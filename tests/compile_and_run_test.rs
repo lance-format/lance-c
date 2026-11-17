@@ -1231,6 +1231,7 @@ fn compile_cpp_test(sources: &[&Path], output: &Path, include_dir: &Path, lib_pa
             "-std=c++20",
             "-Wall",
             "-Wextra",
+            "-pthread",
             "-o",
             output.to_str().unwrap(),
             &format!("-I{}", include_dir.display()),
