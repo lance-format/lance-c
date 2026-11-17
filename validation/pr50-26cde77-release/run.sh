@@ -16,7 +16,6 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SOURCE=${SOURCE:?set SOURCE to a lance-c clone checked out at the validated commit}
 EVID_ROOT=${EVID_ROOT:-$HOME/Code/evidence/lance-c-pr50-final-26cde77}
 IMAGE=${IMAGE:-quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c}
-CLANG_VERSION=${CLANG_VERSION:-public-ip-xoswtxdp}
 EXPECTED_HEAD=${EXPECTED_HEAD:-26cde77e8c1acc538ec1a2f3be26f8eeea74373a}
 NAME=${NAME:-lance-c-pr50-26cde77}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
@@ -28,6 +27,13 @@ chmod +x "$EVID_ROOT/driver/body.sh"
 source_head=$(git -C "$SOURCE" rev-parse HEAD)
 if [ "$source_head" != "$EXPECTED_HEAD" ]; then
     printf 'source checkout is at %s, expected %s\n' "$source_head" "$EXPECTED_HEAD" >&2
+    exit 1
+fi
+# Use the clang version pinned by the workflow under test instead of a copy.
+CLANG_VERSION=${CLANG_VERSION:-$(grep -oE 'manylinux-install-clang -v [^ ]+' \
+    "$SOURCE/.github/workflows/release.yml" | head -1 | awk '{print $NF}')}
+if [ -z "$CLANG_VERSION" ]; then
+    printf 'could not resolve the pinned clang version from release.yml\n' >&2
     exit 1
 fi
 printf '%s\n' "$source_head" >"$EVID_ROOT/driver/source-commit.txt"

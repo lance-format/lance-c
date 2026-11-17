@@ -101,7 +101,7 @@ p_protoc() {
 }
 
 p_clang() {
-    manylinux-install-clang -v "${CLANG_VERSION:?CLANG_VERSION must be set}"
+    manylinux-install-clang -v "${CLANG_VERSION:?CLANG_VERSION must be set}" || return 1
     clang --version
     clang++ --version
 }
@@ -385,7 +385,24 @@ p_summary() {
     cat "$EVID/summary.env"
 }
 
-mkdir -p "$WORK/datasets"
+p_prepare_work() {
+    # Start from a clean work tree so recorded artifacts cannot be leftovers.
+    local stale
+    for stale in "$WORK/build" "$STAGE" "$WORK/stage-retired" "$WORK/consumers" \
+        "$WORK/datasets" "$WORK/cxx17-consumer" "$WORK/no-shasum"; do
+        if [ -e "$stale" ]; then
+            printf 'removing stale %s\n' "$stale"
+            rm -rf "$stale"
+        fi
+    done
+    rm -f "$WORK/$ARCHIVE" "$WORK/$ARCHIVE.sha256" "$WORK/$ARCHIVE.sha512" \
+        "$WORK/$ARCHIVE.forced.sha256" "$WORK/$ARCHIVE.forced.sha512"
+    mkdir -p "$WORK/datasets"
+    ls -la "$WORK"
+}
+
+phase p_prepare_work p_prepare_work
+fail_fast $? p_prepare_work
 
 phase p_record_env p_record_env
 phase p_baseline_env p_baseline_env
