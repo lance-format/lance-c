@@ -233,45 +233,56 @@ p_consumer_extracted_official() {
 # Explicit extracted-prefix consumers with rpath disabled, so the recorded link
 # line and ldd output prove which physical prefix was used.
 p_consumer_extracted_explicit() {
-    local linkage build_dir link_txt acceptance_exe
+    local linkage build_dir link_txt fail=0
     for linkage in static shared; do
         build_dir=$WORK/consumers/extracted-$linkage
         rm -rf "$build_dir"
         mkdir -p "$build_dir"
+        # No CMAKE_SKIP_RPATH here: CMake's build-tree RPATH is what lets a
+        # shared consumer start without an external search path, and the
+        # shipped consumer gate relies on the same behaviour.
         cmake -S "$SOURCE/examples/cmake-consumer" -B "$build_dir" \
             -DCMAKE_PREFIX_PATH="$EXTRACTED" \
             -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF \
             -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SKIP_RPATH=ON \
-            -DLanceC_LINK="$linkage"
-        cmake --build "$build_dir" --parallel 2
-        grep -Fq "LanceC_DIR:PATH=$EXTRACTED/lib/cmake/LanceC" "$build_dir/CMakeCache.txt"
+            -DLanceC_LINK="$linkage" || return 1
+        cmake --build "$build_dir" --parallel 2 || return 1
+        grep -Fq "LanceC_DIR:PATH=$EXTRACTED/lib/cmake/LanceC" "$build_dir/CMakeCache.txt" \
+            || { echo "resolved a different LanceC package" >&2; return 1; }
         link_txt=$build_dir/CMakeFiles/consumer.dir/link.txt
-        acceptance_exe=$build_dir/CMakeFiles/acceptance.dir/link.txt
-        grep -Fq "$WORK/stage-retired" "$link_txt" "$acceptance_exe" && {
+        acceptance_txt=$build_dir/CMakeFiles/acceptance.dir/link.txt
+        if grep -Fq "$WORK/stage-retired" "$link_txt" "$acceptance_txt"; then
             echo "$linkage consumer link line references the retired prefix" >&2
             return 1
-        }
-        if [ "$linkage" = static ]; then
-            grep -Fq "$EXTRACTED/lib/liblance_c.a" "$link_txt"
-        else
-            grep -Fq "$EXTRACTED/lib/liblance_c.so" "$link_txt"
         fi
-        # usage path must exit 2
+        if [ "$linkage" = static ]; then
+            grep -Fq "$EXTRACTED/lib/liblance_c.a" "$link_txt" \
+                || { echo "static consumer did not link the extracted archive" >&2; return 1; }
+        else
+            grep -Fq "$EXTRACTED/lib/liblance_c.so" "$link_txt" \
+                || { echo "shared consumer did not link the extracted library" >&2; return 1; }
+            printf 'runpath_%s=%s\n' "$linkage" \
+                "$(readelf -d "$build_dir/consumer" |
+                    sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')"
+        fi
         local rc=0
         "$build_dir/consumer" >/dev/null 2>&1 || rc=$?
         printf '%s consumer usage exit=%s\n' "$linkage" "$rc"
-        [ "$rc" -eq 2 ]
-        "$build_dir/consumer" "file://$SOURCE/test_data/v0.27.1/pq_in_schema"
-        "$build_dir/acceptance" "file://$WORK/datasets/acceptance-$linkage.lance"
-        ldd "$build_dir/consumer" || true
+        if [ "$rc" -ne 2 ]; then
+            echo "$linkage usage path exited $rc, expected 2" >&2
+            fail=1
+            continue
+        fi
+        "$build_dir/consumer" "file://$SOURCE/test_data/v0.27.1/pq_in_schema" || fail=1
+        "$build_dir/acceptance" "file://$WORK/datasets/acceptance-$linkage.lance" || fail=1
         for exe in consumer acceptance; do
             printf 'max_glibc_%s_%s=%s\n' "$linkage" "$exe" \
                 "$(readelf --dyn-syms --wide "$build_dir/$exe" |
                     grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -uV | tail -1)"
         done
     done
+    return "$fail"
 }
 
 p_audit_layout() {
