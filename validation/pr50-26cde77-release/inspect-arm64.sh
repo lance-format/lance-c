@@ -63,7 +63,7 @@ printf 'rootfs_entries=%s\n' "$(wc -l <"$OUT/rootfs-listing.txt")" | tee -a "$OU
     done
 } >"$OUT/tool-presence.env"
 
-docker cp "$cid:/etc/os-release" "$OUT/os-release.txt"
+docker cp -L "$cid:/etc/os-release" "$OUT/os-release.txt"
 docker cp -L "$cid:/lib64/libc.so.6" "$OUT/libc.so.6"
 docker cp -L "$cid:/usr/local/bin/manylinux-install-clang" "$OUT/install-static-clang-helper.sh"
 docker cp "$cid:/opt/_internal/build_scripts/static_clang_versions.txt" "$OUT/static_clang_versions.txt"
@@ -77,7 +77,8 @@ docker cp "$cid:/opt/_internal/build_scripts/static_clang_versions.txt" "$OUT/st
     printf 'clang_installer_arm64_mapping=%s\n' \
         "$(grep -m1 'GO_ARCH=arm64' "$OUT/install-static-clang-helper.sh" || echo missing)"
     printf 'toolchain_path=%s\n' "$(grep -m1 '^TOOLCHAIN_PATH=' "$OUT/install-static-clang-helper.sh")"
-    if grep -qE "^${CLANG_VERSION} " "$OUT/static_clang_versions.txt"; then
+    # The installer prepends the "v" itself, so accept the pin with or without it.
+    if grep -qE "^v?${CLANG_VERSION} " "$OUT/static_clang_versions.txt"; then
         printf 'clang_version_%s=listed\n' "$CLANG_VERSION"
     else
         printf 'clang_version_%s=MISSING\n' "$CLANG_VERSION"
