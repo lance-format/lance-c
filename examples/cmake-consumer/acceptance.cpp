@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// Portable C++17 acceptance consumer for an installed LanceC package.
+// Portable C++20 acceptance consumer for an installed LanceC package.
 //
 // It creates a dataset through the public C++ wrapper, closes and reopens it,
 // reads every row through an ArrowArrayStream, verifies the Arrow release

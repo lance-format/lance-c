@@ -641,10 +641,10 @@ This is a packaging decision, not a change to any downloadable asset:
   `GLIBC_2.35`, remain published with their current hashes and recipe
   selections. They are historical assets; no future tag adds another one.
 - Keep the physical `lib/` install layout, with no `lib64` and no
-  compatibility symlinks, and keep the C++17 consumer requirement.
+  compatibility symlinks, and keep the C++20 consumer requirement.
 - Runtime evidence is limited to the glibc 2.28 containers that were executed
   (AlmaLinux 8.10) on `x86_64` and native `aarch64`, with installed and
-  archive-extracted static/shared C++17 dataset consumers. It is not a promise
+  archive-extracted static/shared C++20 dataset consumers. It is not a promise
   for every glibc 2.28 distribution, and no glibc 2.28 archive has been
   published.
 - The workflow change that would produce these archives is author-maintained
@@ -795,7 +795,7 @@ Windows CI builds this layout with Rust 1.95.0. The x64 job uses
 `windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies
 the PE32+ machine, public `lance_*` exports, absence of redistributable CRT
-imports, static archive directives, and installed static/shared C++17
+imports, static archive directives, and installed static/shared C++20
 consumers. The consumers run with `PATH` restricted to the Windows system
 directories and write their loaded-module lists; `LNK4098` and `LNK2038` are
 failures. The hosted images already contain a VC Runtime under `System32`, so
@@ -842,7 +842,7 @@ this release.
 #include <lance/lance.hpp>   // C++
 ```
 
-The C++ wrappers require C++17. The C header is usable from C.
+The C++ wrappers require C++20. The C header is usable from C.
 
 ## Usage
 

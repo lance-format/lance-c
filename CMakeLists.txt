@@ -191,11 +191,13 @@ endif()
 add_library(LanceC::lance_c_static INTERFACE IMPORTED GLOBAL)
 set_target_properties(LanceC::lance_c_static PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
+    INTERFACE_COMPILE_FEATURES cxx_std_20
     INTERFACE_LINK_LIBRARIES "${_lance_c_static_real};LanceC_platform_deps")
 
 add_library(LanceC::lance_c_shared INTERFACE IMPORTED GLOBAL)
 set_target_properties(LanceC::lance_c_shared PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
+    INTERFACE_COMPILE_FEATURES cxx_std_20
     INTERFACE_LINK_LIBRARIES "${_lance_c_shared_real};LanceC_platform_deps")
 
 if(LANCE_C_LINK STREQUAL "shared")

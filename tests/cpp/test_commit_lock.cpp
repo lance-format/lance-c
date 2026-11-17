@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// C++17 consumer for the native commit-lock bridge. argv[1] is an existing
+// C++20 consumer for the native commit-lock bridge. argv[1] is an existing
 // dataset used as the Arrow stream source, argv[2] is a scratch directory.
 
 #include "lance/lance.hpp"

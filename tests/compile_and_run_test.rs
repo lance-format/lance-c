@@ -1981,7 +1981,7 @@ fn resolve_sql_delta_window(uri: &str, begin: (i64, u32), end: (i64, u32)) -> (u
     (begin_version, end_version)
 }
 
-/// Real C11 and C++17 consumers of the native SQL and delta APIs.
+/// Real C11 and C++20 consumers of the native SQL and delta APIs.
 #[test]
 #[ignore = "requires C and C++ compilers; run with: cargo test -p lance-c -- --ignored test_native_sql_delta_compilation_and_execution"]
 fn test_native_sql_delta_compilation_and_execution() {
