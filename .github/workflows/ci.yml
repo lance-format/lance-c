@@ -143,7 +143,10 @@ jobs:
   package-macos-intel:
     name: Package (macOS Intel)
     runs-on: macos-15-intel
-    timeout-minutes: 180
+    # A cold cache builds the full Lance dependency graph twice: the direct
+    # Cargo build and the release staging tree. Cold builds have exceeded the
+    # 180-minute cap, so keep headroom to reach packaging.
+    timeout-minutes: 240
     env:
       CC: clang
       CXX: clang++
