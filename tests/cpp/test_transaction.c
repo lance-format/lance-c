@@ -348,6 +348,34 @@ static int compare_i32(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
+static int compare_u64(const void *left, const void *right) {
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+    return (a > b) - (a < b);
+}
+
+/* Format the exact `fragment_ids` JSON member for the sorted coverage the
+ * native index metadata should report. `excluded` is omitted when present. */
+static void format_index_coverage(char *out, size_t capacity,
+                                  const uint64_t *fragment_ids, size_t count,
+                                  uint64_t excluded) {
+    uint64_t sorted[16];
+    ASSERT(count <= sizeof(sorted) / sizeof(sorted[0]),
+           "index coverage fragment capacity");
+    memcpy(sorted, fragment_ids, count * sizeof(uint64_t));
+    qsort(sorted, count, sizeof(uint64_t), compare_u64);
+    size_t used = (size_t)snprintf(out, capacity, "\"fragment_ids\":[");
+    int first = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (sorted[i] == excluded) continue;
+        used += (size_t)snprintf(out + used, capacity - used, "%s%llu",
+                                 first ? "" : ",",
+                                 (unsigned long long)sorted[i]);
+        first = 0;
+    }
+    snprintf(out + used, capacity - used, "]");
+}
+
 static uint64_t dataset_max_fragment_id(LanceDataset *dataset) {
     uint64_t count = lance_dataset_fragment_count(dataset);
     CHECK_OK();
@@ -364,12 +392,18 @@ static uint64_t dataset_max_fragment_id(LanceDataset *dataset) {
     return max_id;
 }
 
-static size_t collect_c_ids(const char *uri, int32_t *out, size_t capacity) {
+static size_t collect_c_ids(const char *uri, const char *filter,
+                            int use_scalar_index, int32_t *out,
+                            size_t capacity) {
     LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
     ASSERT(dataset != NULL, "open replacement result");
     CHECK_OK();
-    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, filter);
     ASSERT(scanner != NULL, "replacement result scanner");
+    CHECK_OK();
+    ASSERT(lance_scanner_set_use_scalar_index(
+               scanner, use_scalar_index != 0) == 0,
+           "set replacement result scalar index usage");
     CHECK_OK();
     struct ArrowArrayStream stream;
     memset(&stream, 0, sizeof(stream));
@@ -882,6 +916,30 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     ASSERT(lance_dataset_fragment_ids(dataset, ids) == 0,
            "data replacement fragment IDs");
     CHECK_OK();
+
+    /* Index the value column before replacing one fragment's values. With
+     * data_change=true the commit must withdraw that fragment's coverage;
+     * leaving it behind would let the BTree answer from stale values. */
+    ASSERT(lance_dataset_create_scalar_index(
+               dataset, "id", "c_data_replacement_id", LANCE_SCALAR_BTREE,
+               NULL, false) == 0,
+           "create data replacement BTree index");
+    CHECK_OK();
+    ASSERT(lance_dataset_index_count(dataset) == 1,
+           "data replacement BTree index count");
+    char *segments = (char *)lance_dataset_index_segments_json(dataset);
+    ASSERT(segments != NULL, "read data replacement index coverage");
+    CHECK_OK();
+    char all_coverage[256];
+    format_index_coverage(all_coverage, sizeof(all_coverage), ids, 5,
+                          UINT64_MAX);
+    ASSERT(strstr(segments, "\"name\":\"c_data_replacement_id\"") != NULL &&
+               strstr(segments, all_coverage) != NULL,
+           "BTree index must cover every data replacement fragment");
+    lance_free_string(segments);
+    const uint64_t index_version = lance_dataset_version(dataset);
+    CHECK_OK();
+
     LanceFragment *fragment = lance_dataset_open_fragment(dataset, ids[0]);
     ASSERT(fragment != NULL, "open data replacement fragment");
     CHECK_OK();
@@ -1037,11 +1095,11 @@ static void test_data_replacement(const char *src_uri, const char *base) {
                deleted == 1,
            "delete replacement fixture row");
     CHECK_OK();
-    ASSERT(lance_dataset_version(dataset) == 2,
+    ASSERT(lance_dataset_version(dataset) == index_version + 1,
            "replacement fixture deletion version");
     CHECK_OK();
     LanceTransaction *transaction =
-        lance_transaction_new(2, operation, NULL);
+        lance_transaction_new(index_version + 1, operation, NULL);
     ASSERT(transaction != NULL, "construct DataReplacement transaction");
     CHECK_OK();
     lance_operation_close(operation);
@@ -1054,7 +1112,7 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     LanceDataset *committed =
         commit_transaction(uri, transaction, &commit_options);
     lance_transaction_close(transaction);
-    ASSERT(lance_dataset_version(committed) == 3,
+    ASSERT(lance_dataset_version(committed) == index_version + 2,
            "DataReplacement publishes one version");
     CHECK_OK();
     ASSERT(lance_dataset_count_rows(committed) == 19,
@@ -1063,6 +1121,18 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     ASSERT(lance_dataset_fragment_count(committed) == 5,
            "DataReplacement fragment count");
     CHECK_OK();
+
+    segments = (char *)lance_dataset_index_segments_json(committed);
+    ASSERT(segments != NULL, "read committed data replacement index coverage");
+    CHECK_OK();
+    char remaining_coverage[256];
+    format_index_coverage(remaining_coverage, sizeof(remaining_coverage), ids,
+                          5, ids[0]);
+    ASSERT(strstr(segments, all_coverage) == NULL,
+           "changed fragment must lose its stale BTree coverage");
+    ASSERT(strstr(segments, remaining_coverage) != NULL,
+           "BTree index must keep unchanged fragment coverage");
+    lance_free_string(segments);
 
     LanceTransaction *history = NULL;
     ASSERT(lance_dataset_read_transaction(committed, &history) == 0,
@@ -1088,7 +1158,7 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     lance_dataset_close(dataset);
 
     int32_t actual[19] = {0};
-    ASSERT(collect_c_ids(uri, actual, 19) == 19,
+    ASSERT(collect_c_ids(uri, NULL, 0, actual, 19) == 19,
            "reopened DataReplacement row count");
     const int32_t expected[19] = {5,    6,    7,    8,    9,    10,   11,
                                   12,   13,   14,   15,   16,   17,   18,
@@ -1096,6 +1166,15 @@ static void test_data_replacement(const char *src_uri, const char *base) {
     for (size_t i = 0; i < 19; i++) {
         ASSERT(actual[i] == expected[i],
                "reopened DataReplacement fixed row value");
+    }
+
+    int32_t changed[3] = {0};
+    ASSERT(collect_c_ids(uri, "id >= 1000", 1, changed, 3) == 3,
+           "indexed public scan must find replaced values");
+    const int32_t expected_changed[3] = {1000, 1002, 1003};
+    for (size_t i = 0; i < 3; i++) {
+        ASSERT(changed[i] == expected_changed[i],
+               "indexed public scan fixed replaced row value");
     }
 
     printf("data replacement OK\n");
