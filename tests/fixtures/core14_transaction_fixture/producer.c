@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-FileCopyrightText: Copyright The Lance Authors */
+
 /*
  * Produce historical Lance 14.0.2 transaction files for the core-15 readback
  * test.
