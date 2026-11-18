@@ -6,15 +6,94 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 - **C++ wrappers:** [`include/lance/lance.hpp`](include/lance/lance.hpp) (header-only, RAII, exceptions)
 - **Data exchange:** [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) for zero-copy interop
 
+## Quickstart (v0.1.9)
+
+[`v0.1.9`](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) is the
+current stable release. It publishes five prebuilt archives; pick the one for
+your platform. The commands below need a C++17 compiler and CMake 3.22 or
+newer, not a Rust toolchain.
+
+| Platform | Archive | Runtime requirement |
+| --- | --- | --- |
+| Linux x86_64 | `lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz` | glibc 2.35 or newer |
+| Linux x86_64 | `lance-c-v0.1.9-x86_64-unknown-linux-gnu.tar.xz` | glibc 2.39 or newer |
+| Linux aarch64 | `lance-c-v0.1.9-aarch64-unknown-linux-gnu-debian12.tar.xz` | glibc 2.35 or newer |
+| Linux aarch64 | `lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz` | glibc 2.39 or newer |
+| macOS arm64 | `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | Apple silicon; dylib declares macOS 11.0 |
+
+The Debian 12 Linux archives have the lower glibc floor. The standard Linux
+archives were built on a newer distribution and record `GLIBC_2.39`. Neither
+is the glibc 2.28 baseline planned for future 0.2-line packages. The macOS
+dylib declares macOS 11.0, while part of its static archive declares 14.5 and
+the published archive has no retained runtime check; see [Published prebuilt
+archives](#published-prebuilt-archives).
+
+From a clean directory:
+
+```bash
+mkdir lance-c-quickstart && cd lance-c-quickstart
+
+# Replace with the archive for your platform.
+ARCHIVE=lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz
+
+curl -fLO "https://github.com/lance-format/lance-c/releases/download/v0.1.9/$ARCHIVE"
+curl -fLO https://github.com/lance-format/lance-c/releases/download/v0.1.9/SHA512SUMS
+sha512sum --ignore-missing -c SHA512SUMS
+mkdir install
+tar -xJf "$ARCHIVE" -C install
+
+curl -fL -o lance-c-0.1.9-source.tar.gz \
+  https://github.com/lance-format/lance-c/archive/refs/tags/v0.1.9.tar.gz
+tar -xzf lance-c-0.1.9-source.tar.gz
+
+cmake -S lance-c-0.1.9/examples/cmake-consumer -B build \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
+cmake --build build
+./build/consumer lance-c-0.1.9/test_data/v0.27.1/pq_in_schema
+```
+
+Expected output:
+
+```text
+rows: 512, version: 2
+```
+
+On macOS, replace `sha512sum --ignore-missing -c SHA512SUMS` with
+`grep "  $ARCHIVE$" SHA512SUMS | shasum -a 512 -c -`.
+
+The CMake project and sample data above come from the same tag:
+[`examples/cmake-consumer`](https://github.com/lance-format/lance-c/tree/v0.1.9/examples/cmake-consumer)
+and
+[`test_data/v0.27.1/pq_in_schema`](https://github.com/lance-format/lance-c/tree/v0.1.9/test_data/v0.27.1/pq_in_schema).
+
+The archive installs headers, both libraries, and CMake/pkg-config metadata
+under `install/`. `find_package(LanceC 0.1)` links the static archive by
+default; add `-DLanceC_LINK=shared` to link the shared library. The x86_64
+commands were verified on Ubuntu 24.04 with GCC 13.3 and CMake 3.28.3, using
+both x86_64 archives and both linkages.
+
+Package-manager routes install the same v0.1.9 package: [vcpkg overlay
+port](#vcpkg-overlay-port-v019) or [local Conan
+recipe](#conan-local-recipe-v019). Beta tags are published as GitHub
+pre-releases and are not selected by the vcpkg or Conan entries in this
+repository.
+
 ## Supported build targets
+
+The source tree and packages built from the 0.2 line use:
 
 | Component | Target / minimum |
 |-----------|------------------|
 | CMake | 3.22+ |
 | C++ | C++20 |
-| GLIBC baseline | 2.28 |
+| GLIBC | 2.28 for future generic Linux packages; source builds use the host libc |
 | Clang | Clang 20; Apple Clang 15 |
 | macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
+
+The published v0.1.9 archives use C++17. Their Linux floors are glibc 2.35 for
+the Debian 12 archives and 2.39 for the standard archives; no glibc 2.28
+package has been published. See [Quickstart](#quickstart-v019).
+
 Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/6035).
 
 ### Phase 1: Core Read Path + C++ Wrappers (MVP)
@@ -806,34 +885,103 @@ ARM64 or Windows Server ARM64 support.
 See [`examples/cross-sdk-index-metadata/`](examples/cross-sdk-index-metadata/)
 for a reproducible native-14 C segment to Java-12 commit/query PoC.
 
-### vcpkg
+### vcpkg overlay port (v0.1.9)
+
+`lance-c` is not in the public vcpkg registry yet, so `vcpkg install lance-c`
+does not resolve. Use the overlay port in this repository:
 
 ```bash
-vcpkg install lance-c
+git clone https://github.com/microsoft/vcpkg.git
+./vcpkg/bootstrap-vcpkg.sh
+git clone https://github.com/lance-format/lance-c.git
+./vcpkg/vcpkg install lance-c \
+  --overlay-ports="$PWD/lance-c/ports" --triplet x64-linux
 ```
 
-Downloads a prebuilt binary for your triplet from
-[GitHub Releases](https://github.com/lance-format/lance-c/releases). For
-unsupported triples, opt into a source build with the `from-source` feature:
+This installs `lance-c:x64-linux@0.1.9` from the Debian 12 x86_64 archive. Use
+`--triplet x64-linux-dynamic` for shared linkage, `arm64-linux` or
+`arm64-linux-dynamic` for ARM64 Linux, or `arm64-osx` for Apple silicon.
+Intel macOS has no v0.1.9 prebuilt; install `lance-c[from-source]`, which needs
+Rust, CMake, and protoc. The port does not support Windows. The overlay port
+needs git, curl, tar, unzip, a C++17 compiler, and CMake 3.22+.
+
+Configure a consumer with the vcpkg toolchain after the install. The example
+below uses the v0.1.9 tag's CMake consumer from the
+[quickstart](#quickstart-v019):
 
 ```bash
-vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
+cmake -S lance-c-0.1.9/examples/cmake-consumer -B build-vcpkg \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+  -DVCPKG_TARGET_TRIPLET=x64-linux
+cmake --build build-vcpkg
 ```
 
-The prebuilt archives and vcpkg mappings are listed under [Published prebuilt
-archives](#published-prebuilt-archives). Intel macOS has no prebuilt asset in
-this release, so use `lance-c[from-source]` there. Source builds also require
-CMake and `protoc` on the build host.
+Use the repository's `ports/lance-c`, not the copy in the v0.1.9 source
+tarball: that tag predates the usable port and still contains release
+placeholders. The overlay path and both Linux triplets were verified at 0.1.9
+with vcpkg 2026-10-29.
 
-### Conan
+### Conan local recipe (v0.1.9)
+
+ConanCenter does not provide `lance-c/0.1.9`, so
+`conan install --requires=lance-c/0.1.9` does not resolve. Create the recipe
+from this repository first:
 
 ```bash
-conan install --requires=lance-c/0.1.9
+python3 -m venv .conan-venv
+. .conan-venv/bin/activate
+python -m pip install "conan>=2,<3"
+conan profile detect
+git clone https://github.com/lance-format/lance-c.git
+conan create lance-c/recipes/lance-c/all --version=0.1.9
 ```
 
-Default path downloads prebuilts; `-o lance-c/*:from_source=True` builds
-from source via cargo. As with vcpkg, Intel macOS must use the source path in
-this release.
+`conan create` downloads the published v0.1.9 archive and runs the recipe's C
+and C++ test package. It installs `lance-c/0.1.9` with static linkage by
+default; add `-o "&:shared=True"` to create the shared package. A prebuilt
+install needs Python 3, CMake 3.22+, and a C++17 compiler, not Rust.
+
+A minimal consumer consists of a `conanfile.txt`:
+
+```ini
+[requires]
+lance-c/0.1.9
+
+[generators]
+CMakeDeps
+CMakeToolchain
+```
+
+and a `CMakeLists.txt` (use the v0.1.9 example's `main.cpp`):
+
+```cmake
+cmake_minimum_required(VERSION 3.22)
+project(consumer LANGUAGES CXX)
+find_package(LanceC CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE LanceC::lance_c)
+```
+
+Install and build it:
+
+```bash
+conan install . --output-folder=build --build=missing
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Use `-o "lance-c/*:shared=True"` on `conan install` for the shared package.
+Both linkage modes and the recipe at 0.1.9 were verified with Conan 2.34.0.
+
+### Preview releases
+
+Tags containing `-beta.` are published as GitHub pre-releases; the Latest
+release continues to point at the stable version. The vcpkg and Conan entries
+above install v0.1.9 and do not select a beta. To try a beta, use the archive
+attached to its pre-release page; a recipe selects a beta only after its
+version entry and hashes are updated.
 
 ### Header path
 
@@ -842,7 +990,8 @@ this release.
 #include <lance/lance.hpp>   // C++
 ```
 
-The C++ wrappers require C++20. The C header is usable from C.
+The current source tree's C++ wrappers require C++20. The published v0.1.9
+archive's wrappers require C++17. The C header is usable from C.
 
 ## Usage
 
