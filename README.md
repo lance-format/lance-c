@@ -603,10 +603,11 @@ The batch API does not guarantee shared execution or a particular speedup.
 
 ## Building
 
-There are four supported entry points; pick whichever matches your toolchain.
-Building this source tree requires Rust 1.95.0 or newer. The `from-source`
-recipes fetch the v0.1.9 tag, whose `Cargo.toml` declares
-`rust-version = "1.91.0"`. Prebuilt archives do not require a Rust toolchain.
+The main routes are prebuilt archives, the vcpkg overlay port, the Conan
+recipe, and source builds with Cargo or CMake. Building this source tree
+requires Rust 1.95.0 or newer. The `from-source` recipes fetch the v0.1.9 tag,
+whose `Cargo.toml` declares `rust-version = "1.91.0"`. Prebuilt archives do not
+require a Rust toolchain.
 
 ### Published prebuilt archives
 
@@ -905,17 +906,31 @@ Intel macOS has no v0.1.9 prebuilt; install `lance-c[from-source]`, which needs
 Rust, CMake, and protoc. The port does not support Windows. The overlay port
 needs git, curl, tar, unzip, a C++17 compiler, and CMake 3.22+.
 
-Configure a consumer with the vcpkg toolchain after the install. The example
-below uses the v0.1.9 tag's CMake consumer from the
-[quickstart](#quickstart-v019):
+Configure a minimal consumer with the vcpkg toolchain after the install. It
+uses the v0.1.9 example's `main.cpp`:
 
 ```bash
-cmake -S lance-c-0.1.9/examples/cmake-consumer -B build-vcpkg \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+mkdir consumer && cd consumer
+curl -fLO https://raw.githubusercontent.com/lance-format/lance-c/v0.1.9/examples/cmake-consumer/main.cpp
+
+cat > CMakeLists.txt <<'EOF'
+cmake_minimum_required(VERSION 3.22)
+project(consumer LANGUAGES CXX)
+find_package(LanceC CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE LanceC::lance_c)
+EOF
+
+VCPKG_ROOT=/path/to/vcpkg
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
   -DVCPKG_TARGET_TRIPLET=x64-linux
-cmake --build build-vcpkg
+cmake --build build
+./build/consumer /path/to/dataset.lance
 ```
+
+Use the [quickstart](#quickstart-v019) sample path to print
+`rows: 512, version: 2`.
 
 Use the repository's `ports/lance-c`, not the copy in the v0.1.9 source
 tarball: that tag predates the usable port and still contains release
@@ -942,7 +957,14 @@ and C++ test package. It installs `lance-c/0.1.9` with static linkage by
 default; add `-o "&:shared=True"` to create the shared package. A prebuilt
 install needs Python 3, CMake 3.22+, and a C++17 compiler, not Rust.
 
-A minimal consumer consists of a `conanfile.txt`:
+A minimal consumer uses the same v0.1.9 `main.cpp`:
+
+```bash
+mkdir consumer && cd consumer
+curl -fLO https://raw.githubusercontent.com/lance-format/lance-c/v0.1.9/examples/cmake-consumer/main.cpp
+```
+
+It consists of a `conanfile.txt`:
 
 ```ini
 [requires]
@@ -953,7 +975,7 @@ CMakeDeps
 CMakeToolchain
 ```
 
-and a `CMakeLists.txt` (use the v0.1.9 example's `main.cpp`):
+and a `CMakeLists.txt`:
 
 ```cmake
 cmake_minimum_required(VERSION 3.22)
