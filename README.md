@@ -76,7 +76,65 @@ Package-manager routes install the same v0.1.9 package: [vcpkg overlay
 port](#vcpkg-overlay-port-v019) or [local Conan
 recipe](#conan-local-recipe-v019). Beta tags are published as GitHub
 pre-releases and are not selected by the vcpkg or Conan entries in this
-repository.
+repository. The current preview is described in the [Preview
+quickstart](#preview-quickstart-v020-beta1).
+
+## Preview quickstart (v0.2.0-beta.1)
+
+[`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1)
+is the current preview. It is a GitHub pre-release, so the Latest release still
+resolves to v0.1.9. It publishes five archives:
+
+| Platform | Archive | Runtime requirement |
+| --- | --- | --- |
+| Linux x86_64 | `lance-c-v0.2.0-beta.1-x86_64-unknown-linux-gnu.tar.xz` | glibc 2.28 or newer |
+| Linux aarch64 | `lance-c-v0.2.0-beta.1-aarch64-unknown-linux-gnu.tar.xz` | glibc 2.28 or newer |
+| macOS arm64 | `lance-c-v0.2.0-beta.1-aarch64-apple-darwin.tar.xz` | Apple silicon |
+| Windows x86_64 | `lance-c-v0.2.0-beta.1-x86_64-pc-windows-msvc.tar.xz` | Windows x86_64, MSVC |
+| Windows ARM64 | `lance-c-v0.2.0-beta.1-aarch64-pc-windows-msvc.tar.xz` | Windows ARM64, MSVC |
+
+The release publishes per-archive `.sha256` and `.sha512` files plus a
+five-line `SHA512SUMS`. The 0.2 package config requires C++20.
+
+From a clean directory:
+
+```bash
+mkdir lance-c-preview && cd lance-c-preview
+
+TAG=v0.2.0-beta.1
+VERSION=0.2.0-beta.1
+ARCHIVE=lance-c-v0.2.0-beta.1-x86_64-unknown-linux-gnu.tar.xz
+
+curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/$ARCHIVE"
+curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/SHA512SUMS"
+sha512sum --ignore-missing -c SHA512SUMS
+mkdir install
+tar -xJf "$ARCHIVE" -C install
+
+curl -fL -o "lance-c-$TAG-source.tar.gz" \
+  "https://github.com/lance-format/lance-c/archive/refs/tags/$TAG.tar.gz"
+tar -xzf "lance-c-$TAG-source.tar.gz"
+
+cmake -S "lance-c-$VERSION/examples/cmake-consumer" -B build \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
+cmake --build build
+./build/consumer "lance-c-$VERSION/test_data/v0.27.1/pq_in_schema"
+```
+
+Expected output:
+
+```text
+rows: 512, version: 2
+```
+
+For shared linkage, use a separate build directory and add
+`-DLanceC_LINK=shared`. Both linkages were verified with the downloaded x86_64
+Linux archive, its per-archive checksums, and `SHA512SUMS`; the same-tag CMake
+consumer read the sample as `rows: 512, version: 2`.
+
+The vcpkg overlay and Conan recipe in this repository install v0.1.9; they do
+not select `v0.2.0-beta.1`. Use the release archive for the preview until
+their version entries and hashes are updated.
 
 ## Supported build targets
 
@@ -1029,11 +1087,12 @@ Both linkage modes and the recipe at 0.1.9 were verified with Conan 2.34.0.
 
 ### Preview releases
 
-Tags containing `-beta.` are published as GitHub pre-releases; the Latest
-release continues to point at the stable version. The vcpkg and Conan entries
-above install v0.1.9 and do not select a beta. To try a beta, use the archive
-attached to its pre-release page; a recipe selects a beta only after its
-version entry and hashes are updated.
+`v0.2.0-beta.1` is the current preview; it is a GitHub pre-release, so the
+Latest release remains v0.1.9. See [Preview
+quickstart](#preview-quickstart-v020-beta1) for the versioned archive and
+commands. The vcpkg overlay and Conan entries install v0.1.9 and do not select
+a preview; they gain preview support only after their version entries and
+hashes are updated.
 
 ### Header path
 
