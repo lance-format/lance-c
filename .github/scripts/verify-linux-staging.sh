@@ -67,9 +67,9 @@ if [ -z "$needed" ]; then
     exit 1
 fi
 
-# The supported Linux release rows build on glibc 2.36 or newer. pthread and
-# libdl are folded into libc there, but remain valid glibc SONAMEs for a
-# toolchain that still names them explicitly. The architecture-specific
+# The supported Linux release rows target glibc 2.28, where pthread and
+# libdl are separate libraries. Their SONAMEs also remain valid when a newer
+# toolchain names them explicitly. The architecture-specific
 # program interpreter is also allowed. Anything else, including libssl and
 # libcrypto, is an unexpected runtime dependency.
 allowed=(
