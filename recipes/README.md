@@ -10,13 +10,13 @@ conan create recipes/lance-c/all --version=0.1.9
 
 The prebuilt path downloads the v0.1.9 GitHub release archive for Linux
 x86_64/aarch64 or macOS arm64. Test both linkage modes with
-`-o shared=True` and `-o shared=False`. Intel macOS has no prebuilt archive in
-this release; use `-o lance-c/*:from_source=True`, which builds the v0.1.9
-source tag and requires Rust, CMake, and `protoc`.
+`-o shared=True` and `-o shared=False`. Intel macOS is not a supported
+platform for new releases, so the recipe rejects `Macos`/`x86_64` in both
+prebuilt and `from_source` modes. A `from_source` build requires Rust, CMake,
+and `protoc`.
 
-The release workflow now builds an `x86_64-apple-darwin` archive for future
-tags. It is not part of the v0.1.9 `conandata.yml`. Add the `Macos-x86_64`
-prebuilt entry only after that asset is published.
+Future releases publish no Intel macOS archive, so no `Macos-x86_64` prebuilt
+entry will be added to `conandata.yml`. The v0.1.9 entries stay as published.
 
 The Linux x86_64 entry uses the Debian 12 `v0.1.9` archive to keep the lower
 Debian 12 libc floor. The `Linux/armv8` entry uses the standard `v0.1.9`

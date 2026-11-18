@@ -14,7 +14,12 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 | C++ | C++20 |
 | GLIBC baseline | 2.28 |
 | Clang | Clang 20; Apple Clang 15 |
-| macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
+| macOS | Apple silicon (arm64) only; `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
+
+macOS packages and release archives are Apple silicon (arm64) only. Intel macOS
+was retired as a supported target for new releases; published artifacts and
+historical validation evidence remain available.
+
 Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/6035).
 
 ### Phase 1: Core Read Path + C++ Wrappers (MVP)
@@ -546,11 +551,10 @@ packages](#linux-baseline-for-future-packages).
 | `lance-c-v0.1.9-aarch64-unknown-linux-gnu-debian12.tar.xz` | Not selected by the current recipes |
 | `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | vcpkg `arm64-osx`, `arm64-osx-dynamic`, Conan `Macos/armv8` |
 
-Intel macOS (`x86_64-apple-darwin`) uses the `from-source` path for v0.1.9.
-The release workflow now includes an Intel macOS build row for future tags.
-That row has no effect on the published v0.1.9 package set: Intel remains a
-source build until a release containing the new archive is published and the
-recipes are updated with its hash.
+Intel macOS (`x86_64-apple-darwin`) was retired as a supported target for new
+releases. The release workflow no longer builds an Intel macOS row, and no
+future release publishes an `x86_64-apple-darwin` archive. The v0.1.9 assets
+and the historical Intel candidate evidence below remain available.
 
 Releases cut after the Windows package path was added also publish
 `lance-c-vX.Y.Z-x86_64-pc-windows-msvc.tar.xz` and
@@ -617,13 +621,16 @@ audit](https://github.com/lance-format/lance-c/blob/2c00796/validation/issue-103
 Runtime consumer evidence for Linux x86_64 remains recorded in the
 [issue 100 validation
 record](https://github.com/lance-format/lance-c/blob/5a29b67/validation/issue-100/RESULTS.md).
-Current macOS checks and their limits are:
+Retained macOS candidate checks and their limits are:
 
 | Build | Declared macOS metadata | Retained runtime check |
 | --- | --- | --- |
 | [Published v0.1.9 ARM64](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) | Dylib `11.0`; static archive maximum `14.5` (416 of 3,298 members above `11.0`) | None for the published archive; the metadata split alone does not prove failure below 14.5 |
 | [#208 Intel Release candidate](https://github.com/lance-format/lance-c/pull/208) ([job](https://github.com/lance-format/lance-c/actions/runs/43137215582/job/130915319083)) | Dylib and all static archive members `<= 11.0` | macOS 15.7.9: installed static and shared dataset reads and Arrow ownership/lifetime acceptance passed. Candidate archive only, not published recipe availability |
 | [ARM64 current-source Release candidate at `62fbc0f`](https://github.com/lance-format/lance-c/commit/62fbc0fd69d66b184643e47ce93f7f3a6525598b) ([job](https://github.com/lance-format/lance-c/actions/runs/43181220854/job/131057410886)) | Dylib and all 3,855 static archive members: arm64, `minos 11.0` | macOS 15.8.2: installed static and shared dataset reads and Arrow, error and clone ownership acceptance passed. Candidate archive only, not published recipe availability; no older-macOS run |
+
+Intel macOS appears above only as v0.1.9-era candidate evidence; it is no
+longer built by macOS CI or the release workflow.
 
 No numeric minimum macOS version is declared. The macOS 15.x versions above
 are exercised baselines, not a support floor; older macOS versions remain
@@ -825,8 +832,9 @@ vcpkg install 'lance-c[from-source]'  # requires Rust toolchain
 ```
 
 The prebuilt archives and vcpkg mappings are listed under [Published prebuilt
-archives](#published-prebuilt-archives). Intel macOS has no prebuilt asset in
-this release, so use `lance-c[from-source]` there. Source builds also require
+archives](#published-prebuilt-archives). Intel macOS is not a supported
+platform for new releases, so the port rejects `x64-osx` instead of falling
+back to a source build. Source builds for supported platforms also require
 CMake and `protoc` on the build host.
 
 ### Conan
@@ -836,8 +844,8 @@ conan install --requires=lance-c/0.1.9
 ```
 
 Default path downloads prebuilts; `-o lance-c/*:from_source=True` builds
-from source via cargo. As with vcpkg, Intel macOS must use the source path in
-this release.
+from source via cargo. The recipe rejects Intel macOS (`Macos`/`x86_64`) in
+both modes, matching the platform retirement.
 
 ### Header path
 
@@ -1308,7 +1316,7 @@ back.
 
 ## Releasing
 
-Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds six prebuilt tarballs for Linux x86_64 and aarch64, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds five prebuilt tarballs for Linux x86_64 and aarch64, macOS arm64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the Windows rows and the Intel macOS retirement; its published matrix remains the five historical archives listed above.
 
 The Linux rows use one generic glibc 2.28 archive per architecture, as adopted in [#50](https://github.com/lance-format/lance-c/pull/50). Published historical Debian 12 assets remain available.
 
@@ -1328,7 +1336,7 @@ Before the consumer smoke test and archive upload, the Linux and macOS rows stri
    - Commits as `github-actions[bot]` with message `chore: bump version to <version>`.
    - Pushes the commit to `main` and pushes the tag.
    - Dispatches `release.yml` at the new tag's ref. (Direct tag push by `GITHUB_TOKEN` does not trigger workflows — GitHub's recursion guard — so we explicitly `gh workflow run` instead.)
-4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, their Debian 12 variants, macOS arm64/Intel x86_64, and Windows x86_64/aarch64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
+4. `release.yml` builds artifacts. Once the tag includes all rows, the [GitHub Release](https://github.com/lance-format/lance-c/releases) has `.tar.xz` artifacts for Linux x86_64/aarch64, macOS arm64, and Windows x86_64/aarch64, plus a `SHA512SUMS` file. The v0.1.9 release remains the historical five-asset set above.
 5. The `publish` job's log emits a paste-ready `set(LANCE_C_SHA512_... "...")` snippet. Copy it into:
    - [`ports/lance-c/portfile.cmake`](ports/lance-c/portfile.cmake) (SHA512s)
    - [`recipes/lance-c/all/conandata.yml`](recipes/lance-c/all/conandata.yml) (SHA256s, derived from the `.sha256` files in the release assets)
@@ -1356,7 +1364,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the six prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the five prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 

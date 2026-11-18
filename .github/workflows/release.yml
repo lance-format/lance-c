@@ -40,15 +40,6 @@ jobs:
             container: quay.io/pypa/manylinux_2_28_aarch64@sha256:34a5e614a4eb26f73f8bf44cbbf2acf8011620453d03ea35a58537bb3cde44de
             target: aarch64-unknown-linux-gnu
             artifact_suffix: ""
-          # macos-15-intel is GitHub's current standard x64 macOS runner.
-          # Keep this row native so both libraries and the consumer exercise
-          # Intel execution rather than a cross-build or arm64 translation.
-          - os: macos-15-intel
-            container: ""
-            target: x86_64-apple-darwin
-            artifact_suffix: ""
-            architecture: x86_64
-            timeout_minutes: 180
           - os: macos-15
             container: ""
             target: aarch64-apple-darwin
