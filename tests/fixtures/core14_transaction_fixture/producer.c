@@ -1,18 +1,18 @@
 /*
- * Produce historical Lance 14.0.2 transaction files for the core-15 migration
- * readback gate.
+ * Produce historical Lance 14.0.2 transaction files for the core-15 readback
+ * test.
  *
  * This program is deliberately built against a Lance 14.0.2 lance-c library
  * and headers. It writes one attached transaction and one detached
  * transaction with fixed UUIDs, tags and properties, then prints the metadata
- * that the candidate verifier must observe.
+ * read by tests/core14_transaction_fixture_test.rs.
  *
- * It is evidence tooling, not part of the candidate library or its CI.
+ * It is fixture tooling, not part of the library or its CI.
  *
- * Build (server path names are examples; point them at a v14 prefix):
- *   cc -std=c11 -O2 core14_transaction_producer.c \
- *      -I <v14-prefix>/include -L <v14-prefix>/lib -llance_c \
- *      -Wl,-rpath,<v14-prefix>/lib -o core14_transaction_producer
+ * Build against the pinned core14 source at lance-c commit
+ * 8cc29073329f5bef1e9ba121b385a4dd5f04e701 (Lance 14.0.2 at
+ * 40f15ed1b71b66950961b175829fdf17a763f108). See README.md in this
+ * directory for the complete reproduction commands.
  */
 
 #include <lance/lance.h>
