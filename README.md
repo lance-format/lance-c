@@ -895,16 +895,20 @@ does not resolve. Use the overlay port in this repository:
 git clone https://github.com/microsoft/vcpkg.git
 ./vcpkg/bootstrap-vcpkg.sh
 git clone https://github.com/lance-format/lance-c.git
+
+# x64-linux installs the static package; x64-linux-dynamic installs shared.
+TRIPLET=x64-linux
 ./vcpkg/vcpkg install lance-c \
-  --overlay-ports="$PWD/lance-c/ports" --triplet x64-linux
+  --overlay-ports="$PWD/lance-c/ports" --triplet "$TRIPLET"
 ```
 
-This installs `lance-c:x64-linux@0.1.9` from the Debian 12 x86_64 archive. Use
-`--triplet x64-linux-dynamic` for shared linkage, `arm64-linux` or
-`arm64-linux-dynamic` for ARM64 Linux, or `arm64-osx` for Apple silicon.
-Intel macOS has no v0.1.9 prebuilt; install `lance-c[from-source]`, which needs
-Rust, CMake, and protoc. The port does not support Windows. The overlay port
-needs git, curl, tar, unzip, a C++17 compiler, and CMake 3.22+.
+`TRIPLET=x64-linux` installs `lance-c:x64-linux@0.1.9` from the Debian 12
+x86_64 archive. Use `x64-linux-dynamic` for shared linkage, `arm64-linux` or
+`arm64-linux-dynamic` for ARM64 Linux, or `arm64-osx` for Apple silicon. Keep
+the same `TRIPLET` value for the consumer below. Intel macOS has no v0.1.9
+prebuilt; install `lance-c[from-source]`, which needs Rust, CMake, and protoc.
+The port does not support Windows. The overlay port needs git, curl, tar,
+unzip, a C++17 compiler, and CMake 3.22+.
 
 Configure a minimal consumer with the vcpkg toolchain after the install. It
 uses the v0.1.9 example's `main.cpp`:
@@ -918,16 +922,22 @@ cmake_minimum_required(VERSION 3.22)
 project(consumer LANGUAGES CXX)
 find_package(LanceC CONFIG REQUIRED)
 add_executable(consumer main.cpp)
+target_compile_features(consumer PRIVATE cxx_std_17)
 target_link_libraries(consumer PRIVATE LanceC::lance_c)
 EOF
 
+# Reuse the install triplet; each value gets its own build dir.
+TRIPLET=${TRIPLET:-x64-linux}
 VCPKG_ROOT=/path/to/vcpkg
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B "build-$TRIPLET" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
-  -DVCPKG_TARGET_TRIPLET=x64-linux
-cmake --build build
-./build/consumer /path/to/dataset.lance
+  -DVCPKG_TARGET_TRIPLET="$TRIPLET"
+cmake --build "build-$TRIPLET"
+./"build-$TRIPLET"/consumer /path/to/dataset.lance
 ```
+
+The v0.1.9 package config does not propagate a C++ standard, so the consumer
+requests C++17 explicitly. Packages from the 0.2 line require C++20.
 
 Use the [quickstart](#quickstart-v019) sample path to print
 `rows: 512, version: 2`.
@@ -982,8 +992,12 @@ cmake_minimum_required(VERSION 3.22)
 project(consumer LANGUAGES CXX)
 find_package(LanceC CONFIG REQUIRED)
 add_executable(consumer main.cpp)
+target_compile_features(consumer PRIVATE cxx_std_17)
 target_link_libraries(consumer PRIVATE LanceC::lance_c)
 ```
+
+The recipe does not propagate a C++ standard either; request C++17 for the
+v0.1.9 package (the 0.2 line requires C++20).
 
 Install and build it:
 
