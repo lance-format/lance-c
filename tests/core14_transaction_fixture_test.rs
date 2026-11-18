@@ -3,11 +3,13 @@
 
 //! Historical transaction-file readback across the core-15 migration.
 //!
-//! The fixture is produced by a Lance 14.0.2 `lance-c` build
-//! (`.validation/core15-migration/fixtures/core14_transaction_producer.c`) and
-//! contains one attached and one detached transaction with fixed UUIDs, tags
-//! and properties. This test is ignored because it needs that external
-//! fixture; run it with:
+//! The fixture is produced from the last Lance 14.0.2 `lance-c` source
+//! (`8cc29073329f5bef1e9ba121b385a4dd5f04e701`) with the maintained
+//! `tests/fixtures/core14_transaction_fixture/producer.c` and contains one
+//! attached and one detached transaction with fixed UUIDs, tags and
+//! properties. See `tests/fixtures/core14_transaction_fixture/README.md` for
+//! the pinned build and fixture-generation commands. This test is ignored
+//! because it needs that external fixture; run it with:
 //!
 //! ```text
 //! LANCE_CORE14_FIXTURE_URI=/tmp/core14-txn-fixture.lance \
