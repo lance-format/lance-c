@@ -1450,7 +1450,7 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
 
     let cache_uri = root.path().join("zero-cache.lance");
     let native_cache_uri = root.path().join("native-zero-cache.lance");
-    let native_cache_panic = catch_unwind(AssertUnwindSafe(|| {
+    let native_cache_success = native_success(|| {
         let mut native = native_writer(
             native_cache_uri.to_str().unwrap(),
             &Schema::empty(),
@@ -1458,18 +1458,11 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
                 data_cache_bytes: Some(1024),
                 ..Default::default()
             },
-        )
-        .expect("native zero-column writer should construct before encoding");
-        lance_c::runtime::block_on(native.write_batch(&zero_batch))
-            .expect("native zero-column write should panic before returning");
-        lance_c::runtime::block_on(native.finish())
-            .expect("native zero-column finish should panic before returning");
-    }))
-    .is_err();
-    assert!(
-        native_cache_panic,
-        "native zero-column writer with an explicit cache must panic"
-    );
+        )?;
+        native_write_batch(&mut native, &zero_batch)?;
+        lance_c::runtime::block_on(native.finish())?;
+        Ok::<(), lance_core::Error>(())
+    });
     let cache_uri_c = c_string(cache_uri.to_str().unwrap());
     let cache_options = LanceFileWriterOptions {
         has_data_cache_bytes: 1,
@@ -1485,29 +1478,42 @@ fn writer_zero_column_and_failure_boundaries_are_native() {
             ptr::null(),
         )
     };
-    let c_cache_panic;
-    if !cache_writer.is_null() {
+    let mut cache_summary = LanceFileWriteSummary::default();
+    let c_cache_success = if cache_writer.is_null() {
+        let (code, message) = take_error();
+        panic!("C zero-column cache writer must open: {code:?}: {message}");
+    } else {
         let raw_zero = import_batch(&zero_batch);
-        let status = unsafe { lance_file_writer_write_batch(cache_writer, raw_zero) };
-        if status == 0 {
-            let mut summary = LanceFileWriteSummary::default();
-            let status = unsafe { lance_file_writer_finish(cache_writer, &mut summary) };
-            if status != 0 {
-                c_cache_panic = take_error().0 == LanceErrorCode::Panic;
-            } else {
-                c_cache_panic = false;
-            }
+        let write_status = unsafe { lance_file_writer_write_batch(cache_writer, raw_zero) };
+        let finish_status = if write_status == 0 {
+            unsafe { lance_file_writer_finish(cache_writer, &mut cache_summary) }
         } else {
-            c_cache_panic = take_error().0 == LanceErrorCode::Panic;
+            -1
+        };
+        if write_status != 0 || finish_status != 0 {
+            let (code, message) = take_error();
+            assert_eq!(code, LanceErrorCode::InvalidArgument, "{message}");
+            assert!(!message.is_empty());
         }
         unsafe {
             lance_batch_free(raw_zero);
             lance_file_writer_close(cache_writer);
         }
-    } else {
-        c_cache_panic = take_error().0 == LanceErrorCode::Panic;
+        write_status == 0 && finish_status == 0
+    };
+    // Core 15.0.0-beta.23 fixed the empty-schema divide-by-zero in the
+    // per-column cache split, so this path now succeeds instead of panicking.
+    assert!(
+        native_cache_success,
+        "native zero-column cache write must succeed"
+    );
+    assert_eq!(c_cache_success, native_cache_success);
+    if c_cache_success {
+        assert_eq!(cache_summary.num_rows, 3);
+        let reader = open_c_reader(cache_uri.to_str().unwrap(), None);
+        assert_eq!(metadata_info(reader).num_rows, 3);
+        unsafe { lance_file_reader_close(reader) };
     }
-    assert!(c_cache_panic, "C zero-column cache path must report panic");
 
     let empty_uri = root.path().join("empty.lance");
     let empty_uri_c = c_string(empty_uri.to_str().unwrap());

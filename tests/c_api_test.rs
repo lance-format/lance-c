@@ -39931,14 +39931,27 @@ fn test_scalar_segment_label_list_exact_candidates() {
             let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], predicate, None, 0);
             assert_eq!(ids, expected, "{predicate}, stable={stable}");
         }
-        // An untyped integer literal casts this Int32 list to Int64. Such
-        // a column expression must retain the scan fallback.
+        // An untyped integer literal widens this Int32 list to Int64. Native now
+        // looks through that lossless cast and drives the LabelList index.
         let (ids, stats) =
             scalar_segment_ids(&uri, &uuids[0], &[0, 1], "array_contains(key, 42)", None, 0);
         assert_eq!(ids, vec![2, 3, 5, 6, 7]);
-        assert!(stats.metrics.iter().any(|(name, _, value)| {
-            name == "scalar_segment_fallback_no_driver" && *value == 1
-        }));
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, value)| { name == "scalar_segments_searched" && *value == 1 }),
+            "stable={stable}, metrics={:?}",
+            stats.metrics
+        );
+        assert!(
+            !stats
+                .metrics
+                .iter()
+                .any(|(name, _, value)| { name == "scalar_segment_fallbacks" && *value != 0 }),
+            "stable={stable}, metrics={:?}",
+            stats.metrics
+        );
 
         lance_c::runtime::block_on(async {
             let mut ds = Dataset::open(&uri).await.unwrap();
@@ -48425,10 +48438,10 @@ fn test_memwal_vector_search_planner_on_base() {
     );
     let batches = c_stream_batches(unsafe { stream.assume_init() }).1;
     let ids = mw_int32_values(&batches, "id");
-    // Native vector planning requires a base vector index; without one the
-    // plan is valid but yields no base rows. The indexed test below covers
-    // neighbor behavior against an independent flat-distance control.
-    assert!(ids.is_empty(), "{ids:?}");
+    // Core 15.0.0-beta.23 searches a base table without a usable vector index
+    // flat instead of yielding no base rows. The query is closest to [1, 0, 0, 0]
+    // and then [0, 0, 0, 0], so both rows within the limit are returned.
+    assert_eq!(ids, vec![2, 1]);
     unsafe { lance_mem_wal_plan_free(plan) };
 
     // Wrong query dimension is rejected by native with the dimension details.

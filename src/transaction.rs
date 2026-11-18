@@ -283,7 +283,7 @@ fn create_index_operation_parts(
 
 fn data_replacement_groups(operation: &LanceOperation) -> Result<&[DataReplacementGroup]> {
     match &operation.inner {
-        Operation::DataReplacement { replacements } => Ok(replacements),
+        Operation::DataReplacement { replacements, .. } => Ok(replacements),
         other => Err(lance_core::Error::not_supported_source(
             format!(
                 "DataReplacement inspection is not supported for {} operations",
@@ -492,7 +492,14 @@ unsafe fn operation_data_replacement_new_inner(
     };
 
     Ok(Box::into_raw(Box::new(LanceOperation::from_native(
-        Operation::DataReplacement { replacements },
+        // Core 15.0.0-beta.24 added `data_change` to distinguish value
+        // replacement from a compaction repack that only moves values. This
+        // entry point has always meant value replacement, so it keeps that
+        // semantics; repacks stay native and are not exposed through C.
+        Operation::DataReplacement {
+            replacements,
+            data_change: true,
+        },
     ))))
 }
 
