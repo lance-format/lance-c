@@ -97,13 +97,16 @@ mod tests {
             unsafe { lance_free_string(message_ptr) };
             Some(message)
         };
-        tx.send(Observation {
+        // A failed assertion can drop the receiver while this completion is
+        // still in flight. Unwinding here would cross the `extern "C"`
+        // boundary and abort the whole test binary, hiding the original
+        // failure, so a failed delivery is intentionally ignored.
+        let _ = tx.send(Observation {
             status,
             result,
             code,
             message,
-        })
-        .unwrap();
+        });
     }
 
     fn completion() -> (
@@ -118,12 +121,35 @@ mod tests {
         (completion, rx, ctx)
     }
 
+    /// Upper bound for one completion to reach the test channel. Spawned tasks
+    /// share the global runtime with the rest of the lib test suite, where
+    /// CPU-heavy dataset tests can occupy every worker for seconds; the
+    /// macOS CI run observed 3-4s delays for these callbacks. This only bounds
+    /// a broken bridge, so keep enough headroom that suite load cannot turn
+    /// into a false failure.
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
+
     fn receive(rx: &mpsc::Receiver<Observation>) -> Observation {
         let observation = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(COMPLETION_TIMEOUT)
             .expect("async bridge must deliver completion");
         crate::async_dispatcher::wait_for_callbacks();
         observation
+    }
+
+    #[test]
+    fn late_completion_after_receiver_drop_does_not_unwind() {
+        let (tx, rx) = mpsc::channel::<Observation>();
+        let ctx = Box::into_raw(Box::new(tx));
+        drop(rx);
+
+        // Regression: on macOS CI a timed-out test dropped its receiver, the
+        // pending completion's `send` then returned `SendError`, and unwrapping
+        // it on the dispatcher aborted the whole lib test process instead of
+        // reporting the timeout.
+        unsafe { observe(ctx.cast(), -1, std::ptr::null_mut()) };
+
+        unsafe { drop(Box::from_raw(ctx)) };
     }
 
     #[test]
