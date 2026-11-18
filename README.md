@@ -1033,23 +1033,37 @@ archive's wrappers require C++17. The C header is usable from C.
 
 ### C
 
-```c
-#include <lance/lance.h>
+[`examples/c-scan/main.c`](examples/c-scan/main.c) is a complete scan with its
+own `Makefile`. It opens the dataset, creates a scanner and reads every batch
+from an `ArrowArrayStream`; the example needs `make` and a C11 compiler.
 
-LanceDataset* ds = lance_dataset_open("data.lance", NULL, 0);
-if (!ds) {
-    printf("Error: %s\n", lance_last_error_message());
-    return 1;
-}
-
-struct ArrowArrayStream stream;
-LanceScanner* scanner = lance_scanner_new(ds, NULL, NULL);
-lance_scanner_to_arrow_stream(scanner, &stream);
-// consume stream...
-
-lance_scanner_close(scanner);
-lance_dataset_close(ds);
+```bash
+make -C examples/c-scan LANCE_C_PREFIX=/path/to/lance-c-install
+LD_LIBRARY_PATH=/path/to/lance-c-install/lib \
+  ./examples/c-scan/build/lance-c-scan test_data/v0.27.1/pq_in_schema
 ```
+
+Expected output:
+
+```text
+rows: 512, version: 2
+```
+
+`stream.get_next` distinguishes three outcomes: a nonzero return is an error
+reported by `stream.get_last_error`; a returned batch with `release != NULL` is
+data owned by the caller; and a successful call with `release == NULL` is end
+of stream. Release every returned batch with its release callback, release the
+stream, close the scanner and dataset on success and failure, and free
+`lance_last_error_message()` strings with `lance_free_string()`.
+
+A missing dataset exits `1` with a Lance error, for example:
+
+```text
+cannot open dataset /path/that/does/not/exist: Lance error 3: ...
+```
+
+This example is in the current source tree, which postdates v0.1.9, and was
+verified against the v0.1.9 x86_64 Linux package.
 
 ### C++
 
