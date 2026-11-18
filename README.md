@@ -644,14 +644,14 @@ This is a packaging decision, not a change to any downloadable asset:
   compatibility symlinks, and keep the C++20 consumer requirement.
 - Runtime evidence is limited to the glibc 2.28 containers that were executed
   (AlmaLinux 8.10) on `x86_64` and native `aarch64`, with installed and
-  archive-extracted static/shared C++20 dataset consumers. It is not a promise
+  archive-extracted static/shared C++17 dataset consumers. Those historical
+  runs predate the C++20 package requirement. It is not a promise
   for every glibc 2.28 distribution, and no glibc 2.28 archive has been
   published.
-- The workflow change that would produce these archives is author-maintained
-  in [#50](https://github.com/lance-format/lance-c/pull/50). It is not part of
-  `release.yml` on `main` yet, which still builds the two Debian 12 rows next
-  to the generic Linux rows. Until packages built with this baseline are
-  published and the recipe hashes are updated, the recipes keep selecting the
+- The workflow adopted in [#50](https://github.com/lance-format/lance-c/pull/50)
+  builds the two generic Linux archives without separate Debian 12 rows.
+  Until packages built with this baseline are published and the recipe hashes
+  are updated, the recipes keep selecting the
   `v0.1.9` archives listed above: `x64-linux`, `x64-linux-dynamic` and
   `Linux/x86_64` use the Debian 12 x86_64 archive, while `arm64-linux`,
   `arm64-linux-dynamic` and `Linux/armv8` use the standard aarch64 archive
@@ -1304,9 +1304,9 @@ back.
 
 ## Releasing
 
-Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds eight prebuilt tarballs for Linux x86_64 and aarch64, their Debian 12 variants, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
+Pushing a `v*.*.*` tag starts [`release.yml`](.github/workflows/release.yml), which builds six prebuilt tarballs for Linux x86_64 and aarch64, macOS arm64 and Intel x86_64, and Windows x86_64 and aarch64. The workflow attaches them to a GitHub Release. Beta tags (`v*-beta.*`) are published as pre-releases. The v0.1.9 release predates the restored Intel and Windows rows; its published matrix remains the five archives listed above.
 
-The two Debian 12 rows belong to this current workflow, not to the future Linux baseline. The glibc 2.28-only policy replaces them with a single generic archive per Linux architecture, pending in the author-maintained [#50](https://github.com/lance-format/lance-c/pull/50); `main` still builds all eight tarballs until that change lands.
+The Linux rows use one generic glibc 2.28 archive per architecture, as adopted in [#50](https://github.com/lance-format/lance-c/pull/50). Published historical Debian 12 assets remain available.
 
 Before the consumer smoke test and archive upload, the Linux and macOS rows strip the staged shared library and verify its exact public exports. Linux rows also verify direct runtime dependencies. Windows verifies PE architecture, exact DLL and import-library export sets, absence of redistributable CRT imports, compatible static-CRT archive and consumer directives, and installed static/shared consumers.
 
@@ -1352,7 +1352,7 @@ If you need to cut a release without the workflow (e.g. local tag with extra com
    git tag v0.2.0
    git push origin v0.2.0
    ```
-5. `release.yml` fires on the tag push and builds the eight prebuilt tarballs as above.
+5. `release.yml` fires on the tag push and builds the six prebuilt tarballs as above.
 
 A `workflow_dispatch` trigger on `release.yml` lets you do dry-run builds without cutting a tag — Actions tab → "Release" → "Run workflow" → enter a version like `0.0.1-dev`. The `publish` job is skipped (gated on `refs/tags/v`), but the build matrix runs end-to-end so you can validate it before the real tag.
 
