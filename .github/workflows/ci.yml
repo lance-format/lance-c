@@ -54,6 +54,15 @@ jobs:
             exit 1
           fi
 
+  release-snippet:
+    name: Release snippet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release recipe snippet
+        run: python3 .github/scripts/test-release-recipe-snippet.py
+
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
