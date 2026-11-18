@@ -3252,7 +3252,7 @@ static void test_cleanup_and_lifecycle(const std::string& uri) {
     PASS();
 }
 
-// Exercises table/schema metadata through the C++17 wrappers, including
+// Exercises table/schema metadata through the C++20 wrappers, including
 // removal, real empty values, replace/clear, snapshot isolation and reopen.
 static void test_dataset_metadata(const std::string& dst_uri) {
     TEST(test_dataset_metadata);
@@ -3317,7 +3317,7 @@ static void test_dataset_metadata(const std::string& dst_uri) {
 }
 
 // Exercises batched field metadata updates and schema/snapshot inspection
-// through the C++17 wrappers on the nested two-fragment fixture.
+// through the C++20 wrappers on the nested two-fragment fixture.
 static void test_dataset_field_metadata(const std::string& uri) {
     TEST(test_dataset_field_metadata);
     using MetadataUpdates =

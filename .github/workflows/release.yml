@@ -21,7 +21,7 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.target }}${{ matrix.artifact_suffix }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
     container:
       # An expression evaluating to empty means "no container" — the job runs
       # directly on the runner. A literal `image: ''` fails schema validation,
@@ -32,44 +32,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            os_label: linux
-            container: ""
+          - os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
+            target: x86_64-unknown-linux-gnu
             artifact_suffix: ""
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            os_label: linux
-            container: ""
+          - os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64@sha256:34a5e614a4eb26f73f8bf44cbbf2acf8011620453d03ea35a58537bb3cde44de
+            target: aarch64-unknown-linux-gnu
             artifact_suffix: ""
-          # Debian 12 (bookworm) ships glibc 2.36. Building inside the image
-          # pins the ABI floor by construction, independent of whatever glibc
-          # the host runner image happens to carry, so these archives keep
-          # working on bookworm-based deployments.
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            os_label: linux
-            container: "debian:12"
-            artifact_suffix: "-debian12"
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            os_label: linux
-            container: "debian:12"
-            artifact_suffix: "-debian12"
           # macos-15-intel is GitHub's current standard x64 macOS runner.
           # Keep this row native so both libraries and the consumer exercise
           # Intel execution rather than a cross-build or arm64 translation.
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            timeout_minutes: 180
-            os_label: macos
+          - os: macos-15-intel
             container: ""
+            target: x86_64-apple-darwin
             artifact_suffix: ""
             architecture: x86_64
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            os_label: macos
+            timeout_minutes: 180
+          - os: macos-15
             container: ""
+            target: aarch64-apple-darwin
             artifact_suffix: ""
             architecture: arm64
     env:
@@ -77,40 +59,16 @@ jobs:
       CXX: clang++
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      # Runs before checkout so git is present for the clone and for the
-      # Corrosion FetchContent. The image has no sudo and runs as root.
-      # xz-utils backs `tar -cJf`, zstd backs `rust-cache`, and perl provides
-      # `shasum`; none is in the base image. libprotobuf-dev supplies the
-      # well-known .proto files under /usr/include/google/protobuf/, which
-      # lance-encoding's build script imports; protobuf-compiler only Recommends
-      # it, so --no-install-recommends drops it and protoc fails to resolve
-      # google/protobuf/empty.proto.
-      - name: Install build dependencies (container)
-        if: matrix.container != ''
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            clang \
-            cmake \
-            curl \
-            git \
-            libprotobuf-dev \
-            perl \
-            pkg-config \
-            protobuf-compiler \
-            xz-utils \
-            zstd
-          # TLS stays on rustls; Cargo.lock has no openssl-sys or native-tls.
-          # openssl-probe only discovers certificate locations; it does not
-          # link OpenSSL.
-          # libssl-dev must not be installed here: an accidental libssl or
-          # libcrypto DT_NEEDED breaks dlopen in minimal Linux images.
       - uses: actions/checkout@v4
-      - name: Mark workspace safe for git (container)
-        if: matrix.container != ''
-        run: git config --global --add safe.directory '*'
+      - name: Load baseline floors
+        shell: bash
+        run: |
+          set -a
+          source .github/baseline.env
+          set +a
+          {
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+          } >>"$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -121,13 +79,17 @@ jobs:
           # sharing a cache — they link against different glibc versions.
           key: ${{ matrix.target }}${{ matrix.artifact_suffix }}
       - name: Install protobuf (Linux)
-        if: matrix.os_label == 'linux' && matrix.container == ''
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-protoc
+      - name: Install Clang 20 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          manylinux-install-clang -v 20.1.8.0
       - name: Install protobuf (macOS)
-        if: matrix.os_label == 'macos'
+        if: runner.os == 'macOS'
         run: brew install protobuf
       - name: Record macOS host and toolchain
-        if: matrix.os_label == 'macos'
+        if: runner.os == 'macOS'
         run: |
           sw_vers
           uname -m
@@ -148,23 +110,23 @@ jobs:
           fi
       - name: Configure + build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib
           cmake --build build --parallel
       - name: Install to staging prefix
         run: cmake --install build --prefix stage
       - name: Strip release shared library
-        run: bash .github/scripts/strip-release-shared.sh stage ${{ matrix.os_label }}
+        run: bash .github/scripts/strip-release-shared.sh stage "${{ runner.os }}"
       - name: Verify Linux shared-library exports
-        if: matrix.os_label == 'linux'
+        if: runner.os == 'Linux'
         run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance/lance.h linux
       - name: Verify macOS shared-library exports
-        if: matrix.os_label == 'macos'
+        if: runner.os == 'macOS'
         run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
       - name: Verify Linux staged runtime dependencies
-        if: matrix.os_label == 'linux'
+        if: runner.os == 'Linux'
         run: bash .github/scripts/verify-linux-staging.sh stage ${{ matrix.target }}
       - name: Verify macOS staged libraries
-        if: matrix.os_label == 'macos'
+        if: runner.os == 'macOS'
         run: bash .github/scripts/verify-macos-staging.sh stage ${{ matrix.architecture }}
       - name: Smoke-test staged package with CMake consumer
         run: bash .github/scripts/verify-cmake-consumer.sh --from-install-prefix stage
@@ -178,8 +140,13 @@ jobs:
           SUFFIX=${{ matrix.artifact_suffix }}
           ARCHIVE="lance-c-v${VERSION}-${TARGET}${SUFFIX}.tar.xz"
           tar -C stage -cJf "${ARCHIVE}" .
-          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          if command -v shasum > /dev/null 2>&1; then
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          else
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            sha512sum "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          fi
           echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
@@ -289,8 +256,13 @@ jobs:
           TARGET=${{ matrix.target }}
           ARCHIVE="lance-c-v${VERSION}-${TARGET}.tar.xz"
           tar -C stage -cJf "${ARCHIVE}" .
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          sha512sum "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          if command -v shasum > /dev/null 2>&1; then
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            shasum -a 512 "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          else
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            sha512sum "${ARCHIVE}" > "${ARCHIVE}.sha512"
+          fi
           echo "archive=${ARCHIVE}" >>"$GITHUB_OUTPUT"
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
@@ -307,6 +279,7 @@ jobs:
     name: Publish GitHub Release
     needs: [build, build-windows]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4

@@ -6,8 +6,15 @@ The C/C++ binding to [Lance](https://github.com/lancedb/lance), providing native
 - **C++ wrappers:** [`include/lance/lance.hpp`](include/lance/lance.hpp) (header-only, RAII, exceptions)
 - **Data exchange:** [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) for zero-copy interop
 
-## Roadmap
+## Supported build targets
 
+| Component | Target / minimum |
+|-----------|------------------|
+| CMake | 3.22+ |
+| C++ | C++20 |
+| GLIBC baseline | 2.28 |
+| Clang | Clang 20; Apple Clang 15 |
+| macOS | `.github/baseline.env` (`MACOSX_DEPLOYMENT_TARGET`) |
 Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/6035).
 
 ### Phase 1: Core Read Path + C++ Wrappers (MVP)
@@ -634,10 +641,10 @@ This is a packaging decision, not a change to any downloadable asset:
   `GLIBC_2.35`, remain published with their current hashes and recipe
   selections. They are historical assets; no future tag adds another one.
 - Keep the physical `lib/` install layout, with no `lib64` and no
-  compatibility symlinks, and keep the C++17 consumer requirement.
+  compatibility symlinks, and keep the C++20 consumer requirement.
 - Runtime evidence is limited to the glibc 2.28 containers that were executed
   (AlmaLinux 8.10) on `x86_64` and native `aarch64`, with installed and
-  archive-extracted static/shared C++17 dataset consumers. It is not a promise
+  archive-extracted static/shared C++20 dataset consumers. It is not a promise
   for every glibc 2.28 distribution, and no glibc 2.28 archive has been
   published.
 - The workflow change that would produce these archives is author-maintained
@@ -662,11 +669,11 @@ cargo build --release
 Produces `target/release/liblance_c.{so,dylib,dll}` and a `liblance_c.a`.
 Headers stay in `include/lance/`.
 
-### From source via CMake (C/C++ developers)
+### From source via CMake (C/C++ developers and packagers)
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build --parallel
 cmake --install build --prefix /your/prefix
 ```
 
@@ -695,6 +702,8 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
+
+Baseline values are defined once in [`.github/baseline.env`](.github/baseline.env) and loaded by CI, release workflows, and CMake.
 
 ### Windows (x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)
 
@@ -786,7 +795,7 @@ Windows CI builds this layout with Rust 1.95.0. The x64 job uses
 `windows-2022`. The ARM64 job uses `windows-11-arm` and asserts that the
 runner, PowerShell process, and Rust host are native ARM64. Each job verifies
 the PE32+ machine, public `lance_*` exports, absence of redistributable CRT
-imports, static archive directives, and installed static/shared C++17
+imports, static archive directives, and installed static/shared C++20
 consumers. The consumers run with `PATH` restricted to the Windows system
 directories and write their loaded-module lists; `LNK4098` and `LNK2038` are
 failures. The hosted images already contain a VC Runtime under `System32`, so
@@ -833,7 +842,7 @@ this release.
 #include <lance/lance.hpp>   // C++
 ```
 
-The C++ wrappers require C++17. The C header is usable from C.
+The C++ wrappers require C++20. The C header is usable from C.
 
 ## Usage
 

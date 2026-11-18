@@ -5,7 +5,14 @@ cmake_minimum_required(VERSION 3.22)
 
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(cargo-version)
+include(baseline)
 read_cargo_version("${CMAKE_CURRENT_LIST_DIR}/Cargo.toml" LANCE_C_VERSION)
+
+lance_c_load_baseline_env("${CMAKE_CURRENT_LIST_DIR}/.github/baseline.env")
+
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "${MACOSX_DEPLOYMENT_TARGET}" CACHE STRING "Minimum macOS deployment target" FORCE)
+endif()
 
 project(LanceC
     VERSION ${LANCE_C_VERSION}
@@ -13,6 +20,22 @@ project(LanceC
     HOMEPAGE_URL "https://github.com/lance-format/lance-c"
     LANGUAGES C CXX
 )
+
+if(NOT DEFINED CMAKE_C_STANDARD OR CMAKE_C_STANDARD LESS 11)
+    set(CMAKE_C_STANDARD 11)
+endif()
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+if(NOT DEFINED CMAKE_CXX_STANDARD OR CMAKE_CXX_STANDARD LESS 20)
+    set(CMAKE_CXX_STANDARD 20)
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 include(GNUInstallDirs)
 
@@ -66,6 +89,9 @@ if(NOT LANCE_C_USE_PREBUILT)
         CRATE_TYPES staticlib cdylib
         PROFILE release
     )
+    if(APPLE)
+        corrosion_set_env_vars(lance_c "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
     if(LANCE_C_CRT_STATIC)
         if(NOT Rust_CARGO_TARGET_ENV STREQUAL "msvc")
             message(FATAL_ERROR
@@ -165,11 +191,13 @@ endif()
 add_library(LanceC::lance_c_static INTERFACE IMPORTED GLOBAL)
 set_target_properties(LanceC::lance_c_static PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
+    INTERFACE_COMPILE_FEATURES cxx_std_20
     INTERFACE_LINK_LIBRARIES "${_lance_c_static_real};LanceC_platform_deps")
 
 add_library(LanceC::lance_c_shared INTERFACE IMPORTED GLOBAL)
 set_target_properties(LanceC::lance_c_shared PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
+    INTERFACE_COMPILE_FEATURES cxx_std_20
     INTERFACE_LINK_LIBRARIES "${_lance_c_shared_real};LanceC_platform_deps")
 
 if(LANCE_C_LINK STREQUAL "shared")

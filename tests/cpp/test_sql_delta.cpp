@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// Native dataset SQL and delta C++17 consumer exercising the RAII wrappers:
+// Native dataset SQL and delta C++20 consumer exercising the RAII wrappers:
 // chained builders, consume-on-build/into-stream handle release, exception
 // safety, transaction array adoption and stream ownership across parent
 // handle destruction.

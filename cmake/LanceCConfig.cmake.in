@@ -42,6 +42,7 @@ if(EXISTS "${_lance_c_static}" AND NOT TARGET LanceC::lance_c_static)
     set_target_properties(LanceC::lance_c_static PROPERTIES
         IMPORTED_LOCATION "${_lance_c_static}"
         INTERFACE_INCLUDE_DIRECTORIES "${_LANCE_C_INCLUDE_DIR}"
+        INTERFACE_COMPILE_FEATURES cxx_std_20
         INTERFACE_LINK_LIBRARIES "${_lance_c_platform_deps}")
 endif()
 
@@ -51,6 +52,7 @@ if(EXISTS "${_lance_c_shared}" AND (NOT WIN32 OR EXISTS "${_lance_c_import}")
     set_target_properties(LanceC::lance_c_shared PROPERTIES
         IMPORTED_LOCATION "${_lance_c_shared}"
         INTERFACE_INCLUDE_DIRECTORIES "${_LANCE_C_INCLUDE_DIR}"
+        INTERFACE_COMPILE_FEATURES cxx_std_20
         INTERFACE_LINK_LIBRARIES "${_lance_c_platform_deps}")
     if(WIN32)
         set_target_properties(LanceC::lance_c_shared PROPERTIES

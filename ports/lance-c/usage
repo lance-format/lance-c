@@ -3,7 +3,7 @@ The package lance-c provides CMake targets:
     find_package(LanceC CONFIG REQUIRED)
     target_link_libraries(main PRIVATE LanceC::lance_c)
 
-Consumers require C++17 for lance.hpp. C consumers include lance/lance.h.
+Consumers require C++20 for lance.hpp. C consumers include lance/lance.h.
 
 The default linkage matches the vcpkg triplet:
     x64-linux         → static  (LanceC::lance_c → LanceC::lance_c_static)

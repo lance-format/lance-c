@@ -57,6 +57,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -66,22 +67,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
-          printf '%s\n' \
-            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
-            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
-            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
-            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+      - uses: ./.github/actions/setup-protoc
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
   test-linux:
     name: Tests (Linux)
     runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     env:
       CC: clang
@@ -92,18 +85,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
-          printf '%s\n' \
-            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
-            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
-            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
-            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler lld
+      - name: Install Clang 20
+        run: manylinux-install-clang -v 20.1.8.0
+      - uses: ./.github/actions/setup-protoc
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
@@ -418,6 +402,7 @@ jobs:
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -425,22 +410,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
-          printf '%s\n' \
-            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
-            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
-            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
-            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+      - uses: ./.github/actions/setup-protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
   msrv:
     name: MSRV (1.95.0)
     runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -448,15 +425,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
-        run: |
-          # Prefer an independent mirror and retain the runner mirrors as APT fallbacks.
-          printf '%s\n' \
-            $'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1' \
-            $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:2' \
-            $'https://archive.ubuntu.com/ubuntu/\tpriority:3' \
-            $'https://security.ubuntu.com/ubuntu/\tpriority:4' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+      - uses: ./.github/actions/setup-protoc
       - name: Check MSRV
         run: cargo check --all-targets
+
+  license-headers:
+    name: License headers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Rust files for SPDX headers
+        run: |
+          MISSING=""
+          for f in $(find src tests -name '*.rs'); do
+            if ! head -2 "$f" | grep -q 'SPDX-License-Identifier'; then
+              MISSING="$MISSING $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "Missing SPDX license header in:$MISSING"
+            exit 1
+          fi

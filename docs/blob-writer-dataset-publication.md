@@ -59,7 +59,7 @@ The complete C11 example is `test_blob_writer_publication` in the
 [native transaction consumer](../tests/cpp/test_transaction.c). It finishes the
 raw writer before creating the `DataFile`, then constructs the replacement
 operation and commits through the existing transaction APIs. The
-[C++17 consumer](../tests/cpp/test_transaction.cpp) follows the same workflow.
+[C++20 consumer](../tests/cpp/test_transaction.cpp) follows the same workflow.
 
 `lance_batch_from_arrow` consumes the top-level array, including the prepared
 descriptor child; do not close or release that child again. The top-level
@@ -135,7 +135,7 @@ not manifest writers. Native commit owns fragment-ID assignment, schema
 coverage, conflict handling and manifest publication. The C11 example is
 `test_blob_writer_append` in the
 [native transaction consumer](../tests/cpp/test_transaction.c); the
-[C++17 consumer](../tests/cpp/test_transaction.cpp) implements the same flow.
+[C++20 consumer](../tests/cpp/test_transaction.cpp) implements the same flow.
 
 ### Standalone raw-reader limitation
 

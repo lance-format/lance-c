@@ -601,6 +601,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "std::exception: %s\n", error.what());
         return 1;
     }
-    std::printf("all C++17 fragment mutation publication checks passed\n");
+    std::printf("all C++20 fragment mutation publication checks passed\n");
     return 0;
 }
