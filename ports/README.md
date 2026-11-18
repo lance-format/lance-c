@@ -9,14 +9,16 @@ vcpkg install lance-c --overlay-ports=path/to/lance-c/ports
 ```
 
 The v0.1.9 port downloads prebuilt archives for `x64-linux`, `arm64-linux`,
-and `arm64-osx`. Intel macOS and other supported Linux triples without a
-prebuilt asset can use the `from-source` feature; that path requires a Rust
-toolchain, CMake, and `protoc`. Test both `x64-linux` and `x64-linux-dynamic`
-to cover static and shared installation.
+and `arm64-osx`. The port's `supports` field allows macOS only on `arm64`;
+Intel macOS (`x64-osx`) is not supported and is rejected in both prebuilt and
+`from-source` modes. Other Linux triples without a prebuilt asset can use the
+`from-source` feature; that path requires a Rust toolchain, CMake, and
+`protoc`. Test both `x64-linux` and `x64-linux-dynamic` to cover static and
+shared installation.
 
-The release workflow now builds an `x86_64-apple-darwin` archive for future
-tags. It is not part of the v0.1.9 assets. Add an `x64-osx` mapping and its
-release SHA512 only after that asset is published.
+The release workflow no longer builds an `x86_64-apple-darwin` archive, so no
+`x64-osx` mapping or release SHA512 will be added. The v0.1.9 mappings and
+hashes stay as published.
 
 The `x64-linux` and `x64-linux-dynamic` mappings select the Debian 12 x86_64
 `v0.1.9` archive so the default prebuilt keeps the lower Debian 12 libc floor.

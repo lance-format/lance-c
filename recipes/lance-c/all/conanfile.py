@@ -42,12 +42,16 @@ class LanceCConan(ConanFile):
         return {
             ("Linux", "x86_64"),
             ("Linux", "armv8"),
-            ("Macos", "x86_64"),
             ("Macos", "armv8"),
         }
 
     def validate(self):
         key = (str(self.settings.os), str(self.settings.arch))
+        if key == ("Macos", "x86_64"):
+            raise ConanInvalidConfiguration(
+                "lance-c does not support Macos/x86_64: Intel macOS was "
+                "retired for new releases."
+            )
         if self.options.from_source:
             if key not in self._source_keys:
                 raise ConanInvalidConfiguration(
