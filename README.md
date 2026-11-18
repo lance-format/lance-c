@@ -696,9 +696,13 @@ Installs headers, both linkages, a `LanceCConfig.cmake` package config, and
 a `lance-c.pc` pkg-config file. Consumers then:
 
 ```cmake
-find_package(LanceC 0.1 REQUIRED)
+find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(myapp PRIVATE LanceC::lance_c)
 ```
+
+The unversioned `CONFIG` lookup accepts the package in the selected prefix.
+Add a version only to require a specific release line; `SameMinorVersion`
+compatibility rejects a 0.1 request against a 0.2 package.
 
 See [`examples/cmake-consumer/`](examples/cmake-consumer/) for a minimal
 working example.
@@ -758,7 +762,7 @@ propagate `CMAKE_MSVC_RUNTIME_LIBRARY`, so each consuming target must select it
 from that metadata:
 
 ```cmake
-find_package(LanceC 0.1 REQUIRED)
+find_package(LanceC CONFIG REQUIRED)
 if(WIN32 AND LanceC_STATIC_CRT)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
