@@ -3,7 +3,7 @@
 
 [package]
 name = "lance-c"
-version = "0.1.9"
+version = "0.2.0-beta.1"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -26,25 +26,25 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # transitively via lance-index.
 async-trait = "0.1"
 bytes = "1"
-# Keep every Lance crate on the upstream v15.0.0-beta.20 release commit.
-lance = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["substrait"] }
+# Keep every Lance crate on the upstream v15.0.0-beta.25 release commit.
+lance = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a", features = ["substrait"] }
 # Direct to reuse the native Binary/LargeBinary/BinaryView/FixedSizeBinary iterator.
-lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-core = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-file = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-index = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-io = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-core = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-index = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-io = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-linalg = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
 # Native namespace trait, models, directory/REST implementations and REST adapter.
 # Same upstream pin as every other Lance crate; credential-vendor features stay off.
-lance-namespace = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-namespace-impls = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["rest", "rest-adapter", "dir-goosefs"] }
+lance-namespace = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-namespace-impls = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a", features = ["rest", "rest-adapter", "dir-goosefs"] }
 # Direct to name `NullableIndexExprResult` in the segment-scoped
 # `ScalarIndexLoader` adapter; already in the graph transitively via lance-index.
-lance-select = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-table = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["substrait"] }
+lance-select = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-table = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a", features = ["substrait"] }
 datafusion = { version = "55.0.0", default-features = false }
 arrow = { version = "59.2.0", features = ["prettyprint", "ffi"] }
 arrow-array = "59.2.0"
@@ -75,9 +75,9 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
-lance-file = { git = "https://github.com/lancedb/lance.git", rev = "86fff5f40f299a2ff6abb0c10210451f27e605eb" }
+lance = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "f5dbd55dd79f1f0412f897ed1917128300fb8c1a" }
 geo-types = "0.7.18"
 geoarrow-array = "0.9.0"
 geoarrow-schema = "0.9.0"

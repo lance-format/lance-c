@@ -5,7 +5,7 @@
   "description": "C/C++ bindings for the Lance columnar data format",
   "homepage": "https://github.com/lance-format/lance-c",
   "license": "Apache-2.0",
-  "supports": "(linux | osx) & (x64 | arm64)",
+  "supports": "(linux & (x64 | arm64)) | (osx & arm64)",
   "dependencies": [
     {
       "name": "vcpkg-cmake-config",
