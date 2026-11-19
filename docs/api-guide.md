@@ -98,7 +98,7 @@ A vector query sets `k` on the scanner and can be combined with a SQL filter, pr
 
 ```c
 float query[] = {0.0f, 0.0f};
-LanceScanner* scanner = lance_scanner_new(dataset, NULL, "id >= 3");
+LanceScanner* scanner = lance_scanner_new(dataset, NULL, "id >= 4");
 if (scanner == NULL ||
     lance_scanner_nearest(scanner, "embedding", query, 2,
                           LANCE_DTYPE_FLOAT32, 5) != 0 ||
@@ -111,7 +111,7 @@ if (scanner == NULL ||
 
 ```cpp
 const float query[] = {0.0f, 0.0f};
-auto scanner = dataset.scan();
+auto scanner = dataset.scan(std::nullopt, "id >= 4");
 scanner.nearest("embedding", query, 2, 5)
        .metric(LANCE_METRIC_L2)
        .prefilter(true)
@@ -302,7 +302,7 @@ Expected output on a fresh path:
 ```text
 write: rows=6 version=1
 indices: count=3 version=4
-vector query: 3 4
+vector query: 4 5
 fts query: 1 2 4
 workflow: PASS
 ```

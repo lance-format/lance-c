@@ -33,7 +33,7 @@ The `workflow` target uses public calls present in v0.2.0-beta.1 and prints:
 ```text
 write: rows=6 version=1
 indices: count=3 version=4
-vector query: 3 4
+vector query: 4 5
 fts query: 1 2 4
 workflow: PASS
 ```

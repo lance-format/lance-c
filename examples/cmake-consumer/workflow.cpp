@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -315,7 +316,7 @@ std::vector<int32_t> collect_ids(ArrowArrayStream* stream) {
 
 std::vector<int32_t> vector_query(lance::Dataset& dataset) {
     const float query[] = {0.0f, 0.0f};
-    auto scanner = dataset.scan();
+    auto scanner = dataset.scan(std::nullopt, "id >= 4");
     scanner.nearest("embedding", query, 2, 2)
         .metric(LANCE_METRIC_L2)
         .prefilter(true)
@@ -365,7 +366,7 @@ int main(int argc, char** argv) {
         auto vector_ids = vector_query(dataset);
         print_ids("vector query", vector_ids);
         std::sort(vector_ids.begin(), vector_ids.end());
-        if (vector_ids != std::vector<int32_t>{3, 4}) {
+        if (vector_ids != std::vector<int32_t>{4, 5}) {
             fail("filtered vector query returned unexpected ids");
         }
 
