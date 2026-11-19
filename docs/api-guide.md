@@ -233,20 +233,39 @@ For rotating credentials, wrap a `LanceStorageOptionsProvider` in a `LanceStorag
 
 Set `expires_at_millis` to the credential response's expiry as a decimal string of Unix epoch milliseconds. The pinned native accessor refreshes within `refresh_offset_millis` (default 60 seconds) before that time; an absent or non-numeric `expires_at_millis` means no expiry. Temporary AWS credentials also need `aws_session_token`. Do not substitute a human-readable timestamp or a duration. A provider callback may run on a native worker thread: it must return normally, must not use `lance_last_error_*()`, and reports C failures through `LanceCallbackError`. In C++, throwing `lance::Error` is converted to that callback error.
 
-The C fetch result is borrowed only until `release_snapshot` runs. The callback owns its keys, values, and snapshot storage; the library copies the complete map before releasing it exactly once.
+The C fetch result is borrowed only until `release_snapshot` runs. The callback owns its keys, values, and snapshot storage; the library copies the complete map before releasing it exactly once. The example duplicates the full credential strings and returns a typed callback error if a copy or the epoch-millisecond formatting fails, so it never returns truncated credentials.
 
 ```c
 typedef struct {
-    char access_key_id[128];
-    char secret_access_key[128];
-    char session_token[2048];
-    char expires_at_millis[32];
+    char* access_key_id;
+    char* secret_access_key;
+    char* session_token;
+    char* expires_at_millis;
     const char* keys[4];
     const char* values[4];
 } CredentialSnapshot;
 
+static char* copy_string(const char* value) {
+    size_t length = strlen(value) + 1;
+    char* copy = malloc(length);
+    if (copy != NULL) memcpy(copy, value, length);
+    return copy;
+}
+
 static void release_credential_snapshot(void* context) {
-    free(context);
+    CredentialSnapshot* snapshot = context;
+    free(snapshot->access_key_id);
+    free(snapshot->secret_access_key);
+    free(snapshot->session_token);
+    free(snapshot->expires_at_millis);
+    free(snapshot);
+}
+
+static int32_t callback_io_error(LanceCallbackError* error) {
+    error->code = LANCE_ERR_IO;
+    error->message.data = NULL;
+    error->message.release = NULL;
+    return -1;
 }
 
 /* Return the credential response's real Unix epoch millisecond expiry. */
@@ -256,24 +275,33 @@ static int32_t fetch_storage_options(
     void* context, LanceStorageOptionsFetchResult* out,
     LanceCallbackError* error) {
     (void)context;
-    CredentialSnapshot* snapshot = calloc(1, sizeof(*snapshot));
-    if (snapshot == NULL) {
-        error->code = LANCE_ERR_IO;
-        error->message.data = NULL;
-        error->message.release = NULL;
-        return -1;
+    /* Supply the complete strings from the real credential response. */
+    const char* access_key_id = "<temporary-access-key>";
+    const char* secret_access_key = "<temporary-secret-key>";
+    const char* session_token = "<temporary-session-token>";
+    char expires_at_millis[32];
+
+    int written = snprintf(
+        expires_at_millis, sizeof(expires_at_millis), "%llu",
+        (unsigned long long)temporary_credentials_expire_at_millis());
+    if (written < 0 || (size_t)written >= sizeof(expires_at_millis)) {
+        return callback_io_error(error);
     }
 
-    /* Replace these placeholders and the expiry with the real response. */
-    snprintf(snapshot->access_key_id, sizeof(snapshot->access_key_id),
-             "%s", "<temporary-access-key>");
-    snprintf(snapshot->secret_access_key, sizeof(snapshot->secret_access_key),
-             "%s", "<temporary-secret-key>");
-    snprintf(snapshot->session_token, sizeof(snapshot->session_token),
-             "%s", "<temporary-session-token>");
-    snprintf(snapshot->expires_at_millis,
-             sizeof(snapshot->expires_at_millis), "%llu",
-             (unsigned long long)temporary_credentials_expire_at_millis());
+    CredentialSnapshot* snapshot = calloc(1, sizeof(*snapshot));
+    if (snapshot == NULL) return callback_io_error(error);
+
+    snapshot->access_key_id = copy_string(access_key_id);
+    snapshot->secret_access_key = copy_string(secret_access_key);
+    snapshot->session_token = copy_string(session_token);
+    snapshot->expires_at_millis = copy_string(expires_at_millis);
+    if (snapshot->access_key_id == NULL ||
+        snapshot->secret_access_key == NULL ||
+        snapshot->session_token == NULL ||
+        snapshot->expires_at_millis == NULL) {
+        release_credential_snapshot(snapshot);
+        return callback_io_error(error);
+    }
 
     snapshot->keys[0] = "aws_access_key_id";
     snapshot->keys[1] = "aws_secret_access_key";
