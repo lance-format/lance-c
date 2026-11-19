@@ -33,12 +33,16 @@ extern "C" {
    early because dataset open and write options attach it. */
 typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 
-/* ─── Arrow C Data Interface forward declarations ─── */
-/* These match the canonical Arrow spec structs. If you already include
-   arrow/c/abi.h, guard with ARROW_C_DATA_INTERFACE. */
+/* ─── Arrow C Data and C Stream Interfaces ─── */
+/* Canonical Arrow declarations with independent guards for interoperability
+   with arrow/c/abi.h and other implementations of these interfaces. */
 
 #ifndef ARROW_C_DATA_INTERFACE
 #define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
 
 struct ArrowSchema {
     const char* format;
@@ -65,6 +69,11 @@ struct ArrowArray {
     void* private_data;
 };
 
+#endif /* ARROW_C_DATA_INTERFACE */
+
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
 struct ArrowArrayStream {
     int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
     int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
@@ -73,7 +82,7 @@ struct ArrowArrayStream {
     void* private_data;
 };
 
-#endif /* ARROW_C_DATA_INTERFACE */
+#endif /* ARROW_C_STREAM_INTERFACE */
 
 /* ─── Error handling ─── */
 

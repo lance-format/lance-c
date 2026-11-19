@@ -2181,3 +2181,42 @@ fn test_commit_lock_native_compilation_and_execution() {
 fn test_public_c_abi_layout_matches_rust() {
     abi_layout::assert_public_abi();
 }
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_arrow_header_interop"]
+fn test_arrow_header_interop() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = manifest_dir.join("tests/cpp/test_arrow_header_interop.c");
+    for (compiler, language, standard, cpp_header) in [
+        ("clang", "c", "c11", false),
+        ("c++", "c++", "c++20", false),
+        ("c++", "c++", "c++20", true),
+    ] {
+        for order in 0..=2 {
+            let mut command = Command::new(compiler);
+            command
+                .args([
+                    "-x",
+                    language,
+                    "-fsyntax-only",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(format!("-std={standard}"))
+                .arg(format!("-DARROW_INCLUDE_ORDER={order}"))
+                .arg("-I")
+                .arg(manifest_dir.join("include"))
+                .arg(&source);
+            if cpp_header {
+                command.arg("-DTEST_LANCE_CPP_HEADER");
+            }
+            let output = command.output().expect("C/C++ compiler is required");
+            assert!(
+                output.status.success(),
+                "{language} header compilation failed (cpp_header={cpp_header}, order={order}):\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
