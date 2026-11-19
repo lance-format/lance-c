@@ -19,6 +19,45 @@
         }                                                                        \
     } while (0)
 
+namespace {
+
+struct ArrowBatchExport {
+    ArrowArray array{};
+    ArrowSchema schema{};
+
+    ~ArrowBatchExport() {
+        if (array.release) array.release(&array);
+        if (schema.release) schema.release(&schema);
+    }
+};
+
+lance::Batch first_dataset_batch(lance::Dataset& dataset) {
+    auto scanner = dataset.scan();
+    ArrowArrayStream raw_stream{};
+    scanner.to_arrow_stream(&raw_stream);
+    lance::ArrowStream stream(raw_stream);
+    lance::ArrowSchemaOwner schema;
+    CHECK(stream->get_schema(stream.get(), schema.get()) == 0);
+    ArrowArray array{};
+    CHECK(stream->get_next(stream.get(), &array) == 0);
+    CHECK(array.release != nullptr);
+    return lance::Batch::from_arrow(&array, schema.get());
+}
+
+void check_sharding_batch(const lance::Batch& batch, int64_t expected_rows) {
+    ArrowBatchExport exported{};
+    batch.to_arrow(&exported.array, &exported.schema);
+    CHECK(exported.schema.n_children == 1);
+    CHECK(exported.schema.children != nullptr);
+    CHECK(std::string(exported.schema.children[0]->name) == "bucket");
+    CHECK(std::string(exported.schema.children[0]->format) == "i");
+    CHECK(exported.array.length == expected_rows);
+    CHECK(exported.array.n_children == 1);
+    CHECK(exported.array.children[0]->length == expected_rows);
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     const std::string uri = argv[1];
@@ -42,6 +81,16 @@ int main(int argc, char** argv) {
     CHECK(details->sharding_specs()[0].field_at(0).transform() ==
           std::optional<std::string>("unsharded"));
     CHECK(!details->writer_config_defaults().empty());
+
+    // Evaluate the native unsharded sharding spec against both schema sources.
+    auto sharding_specs = details->sharding_specs();
+    auto source_batch = first_dataset_batch(dataset);
+    const int64_t source_rows = static_cast<int64_t>(dataset.count_rows());
+    auto evaluated = sharding_specs[0].evaluate(dataset, source_batch);
+    check_sharding_batch(evaluated, source_rows);
+    auto evaluated_with_schema =
+        sharding_specs[0].evaluate(source_batch, dataset.native_schema());
+    check_sharding_batch(evaluated_with_schema, source_rows);
 
     // Writer mutation, live scanner visibility, stats, and idempotent close.
     lance::ShardWriterConfig config;

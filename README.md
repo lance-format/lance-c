@@ -8,13 +8,12 @@ The maintained release line is **0.2.x**. The current [v0.2.0-beta.1 release](ht
 
 ## Quickstart
 
-On Linux x86_64, use a C++20 compiler and CMake 3.22+ to open a dataset with the prebuilt library. The release archive supplies the compiled library. The source archive supplies the matching example and sample data. You can run this from outside the repository without a Rust toolchain.
+On Linux x86_64, use a C++20 compiler and CMake 3.22+ to open a dataset with the prebuilt library. The release archive supplies the compiled library. A shallow checkout of `main` supplies the standalone example and sample dataset; copy the example out before building. You can run this without a Rust toolchain.
 
 ```bash
 mkdir lance-c-quickstart && cd lance-c-quickstart
 
 TAG=v0.2.0-beta.1
-VERSION=${TAG#v}
 ARCHIVE=lance-c-$TAG-x86_64-unknown-linux-gnu.tar.xz
 
 curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/$ARCHIVE"
@@ -23,14 +22,15 @@ sha512sum --ignore-missing -c SHA512SUMS
 mkdir install
 tar -xJf "$ARCHIVE" -C install
 
-curl -fL -o "lance-c-$TAG-source.tar.gz" \
-  "https://github.com/lance-format/lance-c/archive/refs/tags/$TAG.tar.gz"
-tar -xzf "lance-c-$TAG-source.tar.gz"
+# v0.2.0-beta.1 predates the standalone consumer fix, so take the example
+# from main. The package version and C++ API are unchanged.
+git clone --depth 1 https://github.com/lance-format/lance-c.git source
+cp -R source/examples/cmake-consumer consumer
 
-cmake -S "lance-c-$VERSION/examples/cmake-consumer" -B build \
+cmake -S consumer -B build \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
 cmake --build build --target consumer
-./build/consumer "lance-c-$VERSION/test_data/v0.27.1/pq_in_schema"
+./build/consumer "source/test_data/v0.27.1/pq_in_schema"
 ```
 
 Expected output:
@@ -39,7 +39,7 @@ Expected output:
 rows: 512, version: 2
 ```
 
-For other platforms, see the [release archives and platform requirements](docs/building-and-packaging.md#published-prebuilt-archives). Pair the library with examples from the same tag.
+The `consumer` directory has no dependency on the checkout layout and also runs against any other Lance dataset. For other platforms, see the [release archives and platform requirements](docs/building-and-packaging.md#published-prebuilt-archives). Pair the library with examples whose API matches its release.
 
 ## Add Lance to a project
 
@@ -51,6 +51,15 @@ target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
 CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to use the shared library. On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules).
+
+With pkg-config, point `PKG_CONFIG_PATH` at the archive's `lib/pkgconfig`:
+
+```bash
+export PKG_CONFIG_PATH=/path/to/lance-c-install/lib/pkgconfig
+cc my_app.c $(pkg-config --cflags --libs lance-c) -o my_app
+```
+
+Add `--static` and link `liblance_c.a` explicitly when using the static archive; see [pkg-config usage](docs/building-and-packaging.md#using-pkg-config).
 
 - **C++** — Include [lance/lance.hpp](include/lance/lance.hpp). Open a dataset with `lance::Dataset::open(uri)`, call `count_rows()` or create a scanner with `scan()`. Handles own their resources and failures throw `lance::Error`. The [CMake consumer](examples/cmake-consumer/main.cpp) is a complete program.
 - **C** — Include [lance/lance.h](include/lance/lance.h). The [C11 scan example](examples/c-scan/) opens a dataset, iterates all Arrow batches, prints errors, and releases the batches, stream, and Lance handles. Set `LANCE_C_PREFIX` to the unpacked archive when building it with Make.

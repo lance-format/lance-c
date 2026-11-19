@@ -4038,9 +4038,13 @@ static void test_compact_files(const std::string& dst_uri) {
         .set_transaction_properties(std::nullopt);
 
     auto from_dataset = lance::CompactionOptions::from_dataset(ds);
+    auto cloned_from_dataset = from_dataset.clone();
+    auto cloned_options = options.clone();
     auto plan = ds.plan_compaction(&options);
+    auto cloned_plan = ds.plan_compaction(&cloned_options);
     assert(plan.read_version() == v_before);
     assert(plan.num_tasks() == 0);
+    assert(cloned_plan.json() == plan.json());
     auto plan_options = plan.options();
     (void)plan_options;
     auto plan_json = plan.json();
@@ -4049,7 +4053,7 @@ static void test_compact_files(const std::string& dst_uri) {
     auto moved_plan = std::move(decoded_plan);
     assert(moved_plan.num_tasks() == 0);
 
-    auto v2_metrics = ds.compact_files_with_options(&from_dataset);
+    auto v2_metrics = ds.compact_files_with_options(&cloned_from_dataset);
     assert(v2_metrics.fragments_removed == 0);
     assert(v2_metrics.fragments_added == 0);
     assert(ds.version() == v_before);
@@ -4062,8 +4066,13 @@ static void test_compact_files(const std::string& dst_uri) {
         .set_transaction_properties(std::nullopt)
         .set_max_rows_per_task(std::nullopt)
         .set_max_rows_per_segment(std::nullopt);
+    auto cloned_index_options = index_options.clone();
     auto index_plan = ds.plan_optimize_indices(&index_options);
+    auto cloned_index_plan =
+        ds.plan_optimize_indices(&cloned_index_options);
     assert(index_plan.num_tasks() == 0);
+    assert(cloned_index_plan.num_tasks() == index_plan.num_tasks());
+    assert(cloned_index_plan.num_merges() == index_plan.num_merges());
     auto index_plan_json = index_plan.json();
     auto decoded_index_plan =
         lance::OptimizeIndicesPlan::from_json(index_plan_json);

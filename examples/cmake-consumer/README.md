@@ -7,6 +7,12 @@ The example builds two executables:
   release callback counts, consumes a thread-local error message, and uses an
   independent cloned dataset handle. Pass a writable `file://` URI.
 
+This directory is standalone. Inside the lance-c source tree it reads
+`Cargo.toml` and requests the package version built from that tree. Once copied
+elsewhere, it calls `find_package(LanceC CONFIG REQUIRED)` without a version and
+accepts the package in `CMAKE_PREFIX_PATH`; the repository layout is not
+required.
+
 ## Build
 
 After unpacking the [0.2.x release archive](../../README.md#quickstart), use its install prefix:

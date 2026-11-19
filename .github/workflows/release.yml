@@ -76,9 +76,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           manylinux-install-clang -v 20.1.8.0
+      - name: Ensure pkg-config (Linux)
+        if: runner.os == 'Linux'
+        run: command -v pkg-config >/dev/null || dnf install -y pkgconf-pkg-config
       - name: Install protobuf (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: brew install protobuf pkgconf
       - name: Record macOS host and toolchain
         if: runner.os == 'macOS'
         run: |

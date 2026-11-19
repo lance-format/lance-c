@@ -12,12 +12,15 @@
 #     2. Stage <cargo-profile-dir>/liblance_c.* via LANCE_C_USE_PREBUILT=ON and
 #        run `cmake --install` into a clean prefix.
 #     3. Verify macOS Mach-O architectures when running on Darwin.
-#     4. Build and run `examples/cmake-consumer` against the installed prefix
-#        with both static and shared linkage.
+#     4. Build and run `examples/cmake-consumer` from the source tree and from a
+#        copied-out directory against the installed prefix, with both static
+#        and shared linkage.
+#     5. Build and run `examples/c-scan` through pkg-config with both dynamic and
+#        static linkage.
 #
 #   verify-cmake-consumer.sh --from-install-prefix <install-prefix>
-#     Build and run `examples/cmake-consumer` against an already-installed
-#     prefix (e.g. `stage` in release.yml) with both static and shared linkage.
+#     Build and run the same consumers against an already-installed prefix
+#     (e.g. `stage` in release.yml).
 
 set -euo pipefail
 
@@ -57,9 +60,88 @@ verify_corrosion_macos_linker() {
     printf '%s\n' "$linker_env"
 }
 
+pkg_config_command() {
+    if command -v pkg-config >/dev/null 2>&1; then
+        echo pkg-config
+    elif command -v pkgconf >/dev/null 2>&1; then
+        echo pkgconf
+    else
+        echo "pkg-config or pkgconf is required for installed-package verification" >&2
+        return 1
+    fi
+}
+
+verify_pkg_config_consumer() {
+    local install_prefix=$1
+    local pc_dir="$install_prefix/lib/pkgconfig"
+    local dataset_uri="$repo_root/test_data/v0.27.1/pq_in_schema"
+    local expected_dataset_output="rows: 512, version: 2"
+    local cc=${CC:-cc}
+    local pkg_config
+    pkg_config=$(pkg_config_command)
+
+    echo "==> Verifying pkg-config and C scan consumer"
+    local pkg_config_path="$pc_dir"
+    if [ -n "${PKG_CONFIG_PATH:-}" ]; then
+        pkg_config_path="$pkg_config_path:$PKG_CONFIG_PATH"
+    fi
+
+    local cflags libs
+    cflags=$(PKG_CONFIG_PATH="$pkg_config_path" "$pkg_config" --cflags lance-c)
+    libs=$(PKG_CONFIG_PATH="$pkg_config_path" "$pkg_config" --cflags --libs lance-c)
+    printf 'pkg-config cflags: %s\n' "$cflags"
+    printf 'pkg-config libs:   %s\n' "$libs"
+    if [[ " $libs " != *" -llance_c "* ]]; then
+        echo "pkg-config libs do not link lance_c: $libs" >&2
+        exit 1
+    fi
+
+    local consumer_dir="$work_dir/pkg-config-consumer"
+    mkdir -p "$consumer_dir"
+
+    # shellcheck disable=SC2086 # pkg-config output is a list of linker flags.
+    "$cc" -std=c11 -O2 $cflags "$repo_root/examples/c-scan/main.c" $libs \
+        -Wl,-rpath,"$install_prefix/lib" \
+        -o "$consumer_dir/lance-c-scan-shared"
+
+    local dataset_output
+    dataset_output=$("$consumer_dir/lance-c-scan-shared" "$dataset_uri")
+    if [ "$dataset_output" != "$expected_dataset_output" ]; then
+        echo "pkg-config dynamic C consumer returned unexpected output:" >&2
+        printf '  expected: %s\n  actual:   %s\n' \
+            "$expected_dataset_output" "$dataset_output" >&2
+        exit 1
+    fi
+    printf 'Verified pkg-config dynamic C consumer dataset read: %s\n' \
+        "$dataset_output"
+
+    local static_libs static_link_flags
+    static_libs=$(PKG_CONFIG_PATH="$pkg_config_path" "$pkg_config" \
+        --static --libs-only-l lance-c)
+    static_link_flags=$(PKG_CONFIG_PATH="$pkg_config_path" "$pkg_config" \
+        --static --libs-only-other lance-c)
+    static_libs=${static_libs//-llance_c/}
+
+    # Link the static archive explicitly and take the system libraries from
+    # pkg-config's Libs.private.
+    # shellcheck disable=SC2086 # pkg-config output is a list of linker flags.
+    "$cc" -std=c11 -O2 $cflags "$repo_root/examples/c-scan/main.c" \
+        "$install_prefix/lib/liblance_c.a" $static_libs $static_link_flags \
+        -o "$consumer_dir/lance-c-scan-static"
+
+    dataset_output=$("$consumer_dir/lance-c-scan-static" "$dataset_uri")
+    if [ "$dataset_output" != "$expected_dataset_output" ]; then
+        echo "pkg-config static C consumer returned unexpected output:" >&2
+        printf '  expected: %s\n  actual:   %s\n' \
+            "$expected_dataset_output" "$dataset_output" >&2
+        exit 1
+    fi
+    printf 'Verified pkg-config static C consumer dataset read: %s\n' \
+        "$dataset_output"
+}
+
 verify_consumer_prefix() {
     local install_prefix=$1
-
     echo "==> Verifying installed artifacts in $install_prefix"
     case "$(uname -s)" in
         Darwin)
@@ -98,51 +180,70 @@ verify_consumer_prefix() {
         fi
     done
 
+    echo "==> Verifying installed package metadata"
+    cmake "-DPREFIX=$install_prefix" "-DPLATFORM=$(uname -s)" \
+        -P "$repo_root/cmake/verify_installed_metadata.cmake"
+
+    verify_pkg_config_consumer "$install_prefix"
+
     local dataset_uri="$repo_root/test_data/v0.27.1/pq_in_schema"
     local expected_dataset_output="rows: 512, version: 2"
 
-    for linkage in static shared; do
-        local build_dir="$work_dir/consumer-${linkage}"
-        echo "==> Testing find_package(LanceC) consumer (${linkage} linkage)"
-        cmake -S "$repo_root/examples/cmake-consumer" -B "$build_dir" \
-            -DCMAKE_PREFIX_PATH="$install_prefix" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLanceC_LINK="$linkage"
-        cmake --build "$build_dir" --parallel
-
-        set +e
-        "$build_dir/consumer"
-        local rc=$?
-        set -e
-        if [ "$rc" -ne 2 ]; then
-            echo "Expected exit code 2 (usage error) for ${linkage} consumer, got $rc" >&2
-            exit 1
+    for source_layout in source standalone; do
+        local consumer_source="$repo_root/examples/cmake-consumer"
+        if [ "$source_layout" = standalone ]; then
+            consumer_source="$work_dir/standalone-consumer"
+            rm -rf "$consumer_source"
+            cp -R "$repo_root/examples/cmake-consumer" "$consumer_source"
         fi
 
-        set +e
-        local dataset_output
-        dataset_output=$("$build_dir/consumer" "$dataset_uri" 2>&1)
-        rc=$?
-        set -e
-        if [ "$rc" -ne 0 ]; then
-            echo "${linkage} consumer failed to read $dataset_uri (exit $rc):" >&2
-            printf '%s\n' "$dataset_output" >&2
-            exit 1
-        fi
-        if [ "$dataset_output" != "$expected_dataset_output" ]; then
-            echo "${linkage} consumer returned unexpected dataset output:" >&2
-            printf '  expected: %s\n  actual:   %s\n' \
-                "$expected_dataset_output" "$dataset_output" >&2
-            exit 1
-        fi
-        printf 'Verified %s consumer dataset read: %s\n' "$linkage" "$dataset_output"
+        for linkage in static shared; do
+            local build_dir="$work_dir/consumer-${source_layout}-${linkage}"
+            echo "==> Testing find_package(LanceC) ${source_layout} consumer (${linkage} linkage)"
+            cmake -S "$consumer_source" -B "$build_dir" \
+                -DCMAKE_PREFIX_PATH="$install_prefix" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DLanceC_LINK="$linkage"
+            cmake --build "$build_dir" --parallel
 
-        echo "==> Running installed acceptance consumer (${linkage} linkage)"
-        acceptance_uri="file://${work_dir}/acceptance-${linkage}.lance"
-        rm -rf "${work_dir}/acceptance-${linkage}.lance"
-        "$build_dir/acceptance" "$acceptance_uri"
+            set +e
+            "$build_dir/consumer"
+            local rc=$?
+            set -e
+            if [ "$rc" -ne 2 ]; then
+                echo "Expected exit code 2 (usage error) for ${source_layout} ${linkage} consumer, got $rc" >&2
+                exit 1
+            fi
+
+            set +e
+            local dataset_output
+            dataset_output=$("$build_dir/consumer" "$dataset_uri" 2>&1)
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+                echo "${source_layout} ${linkage} consumer failed to read $dataset_uri (exit $rc):" >&2
+                printf '%s\n' "$dataset_output" >&2
+                exit 1
+            fi
+            if [ "$dataset_output" != "$expected_dataset_output" ]; then
+                echo "${source_layout} ${linkage} consumer returned unexpected dataset output:" >&2
+                printf '  expected: %s\n  actual:   %s\n' \
+                    "$expected_dataset_output" "$dataset_output" >&2
+                exit 1
+            fi
+            printf 'Verified %s %s consumer dataset read: %s\n' \
+                "$source_layout" "$linkage" "$dataset_output"
+
+            echo "==> Running installed acceptance consumer (${source_layout} ${linkage} linkage)"
+            acceptance_uri="file://${work_dir}/acceptance-${source_layout}-${linkage}.lance"
+            rm -rf "${work_dir}/acceptance-${source_layout}-${linkage}.lance"
+            "$build_dir/acceptance" "$acceptance_uri"
+        done
     done
 }
+
+echo "==> Verifying platform dependency metadata"
+cmake -P "$repo_root/cmake/test_package_metadata.cmake"
 
 case "$mode" in
     --from-target-dir)
