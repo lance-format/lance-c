@@ -9,8 +9,8 @@ set(LANCE_C_TRIPLE_arm64-linux-dynamic "aarch64-unknown-linux-gnu")
 set(LANCE_C_TRIPLE_arm64-osx           "aarch64-apple-darwin")
 set(LANCE_C_TRIPLE_arm64-osx-dynamic   "aarch64-apple-darwin")
 
-# SHA512s of each prebuilt tarball. Updated by the release script after
-# .github/workflows/release.yml publishes a tag.
+# SHA512s of the published v0.1.9 prebuilt tarballs. This portfile is retained
+# as a historical 0.1.x recipe and is not updated by new releases.
 set(LANCE_C_SHA512_x86_64-unknown-linux-gnu-debian12 "5aba369dd70b244d905298eacac93a3f5ddaed4b3df43e6a9fe0184303f1ce06f60794da6ea6288f15ade20f29120a8683bc1fbfdcef65b06f1e1e7944493595")
 set(LANCE_C_SHA512_aarch64-unknown-linux-gnu         "0a8c91a07ca82a15a635a2110cd70ed85bc3eaf4009284a8509395f9da4ef9fa85510f68cddec466a3609b22c5c2c56c0e4e004279dbd8d074d2c61097f30ee9")
 set(LANCE_C_SHA512_aarch64-apple-darwin              "488463b062e25a100b56837613b37efd332e031a82a669eb2a882435d72d11e72dd3c966f9e53ca7197845126cecf2a64be722086f45f83deb2d8171a19d542b")

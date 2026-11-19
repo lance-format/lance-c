@@ -208,6 +208,5 @@ jobs:
               echo "### Next Steps:"
               echo "1. Watch the [Release workflow](https://github.com/${{ github.repository }}/actions/workflows/release.yml) finish (~20 min)."
               echo "2. Verify the published assets at the [release page](https://github.com/${{ github.repository }}/releases/tag/${{ steps.versions.outputs.tag }})."
-              echo "3. Copy the SHA512 snippet from the publish job log into vcpkg/conan recipes."
             } >>"$GITHUB_STEP_SUMMARY"
           fi
