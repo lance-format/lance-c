@@ -668,8 +668,9 @@ defines the complete contract; the main cases are:
 - `LanceDataset` handles are shareable. Snapshot reads and in-place mutations
   may overlap; mutations serialize on the handle's internal write lock for the
   whole native call, and readers that already hold a snapshot keep their old
-  view. `restore` and `checkout_*` commit from a snapshot and follow native
-  commit-conflict rules instead of the source handle's write lock.
+  view. `restore` and `checkout_*` work from a snapshot and return a new
+  handle instead of taking the source handle's write lock; restore still
+  follows native commit-conflict rules.
 - `LanceSession` inspection calls may run concurrently, and one session may
   back concurrent opens. Cache statistics are current values, not one atomic
   snapshot across the index and metadata caches.

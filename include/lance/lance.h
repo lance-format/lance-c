@@ -605,10 +605,10 @@ int32_t lance_session_get_approx_num_items(
  * overlap each other and may overlap in-place mutations. In-place mutations
  * take the handle's internal write lock for the complete native call, including
  * synchronous callbacks, so they serialize; a reader that already holds a
- * snapshot keeps its old view. Snapshot-style commits such as restore and
- * checkout_* do not mutate the source handle and are not serialized by its
- * lock; native commit-conflict rules still apply. lance_dataset_close is
- * exclusive.
+ * snapshot keeps its old view. Snapshot-style operations such as restore and
+ * checkout_* work from a snapshot and return a new handle; they do not mutate
+ * the source handle and are not serialized by its lock. Restore still follows
+ * native commit-conflict rules. lance_dataset_close is exclusive.
  */
 
 /**
