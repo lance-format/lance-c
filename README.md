@@ -2,18 +2,18 @@
 
 Read, write, and search [Lance](https://lance.org/) datasets from C or C++. The library exposes a C ABI and header-only C++ RAII wrappers. Scans and writes exchange Arrow batches through the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html).
 
-The maintained release line is **0.2.x**. The current [v0.2.0-beta.1 release](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1) uses Lance 15.0.0-beta.25. Prebuilt packages support Linux x86_64 and arm64 (glibc 2.28+), macOS arm64, and Windows x64 and ARM64. The C++ wrapper requires C++20.
+The maintained release line is **0.2.x**. The current [v0.2.0 release](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) uses Lance 15.0.0-beta.25 (`f5dbd55d`); a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Prebuilt packages support Linux x86_64 and AArch64 (glibc 2.28+), macOS arm64, and Windows x64 and ARM64 with the static `/MT` CRT. The C API requires C11; the C++ wrapper requires C++20.
 
-<a id="preview-quickstart-v020-beta1"></a>
+<a id="quickstart"></a>
 
 ## Quickstart
 
-On Linux x86_64, use a C++20 compiler and CMake 3.22+ to open a dataset with the prebuilt library. The release archive supplies the compiled library. A shallow checkout of `main` supplies the standalone example and sample dataset; copy the example out before building. You can run this without a Rust toolchain.
+On Linux x86_64, use a C++20 compiler and CMake 3.22+ to build this C++ consumer against the prebuilt library. The release archive supplies the compiled library; the C API itself requires C11. A shallow checkout of the same release tag supplies the standalone example and sample dataset; copy the example out before building. You can run this without a Rust toolchain.
 
 ```bash
 mkdir lance-c-quickstart && cd lance-c-quickstart
 
-TAG=v0.2.0-beta.1
+TAG=v0.2.0
 ARCHIVE=lance-c-$TAG-x86_64-unknown-linux-gnu.tar.xz
 
 curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/$ARCHIVE"
@@ -22,9 +22,7 @@ sha512sum --ignore-missing -c SHA512SUMS
 mkdir install
 tar -xJf "$ARCHIVE" -C install
 
-# v0.2.0-beta.1 predates the standalone consumer fix, so take the example
-# from main. The package version and C++ API are unchanged.
-git clone --depth 1 https://github.com/lance-format/lance-c.git source
+git clone --depth 1 --branch "$TAG" https://github.com/lance-format/lance-c.git source
 cp -R source/examples/cmake-consumer consumer
 
 cmake -S consumer -B build \

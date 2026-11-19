@@ -34,9 +34,9 @@
 #define LANCE_C_VERSION_MINOR 2
 #define LANCE_C_VERSION_PATCH 0
 /* Pre-release suffix without the leading '-'; empty for a stable release. */
-#define LANCE_C_VERSION_PRE "beta.1"
+#define LANCE_C_VERSION_PRE ""
 /* Full Cargo package version, including any pre-release or build suffix. */
-#define LANCE_C_VERSION_STRING "0.2.0-beta.1"
+#define LANCE_C_VERSION_STRING "0.2.0"
 #define LANCE_C_VERSION_ENCODE(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
 /* Numeric form for #if comparisons. The pre-release suffix is not encoded, so
