@@ -176,6 +176,12 @@ struct BatchHolder {
 
 void release_batch(ArrowArray* array) {
     auto* holder = static_cast<BatchHolder*>(array->private_data);
+    // The unconsumed root lives inside `holder`. Clear the caller-visible slot
+    // before deleting the owner so early stream cleanup cannot write into the
+    // freed holder. A successfully transferred root uses the same callback
+    // through a caller-owned ArrowArray outside the holder.
+    array->release = nullptr;
+    array->private_data = nullptr;
     if (holder != nullptr) {
         for (ArrowArray* child : holder->children) {
             if (child->release != nullptr) child->release(child);
@@ -183,8 +189,6 @@ void release_batch(ArrowArray* array) {
         if (holder->item.release != nullptr) holder->item.release(&holder->item);
         delete holder;
     }
-    array->release = nullptr;
-    array->private_data = nullptr;
 }
 
 struct StreamState {
@@ -227,7 +231,7 @@ void stream_release(ArrowArrayStream* stream) {
 
 // ─── Workflow helpers ───────────────────────────────────────────────────────
 
-void write_dataset(const std::string& uri) {
+ArrowArrayStream make_input_stream() {
     auto* state = new StreamState;
     state->batch = new BatchHolder;
 
@@ -237,6 +241,22 @@ void write_dataset(const std::string& uri) {
     input.get_last_error = stream_last_error;
     input.release = stream_release;
     input.private_data = state;
+    return input;
+}
+
+void verify_early_stream_release() {
+    ArrowArrayStream input = make_input_stream();
+    if (input.release == nullptr) fail("input stream has no release callback");
+    // Release without calling get_next: the root is still stored inside the
+    // batch owner, so this exercises the early-cleanup path.
+    input.release(&input);
+    if (input.release != nullptr || input.private_data != nullptr) {
+        fail("input stream release did not clear the stream");
+    }
+}
+
+void write_dataset(const std::string& uri) {
+    ArrowArrayStream input = make_input_stream();
 
     // Dataset::write consumes `input` on every return path, including errors.
     auto dataset = lance::Dataset::write(uri, &input, lance::WriteMode::Create);
@@ -356,6 +376,7 @@ int main(int argc, char** argv) {
     try {
         const std::string uri = argv[1];
         write_dataset(uri);
+        verify_early_stream_release();
 
         {
             auto dataset = lance::Dataset::open(uri);
