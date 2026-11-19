@@ -19,9 +19,28 @@ Build against an installed package whose prefix contains `include/` and `lib/`:
 
 ```bash
 make -C examples/c-scan LANCE_C_PREFIX=/path/to/lance-c-install
-LD_LIBRARY_PATH=/path/to/lance-c-install/lib \
-  ./examples/c-scan/build/lance-c-scan test_data/v0.27.1/pq_in_schema
+./examples/c-scan/build/lance-c-scan test_data/v0.27.1/pq_in_schema
 ```
+
+The Makefile adds the prefix's `lib` directory to the runtime search path, so
+the example runs without a loader variable. If the prefix moves after the
+build, set `LD_LIBRARY_PATH` on Linux or `DYLD_LIBRARY_PATH` on macOS to the new
+`lib` directory.
+
+With pkg-config, the same programs can be built without `LANCE_C_PREFIX`:
+
+```bash
+export PKG_CONFIG_PATH=/path/to/lance-c-install/lib/pkgconfig
+cc -std=c11 -O2 -Wall -Wextra -Wpedantic main.c \
+  $(pkg-config --cflags --libs lance-c) \
+  -Wl,-rpath,"/path/to/lance-c-install/lib" \
+  -o build/lance-c-scan
+./build/lance-c-scan test_data/v0.27.1/pq_in_schema
+```
+
+For a static link, add `--static` to `pkg-config` and name
+`/path/to/lance-c-install/lib/liblance_c.a` instead of `-llance_c`; the system
+libraries in `Libs.private` are then included.
 
 Expected output:
 

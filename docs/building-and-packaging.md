@@ -99,6 +99,17 @@ target_link_libraries(myapp PRIVATE LanceC::lance_c)
 
 An unversioned `find_package(LanceC CONFIG REQUIRED)` accepts the package in the selected prefix. Pass a version number only to require a specific minor release line; `SameMinorVersion` compatibility rejects a `0.1` request against a `0.2` package.
 
+### Using pkg-config
+
+The install prefix also contains `lib/pkgconfig/lance-c.pc`. Point `pkg-config` at that directory and use the flags directly:
+
+```bash
+export PKG_CONFIG_PATH=/your/prefix/lib/pkgconfig
+cc myapp.c $(pkg-config --cflags --libs lance-c) -o myapp
+```
+
+`pkg-config --static` adds the platform system libraries recorded in `Libs.private`. The linker still prefers the shared library when both are installed; name `liblance_c.a` explicitly or use your linker's static-library option. On Windows the `.pc` records the same system libraries as `LanceCConfig.cmake`, but MSVC consumers normally use the CMake package.
+
 <a id="windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc"></a>
 ## Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)
 

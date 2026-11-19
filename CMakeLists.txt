@@ -6,6 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(cargo-version)
 include(baseline)
+include(platform-deps)
 read_cargo_version("${CMAKE_CURRENT_LIST_DIR}/Cargo.toml" LANCE_C_VERSION)
 
 lance_c_load_baseline_env("${CMAKE_CURRENT_LIST_DIR}/.github/baseline.env")
@@ -170,20 +171,12 @@ else()
 endif()
 
 # Platform link requirements declared once. INTERFACE library so we can attach
-# it to multiple consumer targets without duplication.
+# it to multiple consumer targets without duplication. The same list is
+# installed in LanceCConfig.cmake and formatted into lance-c.pc below.
+lance_c_platform_dependencies(LANCE_C_PLATFORM_DEPS "${CMAKE_SYSTEM_NAME}")
+lance_c_pkg_config_private_libs(LANCE_C_PC_LIBS_PRIVATE "${CMAKE_SYSTEM_NAME}")
 add_library(LanceC_platform_deps INTERFACE)
-if(APPLE)
-    target_link_libraries(LanceC_platform_deps INTERFACE
-        "-framework CoreFoundation"
-        "-framework IOKit"
-        "-framework Security"
-        "-framework SystemConfiguration")
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(LanceC_platform_deps INTERFACE pthread dl m)
-elseif(WIN32)
-    target_link_libraries(LanceC_platform_deps INTERFACE
-        advapi32 bcrypt dbghelp kernel32 mswsock ntdll ole32 userenv ws2_32)
-endif()
+target_link_libraries(LanceC_platform_deps INTERFACE ${LANCE_C_PLATFORM_DEPS})
 
 # Public namespaced targets for build-tree (add_subdirectory) consumers.
 # IMPORTED INTERFACE libraries because they aggregate other libs + flags but
@@ -293,15 +286,8 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LanceC)
 
 # ─── pkg-config ──────────────────────────────────────────────────────────────
-if(APPLE)
-    set(LANCE_C_PC_LIBS_PRIVATE
-        "-framework CoreFoundation -framework IOKit -framework Security -framework SystemConfiguration")
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(LANCE_C_PC_LIBS_PRIVATE "-lpthread -ldl -lm")
-else()
-    set(LANCE_C_PC_LIBS_PRIVATE "")
-endif()
-
+# LANCE_C_PC_LIBS_PRIVATE comes from cmake/platform-deps.cmake, the same list
+# used by LanceC_platform_deps and the installed CMake package.
 configure_file(
     "${CMAKE_CURRENT_LIST_DIR}/cmake/lance-c.pc.in"
     "${CMAKE_CURRENT_BINARY_DIR}/lance-c.pc"
