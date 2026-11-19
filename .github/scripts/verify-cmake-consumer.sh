@@ -14,7 +14,7 @@
 #     3. Verify macOS Mach-O architectures when running on Darwin.
 #     4. Build and run `examples/cmake-consumer` from the source tree and from a
 #        copied-out directory against the installed prefix, with both static
-#        and shared linkage.
+#        and shared linkage. This includes the write/index/query workflow.
 #     5. Build and run `examples/c-scan` through pkg-config with both dynamic and
 #        static linkage.
 #
@@ -238,6 +238,11 @@ verify_consumer_prefix() {
             acceptance_uri="file://${work_dir}/acceptance-${source_layout}-${linkage}.lance"
             rm -rf "${work_dir}/acceptance-${source_layout}-${linkage}.lance"
             "$build_dir/acceptance" "$acceptance_uri"
+
+            echo "==> Running installed write/index/query workflow (${source_layout} ${linkage} linkage)"
+            workflow_uri="file://${work_dir}/workflow-${source_layout}-${linkage}.lance"
+            rm -rf "${work_dir}/workflow-${source_layout}-${linkage}.lance"
+            "$build_dir/workflow" "$workflow_uri"
         done
     done
 }

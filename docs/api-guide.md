@@ -1,6 +1,427 @@
 # C and C++ API guide
 
-See the [quickstart](../README.md#quickstart) for installation and a first read. These examples cover the current bindings. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
+See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
+
+The core workflows use public calls present in v0.2.0-beta.1 and current source, and were exercised against the published beta.1 library. That release pins Lance 15.0.0-beta.25. Behavior that requires a newer Lance core is not part of the beta.1 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
+
+## Write Arrow batches
+
+A dataset write takes a caller-owned `ArrowSchema` that describes the stream and an `ArrowArrayStream` that is consumed. The stream must deliver record batches matching the schema. `LANCE_WRITE_CREATE` fails if the URI already contains a dataset, `LANCE_WRITE_APPEND` requires a compatible schema, and `LANCE_WRITE_OVERWRITE` replaces an existing dataset or creates a new one.
+
+```c
+LanceDataset* dataset = NULL;
+int32_t status = lance_dataset_write(
+    "file:///tmp/demo.lance",
+    &schema,              /* caller owns; this call does not release it */
+    &stream,              /* consumed on success and failure */
+    LANCE_WRITE_CREATE,
+    NULL,                 /* static storage options, or NULL */
+    &dataset);
+if (status != 0) {
+    /* Read the thread-local error before the next C call. */
+}
+/* Release the schema with schema.release(&schema); do not release the stream again. */
+lance_dataset_close(dataset);
+```
+
+The C++ `Dataset::write` overload reads the schema from the stream itself, so the stream must be self-describing. The stream is consumed on every return path, including when the call throws:
+
+```cpp
+ArrowArrayStream stream = make_stream();  /* a self-describing Arrow stream */
+lance::Dataset dataset = lance::Dataset::write(
+    "file:///tmp/demo.lance", &stream, lance::WriteMode::Create);
+```
+
+`lance_dataset_write` and `Dataset::write` retain the legacy 20-version / 14-day auto-cleanup policy. Use `lance_dataset_write_with_options` or `Dataset::write_with_options` to select native `WriteParams::default()`. The [owned native write options](#owned-native-write-options) section covers the full write-options surface.
+
+## Scan, filter, project and take
+
+`lance_scanner_new(dataset, columns, filter)` copies the NULL-terminated column list and SQL filter when it is called. A NULL column list selects all columns and a NULL filter selects all rows. Use `lance_scanner_set_projection()` for aliases and SQL expressions; the setter replaces the initial column list, copies its strings, and must be called before the scan starts. `lance_scanner_set_limit()` and `lance_scanner_set_offset()` apply the result window. `lance_scanner_count_rows()` executes the native count plan and rejects a configured limit, offset, or ordering.
+
+```c
+LanceScanner* scanner = lance_scanner_new(dataset, NULL, "score >= 10");
+if (scanner == NULL) {
+    /* Read lance_last_error_code()/message(). */
+}
+
+LanceProjectionColumn projection[] = {
+    {"id", "id"},
+    {"upper_name", "upper(name)"},
+};
+if (lance_scanner_set_projection(scanner, projection, 2) != 0 ||
+    lance_scanner_set_limit(scanner, 100) != 0 ||
+    lance_scanner_set_offset(scanner, 20) != 0) {
+    /* Invalid configuration leaves the previous scanner state in place. */
+}
+
+struct ArrowArrayStream stream = {0};
+if (lance_scanner_to_arrow_stream(scanner, &stream) != 0) {
+    /* Read the error, then release the scanner. */
+}
+/* Consume batches, then stream.release(&stream); lance_scanner_close(scanner). */
+```
+
+```cpp
+auto scanner = dataset.scan();
+scanner.project({{"id", "id"}, {"upper_name", "upper(name)"}})
+       .limit(100)
+       .offset(20)
+       .batch_size(64);
+
+ArrowArrayStream raw{};
+scanner.to_arrow_stream(&raw);
+lance::ArrowStream stream(raw);
+/* Read batches from stream->get_next(). */
+```
+
+`take` reads rows by zero-based offset and `take_rows` reads rows by dataset row ID from the `_rowid` column. Both return a caller-owned Arrow stream whose non-NULL `release` callback must be called exactly once; the schema is validated before the stream callbacks are exposed. `take_rows` may omit missing or deleted row IDs and otherwise preserves input order and duplicates. `take` preserves the requested offsets.
+
+```c
+const uint64_t offsets[] = {0, 4, 9};
+struct ArrowArrayStream rows = {0};
+if (lance_dataset_take(dataset, offsets, 3, NULL, &rows) != 0) {
+    /* Read the error. */
+}
+/* rows.release(&rows) exactly once. */
+```
+
+```cpp
+const uint64_t offsets[] = {0, 4, 9};
+ArrowArrayStream raw{};
+dataset.take(offsets, 3, &raw);  /* the overload accepts a column list */
+lance::ArrowStream rows(raw);
+```
+
+## Vector and full-text search
+
+A vector query sets `k` on the scanner and can be combined with a SQL filter, projection, limit, offset, and ordering. The query vector length is the column dimension, not the byte length. The default scoring path adds `_distance` to the output; `Scanner::disable_scoring_autoprojection()` or `lance_scanner_disable_scoring_autoprojection()` keeps it only when named explicitly. `prefilter(true)` applies the filter before ranking; postfiltering can return fewer than `k` rows. An indexed query remains approximate. Use `use_index(false)` for an exact scan, still subject to `k`.
+
+```c
+float query[] = {0.0f, 0.0f};
+LanceScanner* scanner = lance_scanner_new(dataset, NULL, "id >= 4");
+if (scanner == NULL ||
+    lance_scanner_nearest(scanner, "embedding", query, 2,
+                          LANCE_DTYPE_FLOAT32, 5) != 0 ||
+    lance_scanner_set_metric(scanner, LANCE_METRIC_L2) != 0 ||
+    lance_scanner_set_prefilter(scanner, true) != 0 ||
+    lance_scanner_set_limit(scanner, 2) != 0) {
+    /* Read the error and rebuild the scanner if needed. */
+}
+```
+
+```cpp
+const float query[] = {0.0f, 0.0f};
+auto scanner = dataset.scan(std::nullopt, "id >= 4");
+scanner.nearest("embedding", query, 2, 5)
+       .metric(LANCE_METRIC_L2)
+       .prefilter(true)
+       .limit(2);
+```
+
+Full-text search uses BM25 over an inverted scalar index. Build the index first, then either name the indexed columns or pass NULL to search all FTS-indexed columns. `max_fuzzy_distance == 0` selects exact term matching; a positive value enables native fuzzy matching. The default scoring path adds `_score`. FTS and nearest queries are mutually exclusive on one scanner. See [Scanner projection and scoring columns](#scanner-projection-and-scoring-columns), [Distance-bounded vector search](#distance-bounded-vector-search), and [Multi-vector search](#multi-vector-search) for the specialized forms.
+
+```c
+const char* fts_columns[] = {"text", NULL};
+LanceScanner* fts = lance_scanner_new(dataset, NULL, NULL);
+if (fts == NULL ||
+    lance_scanner_full_text_search(fts, "apple", fts_columns, 0) != 0 ||
+    lance_scanner_set_limit(fts, 5) != 0) {
+    /* Read the error. */
+}
+```
+
+```cpp
+auto fts = dataset.scan();
+fts.full_text_search("apple", {"text"}, 0).limit(5);
+```
+
+## Mutations and indices
+
+`delete`, `update`, and `merge_insert` mutate the same dataset handle in place and commit a new manifest. Existing scanners and independently opened handles keep their previous snapshot. A failed mutation can leave uncommitted data files behind; reopen the URI when the commit outcome is uncertain. `merge_insert` consumes its source stream on every return path except a NULL source.
+
+```c
+uint64_t deleted = 0;
+if (lance_dataset_delete(dataset, "id = 6", &deleted) != 0) {
+    /* Read the error. */
+}
+
+const char* update_columns[] = {"text"};
+const char* update_values[] = {"'updated'"};
+uint64_t updated = 0;
+if (lance_dataset_update(dataset, "id = 5", update_columns,
+                         update_values, 1, &updated) != 0) {
+    /* Read the error. */
+}
+
+const char* keys[] = {"id"};
+LanceMergeInsertParams params = {0};
+params.when_matched = LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL;
+params.when_not_matched = LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL;
+LanceMergeInsertResult result = {0};
+if (lance_dataset_merge_insert(dataset, keys, 1, &source, &params,
+                               &result) != 0) {
+    /* source was consumed even on this error path. */
+}
+```
+
+```cpp
+uint64_t deleted = dataset.delete_rows("id = 6");
+uint64_t updated = dataset.update("id = 5", {{"text", "'updated'"}});
+auto find_or_create = dataset.merge_insert({"id"}, &source);
+auto upserted = dataset.upsert({"id"}, &upsert_source);
+```
+
+Scalar indices are created with `lance_dataset_create_scalar_index()` or `Dataset::create_scalar_index()`. BTree is the ordinary equality/range index; `LANCE_SCALAR_INVERTED` with tokenizer JSON is the FTS index. Vector indices use `LanceVectorIndexParams` / `VectorIndexOptions`; the legacy parameter struct and the additive options entry point share native validation and defaults. Index creation commits its own version. Native Lance commits before reloading index metadata, so an error can be returned after a version was published; reopen the dataset to inspect the committed state.
+
+```c
+lance_dataset_create_scalar_index(dataset, "id", "id_btree",
+                                  LANCE_SCALAR_BTREE, NULL, false);
+
+const char* fts_params =
+    "{\"base_tokenizer\":\"simple\",\"language\":\"English\"}";
+lance_dataset_create_scalar_index(dataset, "text", "text_fts",
+                                  LANCE_SCALAR_INVERTED, fts_params, false);
+
+LanceVectorIndexParams vector = {0};
+vector.index_type = LANCE_INDEX_IVF_FLAT;
+vector.metric = LANCE_METRIC_L2;
+vector.num_partitions = 16;
+lance_dataset_create_vector_index(dataset, "embedding", "embedding_ivf",
+                                  &vector, false);
+```
+
+```cpp
+dataset.create_scalar_index("id", LANCE_SCALAR_BTREE, "id_btree");
+dataset.create_scalar_index(
+    "text", LANCE_SCALAR_INVERTED, "text_fts",
+    R"({"base_tokenizer":"simple","language":"English"})");
+
+lance::VectorIndexOptions vector;
+vector.index_type = LANCE_INDEX_IVF_FLAT;
+vector.metric = LANCE_METRIC_L2;
+vector.num_partitions = 16;
+dataset.create_vector_index_with_options(
+    "embedding", vector, "embedding_ivf");
+```
+
+## Cloud object storage and credentials
+
+The dataset URI selects the object store (`s3://`, `gs://`, `az://`, `file://`, `memory://`, and the other schemes supported by the pinned Lance core). Static options are passed unchanged to the native object-store provider. Use the provider's own key names: for example, S3 commonly uses `aws_access_key_id`, `aws_secret_access_key`, `aws_region`, and `aws_endpoint` for a custom endpoint; GCS and Azure use their corresponding native credential keys. The binding does not rename provider keys or add a second credential cache.
+
+```c
+const char* storage_options[] = {
+    "aws_access_key_id", "...",
+    "aws_secret_access_key", "...",
+    "aws_region", "us-east-1",
+    "aws_endpoint", "https://s3.example.com",
+    NULL,
+};
+LanceDataset* dataset = lance_dataset_open(
+    "s3://bucket/data.lance", storage_options, 0);
+```
+
+```cpp
+auto dataset = lance::Dataset::open(
+    "s3://bucket/data.lance",
+    {{"aws_access_key_id", "..."},
+     {"aws_secret_access_key", "..."},
+     {"aws_region", "us-east-1"},
+     {"aws_endpoint", "https://s3.example.com"}});
+```
+
+For rotating credentials, wrap a `LanceStorageOptionsProvider` in a `LanceStorageOptionsAccessor` and pass the accessor to the open or write options. The dataset retains the accessor and provider, so closing the C handles after a successful open does not invalidate later I/O. Native code owns refresh, expiration, caching, and object-store registry identity.
+
+Set `expires_at_millis` to the credential response's expiry as a decimal string of Unix epoch milliseconds. The pinned native accessor refreshes within `refresh_offset_millis` (default 60 seconds) before that time; an absent or non-numeric `expires_at_millis` means no expiry. Temporary AWS credentials also need `aws_session_token`. Do not substitute a human-readable timestamp or a duration. A provider callback may run on a native worker thread: it must return normally, must not use `lance_last_error_*()`, and reports C failures through `LanceCallbackError`. In C++, throwing `lance::Error` is converted to that callback error.
+
+The C fetch result is borrowed only until `release_snapshot` runs. The callback owns its keys, values, and snapshot storage; the library copies the complete map before releasing it exactly once. The example duplicates the full credential strings and returns a typed callback error if a copy or the epoch-millisecond formatting fails, so it never returns truncated credentials.
+
+```c
+typedef struct {
+    char* access_key_id;
+    char* secret_access_key;
+    char* session_token;
+    char* expires_at_millis;
+    const char* keys[4];
+    const char* values[4];
+} CredentialSnapshot;
+
+static char* copy_string(const char* value) {
+    size_t length = strlen(value) + 1;
+    char* copy = malloc(length);
+    if (copy != NULL) memcpy(copy, value, length);
+    return copy;
+}
+
+static void release_credential_snapshot(void* context) {
+    CredentialSnapshot* snapshot = context;
+    free(snapshot->access_key_id);
+    free(snapshot->secret_access_key);
+    free(snapshot->session_token);
+    free(snapshot->expires_at_millis);
+    free(snapshot);
+}
+
+static int32_t callback_io_error(LanceCallbackError* error) {
+    error->code = LANCE_ERR_IO;
+    error->message.data = NULL;
+    error->message.release = NULL;
+    return -1;
+}
+
+/* Return the credential response's real Unix epoch millisecond expiry. */
+uint64_t temporary_credentials_expire_at_millis(void);
+
+static int32_t fetch_storage_options(
+    void* context, LanceStorageOptionsFetchResult* out,
+    LanceCallbackError* error) {
+    (void)context;
+    /* Supply the complete strings from the real credential response. */
+    const char* access_key_id = "<temporary-access-key>";
+    const char* secret_access_key = "<temporary-secret-key>";
+    const char* session_token = "<temporary-session-token>";
+    char expires_at_millis[32];
+
+    int written = snprintf(
+        expires_at_millis, sizeof(expires_at_millis), "%llu",
+        (unsigned long long)temporary_credentials_expire_at_millis());
+    if (written < 0 || (size_t)written >= sizeof(expires_at_millis)) {
+        return callback_io_error(error);
+    }
+
+    CredentialSnapshot* snapshot = calloc(1, sizeof(*snapshot));
+    if (snapshot == NULL) return callback_io_error(error);
+
+    snapshot->access_key_id = copy_string(access_key_id);
+    snapshot->secret_access_key = copy_string(secret_access_key);
+    snapshot->session_token = copy_string(session_token);
+    snapshot->expires_at_millis = copy_string(expires_at_millis);
+    if (snapshot->access_key_id == NULL ||
+        snapshot->secret_access_key == NULL ||
+        snapshot->session_token == NULL ||
+        snapshot->expires_at_millis == NULL) {
+        release_credential_snapshot(snapshot);
+        return callback_io_error(error);
+    }
+
+    snapshot->keys[0] = "aws_access_key_id";
+    snapshot->keys[1] = "aws_secret_access_key";
+    snapshot->keys[2] = "aws_session_token";
+    snapshot->keys[3] = "expires_at_millis";
+    snapshot->values[0] = snapshot->access_key_id;
+    snapshot->values[1] = snapshot->secret_access_key;
+    snapshot->values[2] = snapshot->session_token;
+    snapshot->values[3] = snapshot->expires_at_millis;
+
+    out->has_options = 1;
+    out->keys = snapshot->keys;
+    out->values = snapshot->values;
+    out->count = 4;
+    out->snapshot_ctx = snapshot;
+    out->release_snapshot = release_credential_snapshot;
+    return 0;
+}
+
+LanceStorageOptionsProviderSpec spec = {0};
+spec.fetch = fetch_storage_options;
+spec.provider_id = "sts-refresh";
+LanceStorageOptionsProvider* provider =
+    lance_storage_options_provider_new(&spec);
+LanceStorageOptionsAccessor* accessor =
+    lance_storage_options_accessor_new(NULL, provider);
+
+LanceDatasetOpenOptions open_options = {0};
+open_options.storage_options_accessor = accessor;
+LanceDataset* dataset = lance_dataset_open_with_options(
+    "s3://bucket/data.lance", &open_options, NULL);
+
+/* The dataset retains the accessor and provider. */
+lance_storage_options_accessor_close(accessor);
+lance_storage_options_provider_close(provider);
+```
+
+```cpp
+struct TemporaryCredentials {
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string session_token;
+    uint64_t expires_at_millis = 0; /* Unix epoch milliseconds */
+};
+
+/* Return the credential source's current temporary credentials. */
+TemporaryCredentials fetch_temporary_credentials();
+
+lance::StorageOptionsProvider provider(
+    "sts-refresh",
+    []() -> std::optional<lance::StorageOptions> {
+        auto credentials = fetch_temporary_credentials();
+        return lance::StorageOptions{
+            {"aws_access_key_id", credentials.access_key_id},
+            {"aws_secret_access_key", credentials.secret_access_key},
+            {"aws_session_token", credentials.session_token},
+            {"expires_at_millis",
+             std::to_string(credentials.expires_at_millis)},
+        };
+    });
+lance::StorageOptionsAccessor accessor(
+    lance::StorageOptions{{"aws_region", "us-east-1"}}, &provider);
+lance::DatasetOpenOptions options;
+options.storage_options_accessor = &accessor;
+auto dataset = lance::Dataset::open_with_options(
+    "s3://bucket/data.lance", options);
+```
+
+The same static list is the `storage_opts` argument on the write entry points. For a dynamic accessor, use `lance_dataset_write_with_options_and_accessor()` or `Dataset::write_with_options_and_accessor()`; the returned dataset retains the accessor. A NULL provider and an empty map are different native values, and a provider may return native None for one fetch. Those distinctions are preserved.
+
+## Runnable write/index/query example
+
+`examples/cmake-consumer/workflow.cpp` is a complete C++20 program against an installed package. It writes `id`, `text`, and `embedding` columns, creates BTree, inverted FTS, and IVF vector indices, reopens the dataset, and runs a filtered vector query and an FTS query. The fixture is built directly with the Arrow C Data Interface, so it also shows the release callbacks and stream ownership rules.
+
+```bash
+cmake -S examples/cmake-consumer -B build/workflow \
+  -DCMAKE_PREFIX_PATH=/path/to/lance-c-install
+cmake --build build/workflow --target workflow
+./build/workflow/workflow file:///tmp/lance-c-workflow.lance
+```
+
+Expected output on a fresh path:
+
+```text
+write: rows=6 version=1
+indices: count=3 version=4
+vector query: 4 5
+fts query: 1 2 4
+workflow: PASS
+```
+
+The example uses only calls and behavior present in v0.2.0-beta.1. It is not a statement that later unreleased APIs are part of the beta.1 archive.
+
+## Errors and panic recovery
+
+C entry points report failures through their documented sentinel (NULL, -1, or 0 for selected accessors). The error code and message are thread-local: read them on the thread that made the failing call, before another call can replace them. `lance_last_error_message()` takes the pending message, so the caller must free it with `lance_free_string()`; taking the message also clears the pending error code. If you need the code later, copy it before taking the message.
+
+```c
+LanceDataset* dataset = lance_dataset_open("/path/that/does/not/exist", NULL, 0);
+if (dataset == NULL) {
+    LanceErrorCode code = lance_last_error_code();
+    const char* message = lance_last_error_message();
+    fprintf(stderr, "lance error %d: %s\n",
+            (int)code, message != NULL ? message : "(no message)");
+    lance_free_string(message);
+}
+```
+
+C++ methods throw `lance::Error`; `code` carries the same `LanceErrorCode` value and `what()` carries the message.
+
+```cpp
+try {
+    auto dataset = lance::Dataset::open("/path/that/does/not/exist");
+} catch (const lance::Error& error) {
+    std::fprintf(stderr, "lance error %d: %s\n",
+                 static_cast<int>(error.code), error.what());
+}
+```
+
+A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in the [C header](../include/lance/lance.h) for the complete boundary.
 
 ## Header inclusion
 

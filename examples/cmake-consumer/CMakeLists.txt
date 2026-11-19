@@ -35,3 +35,6 @@ target_link_libraries(consumer PRIVATE LanceC::lance_c)
 
 add_executable(acceptance acceptance.cpp)
 target_link_libraries(acceptance PRIVATE LanceC::lance_c)
+
+add_executable(workflow workflow.cpp)
+target_link_libraries(workflow PRIVATE LanceC::lance_c)
