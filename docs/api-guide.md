@@ -2,6 +2,38 @@
 
 See the [quickstart](../README.md#quickstart) for installation and a first read. These examples cover the current bindings. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
 
+## Binding version
+
+`LANCE_C_VERSION_MAJOR`, `LANCE_C_VERSION_MINOR`, `LANCE_C_VERSION_PATCH`,
+`LANCE_C_VERSION_PRE`, and `LANCE_C_VERSION_STRING` are synchronized with the
+package version in `Cargo.toml`. This is the lance-c release version, not the
+Lance core dataset/file writer version or a Git pin.
+
+`LANCE_C_VERSION` is a numeric encoding for compile-time checks. Major, minor,
+and patch must each be less than 1000. The pre-release suffix is not encoded,
+so a pre-release compares equal to its base release; use
+`LANCE_C_VERSION_PRE` or `LANCE_C_VERSION_STRING` for exact identity.
+
+```c
+#if LANCE_C_VERSION >= LANCE_C_VERSION_ENCODE(0, 2, 0)
+/* Use the 0.2 API. */
+#endif
+
+if (strcmp(lance_c_version(), LANCE_C_VERSION_STRING) != 0) {
+    /* The loaded library and headers disagree. */
+}
+```
+
+```cpp
+if (lance::version() != LANCE_C_VERSION_STRING) {
+    /* The loaded library and headers disagree. */
+}
+```
+
+`lance_c_version()` / `lance::version()` return the full version including a
+pre-release suffix such as `0.2.0-beta.1`. The string is owned by the library,
+remains valid for the process lifetime, and must not be freed.
+
 ## Dataset metadata
 
 Table metadata is available through `lance_dataset_metadata_json()` or

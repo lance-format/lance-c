@@ -81,6 +81,7 @@ mod transaction;
 mod transaction_properties;
 mod update;
 mod update_map;
+mod version;
 mod versions;
 mod writer;
 
@@ -140,5 +141,6 @@ pub use transaction::*;
 pub use transaction_properties::*;
 pub use update::*;
 pub use update_map::*;
+pub use version::*;
 pub use versions::*;
 pub use writer::*;
