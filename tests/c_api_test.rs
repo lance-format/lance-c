@@ -3201,6 +3201,27 @@ fn test_null_inputs() {
     assert_ne!(lance_last_error_code(), LanceErrorCode::Ok);
 }
 
+#[test]
+fn test_dataset_uri_getter() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+
+    let raw = unsafe { lance_dataset_uri(ds) };
+    assert!(!raw.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { CStr::from_ptr(raw) }.to_str().unwrap(), uri);
+
+    unsafe { lance_dataset_close(ds) };
+    // The returned copy is independent of the handle that produced it.
+    assert_eq!(unsafe { CStr::from_ptr(raw) }.to_str().unwrap(), uri);
+    unsafe { lance_free_string(raw) };
+
+    assert!(unsafe { lance_dataset_uri(ptr::null()) }.is_null());
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(take_last_error_message().contains("dataset is NULL"));
+}
+
 // ---------------------------------------------------------------------------
 // Async scan test
 // ---------------------------------------------------------------------------

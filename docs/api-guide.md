@@ -95,7 +95,10 @@ metadata. `lance_dataset_data_storage_version()`,
 `lance_dataset_has_stable_row_ids()`, `lance_dataset_field_id_count()` /
 `lance_dataset_field_id_at()`, `lance_dataset_resolve_field_id()` and
 `lance_dataset_field_path()` expose the current native snapshot; the C++
-wrappers provide the corresponding `Dataset` methods.
+wrappers provide the corresponding `Dataset` methods. `lance_dataset_uri()` /
+`Dataset::uri()` return the fully qualified URI resolved by native
+`Dataset::uri()`; for a namespace-opened dataset this is the `describe_table()`
+location, not the table ID.
 
 ## Dataset configuration, bases and files
 

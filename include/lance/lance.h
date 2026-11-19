@@ -761,6 +761,19 @@ LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
 uint64_t lance_dataset_version(const LanceDataset* dataset);
 
 /**
+ * Return the fully qualified URI of this dataset snapshot.
+ *
+ * This copies native `Dataset::uri()`, the URI resolved when the dataset was
+ * opened. A namespace-opened dataset reports the `describe_table` location,
+ * not its table ID. The returned string stays valid after the dataset handle
+ * is closed.
+ *
+ * Caller must free the returned string with `lance_free_string()`.
+ * Returns NULL on error, including a NULL dataset handle.
+ */
+const char* lance_dataset_uri(const LanceDataset* dataset);
+
+/**
  * Return the number of rows. Returns 0 on error; an empty dataset also returns
  * 0, so check lance_last_error_code().
  */
