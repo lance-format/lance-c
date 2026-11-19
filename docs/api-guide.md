@@ -229,23 +229,67 @@ auto dataset = lance::Dataset::open(
      {"aws_endpoint", "https://s3.example.com"}});
 ```
 
-For rotating credentials, wrap a `LanceStorageOptionsProvider` in a `LanceStorageOptionsAccessor` and pass the accessor to the open or write options. The dataset retains the accessor and provider, so closing the C handles after a successful open does not invalidate later I/O. Native code owns refresh, expiration, caching, and object-store registry identity. A provider callback may run on a native worker thread: it must return normally, must not use `lance_last_error_*()`, and reports C failures through `LanceCallbackError`. In C++, throwing `lance::Error` is converted to that callback error.
+For rotating credentials, wrap a `LanceStorageOptionsProvider` in a `LanceStorageOptionsAccessor` and pass the accessor to the open or write options. The dataset retains the accessor and provider, so closing the C handles after a successful open does not invalidate later I/O. Native code owns refresh, expiration, caching, and object-store registry identity.
+
+Set `expires_at_millis` to the credential response's expiry as a decimal string of Unix epoch milliseconds. The pinned native accessor refreshes within `refresh_offset_millis` (default 60 seconds) before that time; an absent or non-numeric `expires_at_millis` means no expiry. Temporary AWS credentials also need `aws_session_token`. Do not substitute a human-readable timestamp or a duration. A provider callback may run on a native worker thread: it must return normally, must not use `lance_last_error_*()`, and reports C failures through `LanceCallbackError`. In C++, throwing `lance::Error` is converted to that callback error.
+
+The C fetch result is borrowed only until `release_snapshot` runs. The callback owns its keys, values, and snapshot storage; the library copies the complete map before releasing it exactly once.
 
 ```c
+typedef struct {
+    char access_key_id[128];
+    char secret_access_key[128];
+    char session_token[2048];
+    char expires_at_millis[32];
+    const char* keys[4];
+    const char* values[4];
+} CredentialSnapshot;
+
+static void release_credential_snapshot(void* context) {
+    free(context);
+}
+
+/* Return the credential response's real Unix epoch millisecond expiry. */
+uint64_t temporary_credentials_expire_at_millis(void);
+
 static int32_t fetch_storage_options(
     void* context, LanceStorageOptionsFetchResult* out,
     LanceCallbackError* error) {
     (void)context;
-    (void)error;
-    static const char* keys[] = {
-        "aws_access_key_id", "aws_secret_access_key"};
-    static const char* values[] = {"...", "..."};
+    CredentialSnapshot* snapshot = calloc(1, sizeof(*snapshot));
+    if (snapshot == NULL) {
+        error->code = LANCE_ERR_IO;
+        error->message.data = NULL;
+        error->message.release = NULL;
+        return -1;
+    }
+
+    /* Replace these placeholders and the expiry with the real response. */
+    snprintf(snapshot->access_key_id, sizeof(snapshot->access_key_id),
+             "%s", "<temporary-access-key>");
+    snprintf(snapshot->secret_access_key, sizeof(snapshot->secret_access_key),
+             "%s", "<temporary-secret-key>");
+    snprintf(snapshot->session_token, sizeof(snapshot->session_token),
+             "%s", "<temporary-session-token>");
+    snprintf(snapshot->expires_at_millis,
+             sizeof(snapshot->expires_at_millis), "%llu",
+             (unsigned long long)temporary_credentials_expire_at_millis());
+
+    snapshot->keys[0] = "aws_access_key_id";
+    snapshot->keys[1] = "aws_secret_access_key";
+    snapshot->keys[2] = "aws_session_token";
+    snapshot->keys[3] = "expires_at_millis";
+    snapshot->values[0] = snapshot->access_key_id;
+    snapshot->values[1] = snapshot->secret_access_key;
+    snapshot->values[2] = snapshot->session_token;
+    snapshot->values[3] = snapshot->expires_at_millis;
+
     out->has_options = 1;
-    out->keys = keys;
-    out->values = values;
-    out->count = 2;
-    out->snapshot_ctx = NULL;
-    out->release_snapshot = NULL;
+    out->keys = snapshot->keys;
+    out->values = snapshot->values;
+    out->count = 4;
+    out->snapshot_ctx = snapshot;
+    out->release_snapshot = release_credential_snapshot;
     return 0;
 }
 
@@ -268,12 +312,26 @@ lance_storage_options_provider_close(provider);
 ```
 
 ```cpp
+struct TemporaryCredentials {
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string session_token;
+    uint64_t expires_at_millis = 0; /* Unix epoch milliseconds */
+};
+
+/* Return the credential source's current temporary credentials. */
+TemporaryCredentials fetch_temporary_credentials();
+
 lance::StorageOptionsProvider provider(
     "sts-refresh",
     []() -> std::optional<lance::StorageOptions> {
+        auto credentials = fetch_temporary_credentials();
         return lance::StorageOptions{
-            {"aws_access_key_id", current_access_key()},
-            {"aws_secret_access_key", current_secret_key()},
+            {"aws_access_key_id", credentials.access_key_id},
+            {"aws_secret_access_key", credentials.secret_access_key},
+            {"aws_session_token", credentials.session_token},
+            {"expires_at_millis",
+             std::to_string(credentials.expires_at_millis)},
         };
     });
 lance::StorageOptionsAccessor accessor(
