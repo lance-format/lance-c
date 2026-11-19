@@ -1,6 +1,6 @@
 # Conan recipe for lance-c
 
-Canonical source of the recipe published to `conan-io/conan-center-index`.
+Use this local recipe to add lance-c to your Conan cache.
 
 ## Local test
 
@@ -23,8 +23,8 @@ Debian 12 libc floor. The `Linux/armv8` entry uses the standard `v0.1.9`
 archive; static inspection of its shared library records `GLIBC_2.39` there
 and `GLIBC_2.35` in the Debian 12 archive.
 
-The `0.1.9` entries stay pinned to those assets. Future releases publish one
-generic Linux archive per architecture targeting glibc 2.28 and no Debian 12
-variants; add new version entries only after the archives are published. See
-[Linux baseline for future
-packages](../README.md#linux-baseline-for-future-packages).
+The `0.1.9` entries stay pinned to those assets. The `0.2` release line
+(starting with the `v0.2.0-beta.1` pre-release) publishes one generic Linux
+archive per architecture targeting glibc 2.28 and no Debian 12 variants. See
+[Installation and platform requirements](../README.md#linux-baseline-for-future-packages)
+and [Linux baseline for 0.2 and future packages](../docs/building-and-packaging.md#linux-baseline-for-future-packages).

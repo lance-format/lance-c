@@ -1,8 +1,6 @@
 # vcpkg overlay port for lance-c
 
-This directory is the canonical copy of the vcpkg port that ships in the
-upstream `microsoft/vcpkg` registry. Use it as an overlay against any vcpkg
-checkout to install lance-c locally:
+Use the port from this repository as an overlay in your vcpkg checkout:
 
 ```bash
 vcpkg install lance-c --overlay-ports=path/to/lance-c/ports
@@ -26,10 +24,8 @@ The `arm64-linux` mapping selects the standard `v0.1.9` release archive; static
 inspection of its shared library records `GLIBC_2.39` there and `GLIBC_2.35` in
 the Debian 12 archive.
 
-These mappings and hashes stay pinned to the `v0.1.9` assets. Future releases
-publish one generic Linux archive per architecture targeting glibc 2.28 and no
-Debian 12 variants; change the mappings and hashes only after such an archive
-is published. See [Linux baseline for future
-packages](../README.md#linux-baseline-for-future-packages).
-
-After each release, the contents are mirrored into `microsoft/vcpkg` via PR.
+These mappings and hashes stay pinned to the `v0.1.9` assets. The `0.2` release
+line (starting with the `v0.2.0-beta.1` pre-release) publishes one generic Linux
+archive per architecture targeting glibc 2.28 and no Debian 12 variants. See
+[Installation and platform requirements](../README.md#linux-baseline-for-future-packages)
+and [Linux baseline for 0.2 and future packages](../docs/building-and-packaging.md#linux-baseline-for-future-packages).
