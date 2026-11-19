@@ -46,6 +46,7 @@ $headerCpp = Join-Path $prefixPath 'include\lance\lance.hpp'
 $readme = Join-Path $prefixPath 'share\doc\lance-c\README.md'
 $license = Join-Path $prefixPath 'share\licenses\lance-c\LICENSE'
 $packageConfig = Join-Path $prefixPath 'lib\cmake\LanceC\LanceCConfig.cmake'
+$pkgConfig = Join-Path $prefixPath 'lib\pkgconfig\lance-c.pc'
 
 foreach ($required in @(
     $dll,
@@ -55,7 +56,8 @@ foreach ($required in @(
     $headerCpp,
     $readme,
     $license,
-    $packageConfig
+    $packageConfig,
+    $pkgConfig
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "staged package is missing $required"
@@ -68,6 +70,13 @@ foreach ($required in @(
 $packageConfigText = Get-Content -LiteralPath $packageConfig -Raw
 if ($packageConfigText -notmatch '(?m)^set\(LanceC_STATIC_CRT ON\)\s*$') {
     throw 'staged package does not declare LanceC_STATIC_CRT=ON'
+}
+
+Write-Host '==> Verifying installed CMake and pkg-config metadata'
+& cmake "-DPREFIX=$prefixPath" -DPLATFORM=Windows `
+    -P (Join-Path $sourcePath 'cmake\verify_installed_metadata.cmake')
+if ($LASTEXITCODE -ne 0) {
+    throw "installed metadata verification failed with exit code $LASTEXITCODE"
 }
 
 $msvcComponent = if ($Architecture -eq 'ARM64') {
