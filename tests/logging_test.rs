@@ -148,6 +148,14 @@ fn assert_child_success(output: &std::process::Output) {
     );
 }
 
+fn emit_restricted_trace() {
+    tracing::trace!(target: RESTRICTED_TRACE_TARGET, "RESTRICTED_TRACE_MARKER");
+}
+
+fn emit_both_trace() {
+    tracing::trace!(target: BOTH_TRACE_TARGET, "BOTH_TRACE_MARKER");
+}
+
 fn init_logging(filter: &str) -> i32 {
     let filter = CString::new(filter).expect("test filter must not contain NUL");
     unsafe { lance_init_logging(filter.as_ptr()) }
@@ -348,6 +356,10 @@ fn restricted_host_subscriber_state_is_preserved() {
     assert_eq!(TracingLevelFilter::current(), TracingLevelFilter::WARN);
     assert_eq!(log::max_level(), log::LevelFilter::Off);
 
+    // Register this trace callsite under the host filter first. The failed
+    // install then rebuilds every existing callsite with the requested trace
+    // subscriber before rejecting it; this makes stale interest observable.
+    emit_restricted_trace();
     assert_eq!(init_logging("trace"), 0);
     assert_eq!(
         TracingLevelFilter::current(),
@@ -360,7 +372,7 @@ fn restricted_host_subscriber_state_is_preserved() {
         "the log bridge must use the surviving host subscriber level"
     );
 
-    tracing::trace!(target: RESTRICTED_TRACE_TARGET, "RESTRICTED_TRACE_MARKER");
+    emit_restricted_trace();
     tracing::warn!(target: RESTRICTED_WARN_TARGET, "RESTRICTED_WARN_MARKER");
     log::info!(target: RESTRICTED_LOG_INFO_TARGET, "RESTRICTED_LOG_INFO_MARKER");
     log::warn!(target: RESTRICTED_LOG_WARN_TARGET, "RESTRICTED_LOG_WARN_MARKER");
@@ -417,6 +429,7 @@ fn both_host_globals_keep_their_filter_and_log_level() {
     assert_eq!(TracingLevelFilter::current(), TracingLevelFilter::WARN);
     assert_eq!(log::max_level(), log::LevelFilter::Warn);
 
+    emit_both_trace();
     assert_eq!(init_logging("trace"), 0);
     assert_eq!(
         TracingLevelFilter::current(),
@@ -429,7 +442,7 @@ fn both_host_globals_keep_their_filter_and_log_level() {
         "both-global path must preserve the host logger max level"
     );
 
-    tracing::trace!(target: BOTH_TRACE_TARGET, "BOTH_TRACE_MARKER");
+    emit_both_trace();
     tracing::warn!(target: BOTH_WARN_TARGET, "BOTH_WARN_MARKER");
     log::info!(target: BOTH_LOG_INFO_TARGET, "BOTH_LOG_INFO_MARKER");
     log::warn!(target: BOTH_LOG_WARN_TARGET, "BOTH_LOG_WARN_MARKER");
