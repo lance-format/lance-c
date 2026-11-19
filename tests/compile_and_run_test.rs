@@ -1246,6 +1246,40 @@ fn compile_cpp_test(sources: &[&Path], output: &Path, include_dir: &Path, lib_pa
         .success()
 }
 
+/// Compile a C header-only consumer without linking it.
+fn compile_c_header_test(source: &Path, include_dirs: &[&Path]) -> bool {
+    let status = Command::new("clang")
+        .args(["-std=c11", "-Wall", "-Wextra", "-fsyntax-only"])
+        .arg(source)
+        .args(
+            include_dirs
+                .iter()
+                .map(|dir| format!("-I{}", dir.display())),
+        )
+        .status();
+
+    status
+        .expect("C compiler is required for this ignored test")
+        .success()
+}
+
+/// Compile a C++ header-only consumer without linking it.
+fn compile_cpp_header_test(source: &Path, include_dirs: &[&Path]) -> bool {
+    let status = Command::new("c++")
+        .args(["-std=c++20", "-Wall", "-Wextra", "-fsyntax-only"])
+        .arg(source)
+        .args(
+            include_dirs
+                .iter()
+                .map(|dir| format!("-I{}", dir.display())),
+        )
+        .status();
+
+    status
+        .expect("C++ compiler is required for this ignored test")
+        .success()
+}
+
 /// Run a compiled test binary with the source dataset URI, a destination URI
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
 /// cache dataset, separate non-stable/stable fragment-deletion datasets, the
@@ -2180,4 +2214,33 @@ fn test_commit_lock_native_compilation_and_execution() {
 #[ignore = "requires a C compiler; run with: cargo test --test compile_and_run_test -- --ignored test_public_c_abi_layout_matches_rust"]
 fn test_public_c_abi_layout_matches_rust() {
     abi_layout::assert_public_abi();
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_arrow_header_include_orders"]
+fn test_arrow_header_include_orders() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let include_dir = manifest_dir.join("include");
+    let consumer_dir = manifest_dir.join("tests").join("cpp");
+    let arrow_include_dir = consumer_dir.join("arrow_abi");
+    let include_dirs = [include_dir.as_path(), arrow_include_dir.as_path()];
+
+    for source_name in ["header_lance_before_arrow.c", "header_arrow_before_lance.c"] {
+        let source = consumer_dir.join(source_name);
+        assert!(
+            compile_c_header_test(&source, &include_dirs),
+            "C11 consumer with {source_name} failed to compile"
+        );
+    }
+
+    for source_name in [
+        "header_lance_before_arrow.cpp",
+        "header_arrow_before_lance.cpp",
+    ] {
+        let source = consumer_dir.join(source_name);
+        assert!(
+            compile_cpp_header_test(&source, &include_dirs),
+            "C++20 consumer with {source_name} failed to compile"
+        );
+    }
 }
