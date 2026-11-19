@@ -659,6 +659,43 @@ auto approx_items = session.approx_num_items();
 measurement or a configured limit. `approx_num_items()` is explicitly
 approximate and may change as cache maintenance runs.
 
+## Thread safety
+
+The C pointer is a lifetime token, not a lock, and a `const` qualifier does not
+by itself permit concurrent calls. The [header](../include/lance/lance.h)
+defines the complete contract; the main cases are:
+
+- `LanceDataset` handles are shareable. Snapshot reads and in-place mutations
+  may overlap; mutations serialize on the handle's internal write lock for the
+  whole native call, and readers that already hold a snapshot keep their old
+  view. `restore` and `checkout_*` commit from a snapshot and follow native
+  commit-conflict rules instead of the source handle's write lock.
+- `LanceSession` inspection calls may run concurrently, and one session may
+  back concurrent opens. Cache statistics are current values, not one atomic
+  snapshot across the index and metadata caches.
+- `LanceFileReader` read-only calls may overlap. Each `read_all`, `read_range`,
+  or `read_indices` call creates an independent stream.
+- `LanceNamespace` ordinary calls may overlap. Custom operation and dynamic
+  context-provider callbacks must be thread-safe; they must not close or
+  re-enter the namespace that is invoking them.
+- `LanceScanner` and `LanceFileWriter` require caller serialization of all
+  calls on one handle. A scanner's exported streams are independent of the
+  scanner and of each other, but callbacks on one stream are serialized.
+- All four callbacks (`get_schema`, `get_next`, `get_last_error`, `release`) on
+  one `ArrowArrayStream` must be serialized. `get_last_error` returns a borrowed
+  pointer valid only until the next operation on that stream or release.
+
+Every `close`/`free` takes exclusive ownership of its pointer and must not
+overlap any other use of that pointer. Closing a producer releases only that
+handle; children that retain native ownership, such as scanners, fragments,
+streams and snapshots, stay valid where their own documentation says so.
+Borrowed pointers retain only their documented lifetime and may be invalidated
+by a concurrent mutable call or close, even on a shareable handle.
+
+Synchronous callbacks run inside the native call that invoked them. They must
+not close or re-enter the handle whose call is still on the stack; use an
+independent handle or a snapshot acquired before the call.
+
 ## Vector index build options
 
 `lance_dataset_create_vector_index` and
