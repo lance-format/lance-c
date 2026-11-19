@@ -57,6 +57,19 @@ inline void check_error() {
     }
 }
 
+/// Opt in to native diagnostic logging on stderr. `filter` uses the same
+/// `RUST_LOG`-style directive syntax as `lance_init_logging`; the default
+/// `"info"` matches a NULL filter in C. Throws `lance::Error` on an invalid
+/// filter.
+inline void init_logging(std::string_view filter = "info") {
+    if (filter.find('\0') != std::string_view::npos) {
+        throw Error(LANCE_ERR_INVALID_ARGUMENT,
+                    "logging filter must not contain NUL");
+    }
+    std::string owned(filter);
+    if (lance_init_logging(owned.c_str()) != 0) check_error();
+}
+
 /// Build a portable IVF_RQ fast-rotation model as native JSON. `num_bits == 0`
 /// selects the native RQ default of 5.
 inline std::string build_rq_model(uint32_t dimension, uint32_t num_bits = 5) {

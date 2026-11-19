@@ -7840,6 +7840,19 @@ static void test_diagnostics(const char *uri) {
            "snapshot bytes and first incremental read must agree after reset");
     lance_dataset_close(ds);
 
+    /* Invalid filters report through the normal TLS error channel. */
+    ASSERT(lance_init_logging("lance=definitely_not_a_level") == -1,
+           "invalid logging filter should fail");
+    ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+           "invalid logging filter should be invalid argument");
+    const char *filter_error = lance_last_error_message();
+    ASSERT(filter_error != NULL &&
+               strstr(filter_error, "invalid logging filter") != NULL,
+           "invalid logging filter should set a message");
+    lance_free_string(filter_error);
+    ASSERT(lance_init_logging("off") == 0,
+           "valid logging filter should succeed");
+
     printf("OK\n");
 }
 

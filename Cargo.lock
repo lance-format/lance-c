@@ -3834,6 +3834,9 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
  "uuid",
 ]
 
