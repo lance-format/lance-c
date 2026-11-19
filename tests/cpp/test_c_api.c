@@ -38,6 +38,11 @@ _Static_assert(offsetof(LanceCompactionOptions, num_threads) == 24,
 _Static_assert(offsetof(LanceCompactionOptions, batch_size) == 32,
                "legacy compaction field 4 moved");
 
+_Static_assert(LANCE_C_VERSION ==
+                   (LANCE_C_VERSION_MAJOR * 1000000 +
+                    LANCE_C_VERSION_MINOR * 1000 + LANCE_C_VERSION_PATCH),
+               "LANCE_C_VERSION must encode major/minor/patch");
+
 /* Arrow C Data Interface flag bits — mirror arrow_schema/arrow_c_data_interface.h
  * so we don't depend on the full Arrow header just to read schema flags. */
 #define ARROW_FLAG_NULLABLE 2
@@ -8141,6 +8146,19 @@ static void test_dataset_deep_clone(const char *feature_uri) {
     printf("OK\n");
 }
 
+static void test_binding_version(void) {
+    const char *runtime = lance_c_version();
+    ASSERT(runtime != NULL, "lance_c_version must not return NULL");
+    ASSERT(lance_c_version() == runtime,
+           "lance_c_version must return process-lifetime storage");
+    ASSERT(strcmp(runtime, LANCE_C_VERSION_STRING) == 0,
+           "runtime and header versions must agree");
+    ASSERT(LANCE_C_VERSION_PRE[0] == '\0' ||
+               strstr(LANCE_C_VERSION_STRING, LANCE_C_VERSION_PRE) != NULL,
+           "pre-release macro must describe the version string");
+    printf("binding version: %s\n", runtime);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -8168,6 +8186,7 @@ int main(int argc, char **argv) {
     const char *alternate_base_uri = argv[12];
     printf("Running C API tests with dataset: %s\n", uri);
 
+    test_binding_version();
     test_batch_nearest(uri);
     test_materialization_and_fast_search(uri);
     test_open_and_metadata(uri);

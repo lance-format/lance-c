@@ -36,6 +36,14 @@ namespace lance {
 class Scanner;
 struct BatchCommitResult;
 
+// ─── Version ─────────────────────────────────────────────────────────────────
+
+/// Version of the loaded lance-c library, including any pre-release suffix.
+/// The returned view refers to process-lifetime storage owned by the library.
+inline std::string_view version() noexcept {
+    return std::string_view(lance_c_version());
+}
+
 // ─── Error ───────────────────────────────────────────────────────────────────
 
 class Error : public std::runtime_error {

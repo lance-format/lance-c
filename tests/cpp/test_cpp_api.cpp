@@ -44,6 +44,9 @@
 #define PASS()     printf("OK\n")
 
 static_assert(sizeof(LanceCompactionOptions) == 40);
+static_assert(LANCE_C_VERSION ==
+              (LANCE_C_VERSION_MAJOR * 1000000 +
+               LANCE_C_VERSION_MINOR * 1000 + LANCE_C_VERSION_PATCH));
 static_assert(std::is_move_constructible_v<lance::CompactionOptions>);
 static_assert(std::is_move_constructible_v<lance::CompactionPlan>);
 static_assert(std::is_move_constructible_v<lance::CompactionTask>);
@@ -5715,6 +5718,16 @@ static void test_dataset_shallow_clone_base_store_params(
     PASS();
 }
 
+static void test_binding_version() {
+    const char* runtime = lance_c_version();
+    assert(runtime != nullptr && "lance_c_version must not return NULL");
+    assert(lance_c_version() == runtime &&
+           "lance_c_version must return process-lifetime storage");
+    assert(std::string_view(LANCE_C_VERSION_STRING) == lance::version());
+    assert(std::string(runtime) == LANCE_C_VERSION_STRING);
+    std::printf("binding version: %s\n", runtime);
+}
+
 int main(int argc, char** argv) {
     if (argc < 13) {
         fprintf(stderr,
@@ -5740,6 +5753,7 @@ int main(int argc, char** argv) {
     std::string alternate_base_uri(argv[12]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
+    test_binding_version();
     test_dataset_open(uri);
     test_shared_session(uri);
     test_session_cache_config(session_uri);

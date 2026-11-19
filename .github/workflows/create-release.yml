@@ -144,6 +144,12 @@ jobs:
         run: |
           cargo set-version --package lance-c "${{ steps.versions.outputs.crate_version }}"
 
+      - name: Sync public header version
+        if: steps.versions.outputs.version_changed == 'true'
+        run: |
+          python3 .github/scripts/sync-version-header.py \
+            "${{ steps.versions.outputs.crate_version }}"
+
       - name: Configure git identity
         run: |
           git config user.name 'github-actions[bot]'
@@ -152,7 +158,7 @@ jobs:
       - name: Create release commit
         if: steps.versions.outputs.version_changed == 'true'
         run: |
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock include/lance/lance.h
           git commit -m "chore: bump version to ${{ steps.versions.outputs.crate_version }}"
 
       - name: Create tag

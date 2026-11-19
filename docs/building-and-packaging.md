@@ -164,7 +164,7 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
    - **release_type**: `patch` / `minor` / `major` (or `current` to cut another beta on the same base version, e.g. `v0.2.0-beta.2` after `v0.2.0-beta.1`).
    - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
    - **dry_run**: leave on for the first run to preview the computed tag and version without pushing.
-3. Re-run with **dry_run** off. The workflow updates `Cargo.toml` and `Cargo.lock`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref.
+3. Re-run with **dry_run** off. The workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/lance.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref.
 4. Verify that the release page contains all expected platform archives and checksums. Download an archive and run the consumer from the same tag.
 
 > **Branch protection:** If `main` is protected, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or configure `create-release.yml` with a PAT that has `contents: write`.
@@ -175,11 +175,13 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
 To cut a release manually without `create-release.yml`:
 
 1. Choose the new semver version (for `0.x.y`, bump **minor** for breaking changes or new features, **patch** for bug fixes).
-2. On `main`, update `version = ...` in [`Cargo.toml`](../Cargo.toml) and refresh `Cargo.lock`:
+2. On `main`, update `version = ...` in [`Cargo.toml`](../Cargo.toml), refresh `Cargo.lock`, and synchronize the public header macros:
    ```bash
    git checkout main && git pull
    # edit Cargo.toml version
    cargo update -p lance-c
+   python3 .github/scripts/sync-version-header.py 0.2.0
+   python3 .github/scripts/sync-version-header.py --check
    git checkout -b chore/release-0.2.0
    git commit -am "chore(release): v0.2.0"
    ```
