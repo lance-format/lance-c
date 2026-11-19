@@ -61,7 +61,7 @@ cc my_app.c $(pkg-config --cflags --libs lance-c) -o my_app
 
 Add `--static` and link `liblance_c.a` explicitly when using the static archive; see [pkg-config usage](docs/building-and-packaging.md#using-pkg-config).
 
-- **C++** — Include [lance/lance.hpp](include/lance/lance.hpp). Open a dataset with `lance::Dataset::open(uri)`, call `count_rows()` or create a scanner with `scan()`. Handles own their resources and failures throw `lance::Error`. The [CMake consumer](examples/cmake-consumer/main.cpp) is a complete program.
+- **C++** — Include [lance/lance.hpp](include/lance/lance.hpp). Open a dataset with `lance::Dataset::open(uri)`, call `count_rows()` or create a scanner with `scan()`. Handles own their resources and failures throw `lance::Error`. The [CMake consumer](examples/cmake-consumer/main.cpp) is a complete program; the same directory also has a [write/index/query workflow](examples/cmake-consumer/workflow.cpp).
 - **C** — Include [lance/lance.h](include/lance/lance.h). The [C11 scan example](examples/c-scan/) opens a dataset, iterates all Arrow batches, prints errors, and releases the batches, stream, and Lance handles. Set `LANCE_C_PREFIX` to the unpacked archive when building it with Make.
 
 ## Documentation
