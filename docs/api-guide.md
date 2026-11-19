@@ -894,3 +894,57 @@ registered only on a custom session are rejected. A copy or commit error does
 not guarantee that the target remains unpublished; reopen the target to check
 its state. Copied objects may remain under the target path and are not rolled
 back.
+
+## Diagnostic logging
+
+Native diagnostics are opt-in. Until the host calls `lance_init_logging`, the
+library installs no logger or tracing subscriber and emits no diagnostic output;
+`RUST_LOG` alone has no effect.
+
+```c
+if (lance_init_logging("warn,lance=debug,opendal=debug") != 0) {
+    /* Check lance_last_error_code()/message. */
+}
+```
+
+```cpp
+lance::init_logging("warn,lance=debug,opendal=debug");
+```
+
+The argument uses Rust `RUST_LOG` / tracing `EnvFilter` syntax, but the library
+does not read the environment itself: comma-separated `target=level` directives
+with an optional bare default level. NULL selects `info`; an empty string is
+invalid. The call installs a stderr formatter for `tracing` events and, unless
+the host already installed a `log` logger, a bridge for `log` records; both use
+the same filter. A host global keeps its own filtering. For example,
+`lance_init_logging(NULL)` enables info and above for every target.
+
+The `tracing` subscriber and `log` logger are process globals that can be
+installed only once. `lance_init_logging` preserves a logger or subscriber the
+host already installed instead of replacing it, so the host global keeps
+receiving its events. Calls are thread-safe and idempotent: the first successful
+call's filter is final and later calls do nothing. An invalid filter returns
+`-1` with `LANCE_ERR_INVALID_ARGUMENT` and leaves logging unconfigured, so a
+later valid call can still enable it.
+
+## Tokio runtime worker threads
+
+`lance-c` creates one process-wide, multi-thread Tokio runtime lazily on the
+first runtime-backed call. It does not add a binding-specific worker-count API
+or environment variable. The locked Tokio version (1.53.1 in `Cargo.lock`)
+reads `TOKIO_WORKER_THREADS` when that runtime is built because `lance-c` does
+not call `Builder::worker_threads`.
+
+- When unset, Tokio uses `std::thread::available_parallelism()`, the parallelism
+  available to the process, normally one worker per available CPU.
+- When set, it must parse as a positive `usize`. Zero, a non-numeric value, or a
+  non-Unicode value makes Tokio panic while building the runtime; `lance-c` does
+  not clamp or fall back. The panic is caught by the FFI panic boundary, so a
+  runtime-backed call fails instead of running with a different count.
+- The value is read once, when the runtime is first built. Set it before the
+  first runtime-backed `lance_*` call; changing it later has no effect.
+
+This variable controls the runtime's core worker threads only. Tokio's blocking
+pool cap is `max_blocking_threads + worker_threads` (512 plus the worker count
+by default), and the async callback dispatcher uses its own thread. So
+`TOKIO_WORKER_THREADS` does not bound every thread the library may create.

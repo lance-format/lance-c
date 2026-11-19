@@ -377,6 +377,41 @@ const char* lance_last_error_message(void);
 /** Free a string returned by lance_last_error_message(). */
 void lance_free_string(const char* s);
 
+/* ─── Diagnostic logging ─── */
+
+/**
+ * Opt in to native diagnostic logging on stderr.
+ *
+ * `filter` is a NUL-terminated filter expression using the same directive
+ * syntax as Rust's `RUST_LOG` (tracing's `EnvFilter`): comma-separated
+ * `target=level` directives with an optional bare default level. Common target
+ * prefixes are `lance`, `lance_core`, `lance_io`, `opendal`, and `lance_c`.
+ * For example, "warn,lance=debug,opendal=debug" enables warnings everywhere and
+ * debug diagnostics for Lance and OpenDAL. NULL selects "info"; an empty
+ * string is rejected.
+ *
+ * This call is optional; without it the library emits no diagnostics. It
+ * installs one stderr formatter for Rust `tracing` events and, unless the host
+ * already installed a `log` logger, a bridge that routes `log` records through
+ * the same filter. For the globals it installs, both event families obey the
+ * filter; a host global keeps its own filtering.
+ *
+ * The process-global logger and tracing subscriber can only be installed once.
+ * This function never replaces either one: if the host already installed a
+ * `log` logger or a `tracing` subscriber, that global remains in place and
+ * receives its events. If both are already installed, this function leaves
+ * them unchanged. Calls are thread-safe; the first successful call's filter
+ * is final and later calls are no-ops. An invalid filter returns -1 with
+ * LANCE_ERR_INVALID_ARGUMENT and leaves logging unconfigured, so a later valid
+ * call can still enable it.
+ *
+ * Filtering is evaluated per event; changing the filter after this call is not
+ * supported.
+ *
+ * @return 0 on success, -1 on an invalid or non-UTF-8 filter.
+ */
+int32_t lance_init_logging(const char* filter);
+
 /* ─── Opaque handles ─── */
 
 typedef struct LanceDataset  LanceDataset;

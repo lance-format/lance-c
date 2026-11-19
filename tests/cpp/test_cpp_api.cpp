@@ -5501,6 +5501,24 @@ static void test_diagnostics(const std::string& uri) {
     assert(lance::process_iops_counter() >= iops_before);
     assert(lance::process_bytes_read_counter() >= bytes_before);
 
+    bool bad_filter_rejected = false;
+    try {
+        lance::init_logging("lance=definitely_not_a_level");
+    } catch (const lance::Error& error) {
+        bad_filter_rejected = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    assert(bad_filter_rejected && "invalid logging filter must throw");
+
+    bool nul_filter_rejected = false;
+    try {
+        lance::init_logging(std::string_view("info\0extra", 10));
+    } catch (const lance::Error& error) {
+        nul_filter_rejected = error.code == LANCE_ERR_INVALID_ARGUMENT;
+    }
+    assert(nul_filter_rejected && "NUL-containing logging filter must throw");
+
+    lance::init_logging("off");
+
     PASS();
 }
 

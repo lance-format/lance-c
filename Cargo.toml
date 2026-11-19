@@ -58,6 +58,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util"]
 futures = "0.3"
 log = "0.4"
 libc = "0.2"
+# Direct for the opt-in stderr subscriber and its log bridge; these versions
+# are already present in Cargo.lock, so no new transitive versions are added.
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Direct for native object-store paths and raw-file sessions.
 object_store = "=0.14.2"
 # Explicitly install the HTTP transport when embedded in a static C/C++ executable.
