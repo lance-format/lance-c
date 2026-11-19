@@ -1865,7 +1865,14 @@ fn scan_header(source: &str) -> HeaderInventory {
         {
             let name = tokens[index + 1].clone();
             let (body, after) = take_braced(&tokens, index + 2);
-            inventory.plain_structs.insert(name, field_names(&body));
+            let fields = field_names(&body);
+            // A forward `typedef struct X X;` followed by `struct X { ... };`
+            // completes the public alias without repeating the typedef.
+            if inventory.opaque.remove(&name) {
+                inventory.structs.insert(name, fields);
+            } else {
+                inventory.plain_structs.insert(name, fields);
+            }
             index = after + 1;
             continue;
         }

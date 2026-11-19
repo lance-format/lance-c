@@ -413,11 +413,11 @@ typedef struct LanceFtsTokenList LanceFtsTokenList;
 typedef struct LanceBlobFile LanceBlobFile;
 typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
 typedef struct LanceDataFile LanceDataFile;
+/** Owned native `DataReplacementGroup` snapshot. */
 typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
 typedef struct LanceFragment LanceFragment;
 typedef struct LanceTransaction LanceTransaction;
 typedef struct LanceOperation LanceOperation;
-typedef struct LanceUpdateMap LanceUpdateMap;
 typedef struct LanceDataOverlayFile LanceDataOverlayFile;
 typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
 typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
@@ -432,7 +432,6 @@ typedef struct LanceSchema LanceSchema;
 typedef struct LanceNamespace LanceNamespace;
 typedef struct LanceRestAdapter LanceRestAdapter;
 typedef struct LanceCommitLock LanceCommitLock;
-typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 
 /* ─── Shared session ─── */
 
@@ -8038,10 +8037,10 @@ typedef struct LanceBaseStoreParams {
  * maps to native `Some(empty)`. Duplicate `base_path` keys use native
  * `HashMap` last-write-wins semantics.
  */
-typedef struct LanceBaseStoreParamsList {
+struct LanceBaseStoreParamsList {
     const LanceBaseStoreParams* items;
     size_t                      count;
-} LanceBaseStoreParamsList;
+};
 
 /**
  * Native cumulative `WriteStats` passed to the write-stats callback.
@@ -8788,9 +8787,6 @@ void lance_transaction_close(LanceTransaction* transaction);
 
 /** Close an operation handle. NULL-safe. Close exactly once. */
 void lance_operation_close(LanceOperation* operation);
-
-/** Owned native `DataReplacementGroup` snapshot. */
-typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
 
 /** Close a data replacement group. NULL-safe. Close exactly once. */
 void lance_data_replacement_group_close(LanceDataReplacementGroup* group);
@@ -12344,10 +12340,10 @@ typedef enum {
  * 8-4-4-4-12 order. The value is passed by pointer to
  * lance_dataset_merge_insert_with_compaction() and copied by native code.
  */
-typedef struct LanceCompactedSsTable {
+struct LanceCompactedSsTable {
     uint8_t  shard_id[16];
     uint64_t generation;
-} LanceCompactedSsTable;
+};
 
 /**
  * Per-index HNSW build parameters for a shard writer.

@@ -2,6 +2,13 @@
 
 See the [quickstart](../README.md#quickstart) for installation and a first read. These examples cover the current bindings. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
 
+## Header inclusion
+
+The C++ wrapper `<lance/lance.hpp>` is a large header-only interface. Include
+it only in the `.cpp` translation units that use the C++ API, rather than in
+widely included project headers, to limit compile time and rebuild scope where
+practical. C callers include `<lance/lance.h>` directly.
+
 ## Binding version
 
 `LANCE_C_VERSION_MAJOR`, `LANCE_C_VERSION_MINOR`, `LANCE_C_VERSION_PATCH`,
