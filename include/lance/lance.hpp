@@ -8477,6 +8477,18 @@ public:
         return v;
     }
 
+    /// Fully qualified URI resolved when this dataset was opened. For a
+    /// namespace-opened dataset this is the `describe_table` location, not the
+    /// table ID. The returned copy remains valid after this handle is destroyed.
+    /// Throws lance::Error on failure.
+    std::string uri() const {
+        const char* value = lance_dataset_uri(handle_.get());
+        if (!value) check_error();
+        std::string out(value);
+        lance_free_string(value);
+        return out;
+    }
+
     /// Latest version ID (queries object store).
     uint64_t latest_version() const {
         uint64_t v = lance_dataset_latest_version(handle_.get());

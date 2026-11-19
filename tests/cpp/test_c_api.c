@@ -502,6 +502,42 @@ static void test_open_and_metadata(const char *uri) {
     printf("OK\n");
 }
 
+static void test_dataset_uri(const char *uri) {
+    printf("  test_dataset_uri... ");
+
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "dataset open failed");
+    CHECK_OK();
+
+    const char *resolved = lance_dataset_uri(ds);
+    ASSERT(resolved != NULL, "dataset URI should not be NULL");
+    CHECK_OK();
+    ASSERT(strcmp(resolved, uri) == 0,
+           "direct open must preserve the caller URI");
+
+    LanceDataset *clone = lance_dataset_clone_handle(ds);
+    ASSERT(clone != NULL, "dataset clone failed");
+    const char *clone_uri = lance_dataset_uri(clone);
+    ASSERT(clone_uri != NULL, "clone URI should not be NULL");
+    ASSERT(strcmp(clone_uri, resolved) == 0,
+           "clone must share the source snapshot URI");
+
+    lance_dataset_close(ds);
+    ASSERT(strcmp(resolved, uri) == 0,
+           "URI must remain valid after its dataset closes");
+    ASSERT(strcmp(clone_uri, uri) == 0,
+           "clone URI must remain valid after the source closes");
+    lance_free_string(resolved);
+    lance_free_string(clone_uri);
+    lance_dataset_close(clone);
+
+    ASSERT(lance_dataset_uri(NULL) == NULL,
+           "NULL dataset must not return a URI");
+    expect_error_contains(LANCE_ERR_INVALID_ARGUMENT, "dataset is NULL",
+                          "lance_dataset_uri(NULL)");
+    printf("OK\n");
+}
+
 static void test_shared_session(const char *uri) {
     printf("  test_shared_session... ");
 
@@ -8171,6 +8207,7 @@ int main(int argc, char **argv) {
     test_batch_nearest(uri);
     test_materialization_and_fast_search(uri);
     test_open_and_metadata(uri);
+    test_dataset_uri(uri);
     test_shared_session(uri);
     test_session_cache_config(session_uri);
     test_scan(uri);

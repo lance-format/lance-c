@@ -456,13 +456,20 @@ static std::vector<PhysicalFileRow> read_all_files(
 static void test_dataset_open(const std::string& uri) {
     TEST(test_dataset_open);
 
-    auto ds = lance::Dataset::open(uri);
-    assert(ds.version() >= 1);
-    assert(ds.count_rows() > 0);
+    std::string resolved;
+    {
+        auto ds = lance::Dataset::open(uri);
+        assert(ds.version() >= 1);
+        assert(ds.count_rows() > 0);
 
-    printf("version=%llu, rows=%llu... ",
-           (unsigned long long)ds.version(),
-           (unsigned long long)ds.count_rows());
+        resolved = ds.uri();
+        assert(resolved == uri);
+
+        printf("version=%llu, rows=%llu... ",
+               (unsigned long long)ds.version(),
+               (unsigned long long)ds.count_rows());
+    }
+    assert(resolved == uri && "URI must survive its dataset handle");
 
     PASS();
 }

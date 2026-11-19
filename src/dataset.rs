@@ -3,7 +3,7 @@
 
 //! Dataset C API: open, close, metadata, schema, take.
 
-use std::ffi::c_char;
+use std::ffi::{CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
 use std::sync::{Arc, RwLock};
@@ -505,6 +505,37 @@ unsafe fn dataset_version_inner(dataset: *const LanceDataset) -> Result<u64> {
     }
     let ds = unsafe { &*dataset };
     Ok(ds.snapshot().version().version)
+}
+
+/// Return this snapshot's fully qualified native URI.
+///
+/// The value is copied from native `Dataset::uri()` while holding a snapshot
+/// of the handle, so it remains valid after the dataset is closed. A dataset
+/// opened through a namespace returns the native `describe_table` location,
+/// not the table ID.
+///
+/// Caller must free the returned string with `lance_free_string()`.
+/// Returns NULL on error, including when `dataset` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_dataset_uri(dataset: *const LanceDataset) -> *const c_char {
+    ffi_try!(unsafe { dataset_uri_inner(dataset) }, null)
+}
+
+unsafe fn dataset_uri_inner(dataset: *const LanceDataset) -> Result<*const c_char> {
+    if dataset.is_null() {
+        return Err(lance_core::Error::invalid_input_source(
+            "dataset is NULL".into(),
+        ));
+    }
+    let snapshot = unsafe { &*dataset }.snapshot();
+    CString::new(snapshot.uri())
+        .map(CString::into_raw)
+        .map(|value| value as *const c_char)
+        .map_err(|error| {
+            lance_core::Error::internal(format!(
+                "dataset URI contains an embedded NUL byte: {error}"
+            ))
+        })
 }
 
 /// Return the number of rows in the dataset.

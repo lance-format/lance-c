@@ -252,7 +252,24 @@ int main(int argc, char** argv) {
         ns, table_id, NULL, 0, NULL);
     CHECK(opened != NULL, "namespace open");
     CHECK(lance_dataset_count_rows(opened) == 3, "reopen rows");
+    const char* resolved = lance_dataset_uri(opened);
+    CHECK(resolved != NULL, "namespace dataset URI");
+    CHECK(strlen(resolved) > 0, "namespace dataset URI is nonempty");
+    CHECK(strcmp(resolved, table_id) != 0,
+          "namespace dataset URI must not be the table ID");
+    CHECK(strstr(resolved, "numbers") != NULL,
+          "namespace dataset URI must identify the resolved table");
     lance_dataset_close(opened);
+    CHECK(strstr(resolved, "numbers") != NULL,
+          "namespace dataset URI must outlive the dataset handle");
+    lance_free_string(resolved);
+    CHECK(lance_dataset_uri(NULL) == NULL, "NULL dataset URI");
+    CHECK(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+          "NULL dataset URI error code");
+    const char* uri_error = lance_last_error_message();
+    CHECK(uri_error != NULL && strstr(uri_error, "dataset is NULL") != NULL,
+          "NULL dataset URI error message");
+    lance_free_string(uri_error);
 
     char* metrics = lance_namespace_retrieve_ops_metrics(ns);
     CHECK(metrics != NULL && strstr(metrics, ":") != NULL, "metrics");

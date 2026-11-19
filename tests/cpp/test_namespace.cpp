@@ -110,6 +110,39 @@ bool contains(const std::string& value, const std::string& needle) {
     return value.find(needle) != std::string::npos;
 }
 
+std::string json_string_field(
+    const std::string& json,
+    const std::string& field) {
+    const std::string marker = "\"" + field + "\":\"";
+    auto start = json.find(marker);
+    if (start == std::string::npos) {
+        throw std::runtime_error("missing JSON string field: " + field);
+    }
+    start += marker.size();
+    std::string value;
+    for (size_t i = start; i < json.size(); ++i) {
+        const char c = json[i];
+        if (c == '"') return value;
+        if (c != '\\') {
+            value.push_back(c);
+            continue;
+        }
+        if (++i >= json.size()) break;
+        switch (json[i]) {
+            case '"': value.push_back('"'); break;
+            case '\\': value.push_back('\\'); break;
+            case '/': value.push_back('/'); break;
+            case 'b': value.push_back('\b'); break;
+            case 'f': value.push_back('\f'); break;
+            case 'n': value.push_back('\n'); break;
+            case 'r': value.push_back('\r'); break;
+            case 't': value.push_back('\t'); break;
+            default: value.push_back(json[i]); break;
+        }
+    }
+    throw std::runtime_error("unterminated JSON string field: " + field);
+}
+
 void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -170,6 +203,15 @@ int main(int argc, char** argv) {
         backend.reset_ops_metrics();
         metrics = backend.ops_metrics_json();
         require(metrics == "{}" || contains(metrics, "\"0\""), "metrics reset");
+
+        auto described = backend.call(
+            "describe_table", R"({"id":["workspace","numbers"]})");
+        require(described.has_json(), "describe_table location");
+        const std::string opened_uri = opened.uri();
+        require(opened_uri == json_string_field(*described.json(), "location"),
+                "namespace URI must be the describe_table location");
+        require(opened_uri != R"(["workspace","numbers"])",
+                "namespace URI must not be the table ID");
 
         // RAII + four managed-version callbacks. Unimplemented operations keep
         // native Unsupported and preserve the native code separately.
