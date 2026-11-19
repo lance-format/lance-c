@@ -158,6 +158,13 @@ int main(int argc, char** argv) {
         auto opened = lance::Dataset::open_namespace(backend, table_id);
         require(opened.count_rows() == 3, "reopen count");
 
+        // A namespace-backed provider retains the native namespace itself.
+        lance::StorageOptionsProvider provider =
+            lance::StorageOptionsProvider::from_namespace(backend, table_id);
+        const std::string provider_id = provider.provider_id();
+        require(contains(provider_id, "workspace"), "provider namespace id");
+        require(contains(provider_id, "numbers"), "provider table id");
+
         auto metrics = backend.ops_metrics_json();
         require(contains(metrics, ":"), "directory metrics");
         backend.reset_ops_metrics();

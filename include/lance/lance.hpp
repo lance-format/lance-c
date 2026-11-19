@@ -3069,6 +3069,11 @@ using StorageOptions = std::map<std::string, std::string>;
 class StorageOptionsProvider {
     Handle<LanceStorageOptionsProvider, lance_storage_options_provider_close> handle_;
 
+    explicit StorageOptionsProvider(LanceStorageOptionsProvider* provider)
+        : handle_(provider) {
+        if (!handle_) check_error();
+    }
+
 public:
     using Fetch = std::function<std::optional<StorageOptions>()>;
 
@@ -3076,6 +3081,13 @@ public:
         std::string provider_id,
         Fetch fetch,
         Fetch force_fetch = {});
+
+    /// Create a provider backed by a native namespace. The provider retains
+    /// the namespace, so it may outlive this C++ handle. `table_id` is the
+    /// native table path; every component is borrowed only for this call.
+    static StorageOptionsProvider from_namespace(
+        const Namespace& ns,
+        const std::vector<std::string>& table_id);
 
     const LanceStorageOptionsProvider* c_handle() const { return handle_.get(); }
 
@@ -5550,6 +5562,12 @@ public:
     /// Native `CompactionOptions::from_dataset_config(dataset.config())`.
     static CompactionOptions from_dataset(const Dataset& dataset);
 
+    CompactionOptions clone() const {
+        auto* raw = lance_compaction_options_v2_clone(handle_.get());
+        if (!raw) check_error();
+        return CompactionOptions(raw);
+    }
+
     CompactionOptions& set_target_rows_per_fragment(uint64_t value) {
         if (lance_compaction_options_v2_set_target_rows_per_fragment(
                 handle_.get(), value) != 0) check_error();
@@ -5936,6 +5954,12 @@ public:
         default;
     OptimizeIndicesOptions(const OptimizeIndicesOptions&) = delete;
     OptimizeIndicesOptions& operator=(const OptimizeIndicesOptions&) = delete;
+
+    OptimizeIndicesOptions clone() const {
+        auto* raw = lance_optimize_indices_options_clone(handle_.get());
+        if (!raw) check_error();
+        return OptimizeIndicesOptions(raw);
+    }
 
     OptimizeIndicesOptions& set_num_indices_to_merge(
         std::optional<uint64_t> value) {
@@ -6723,6 +6747,14 @@ public:
         }
         return ShardingSpec(raw);
     }
+
+    /// Evaluate against the dataset's native snapshot schema. The dataset and
+    /// batch are borrowed for the call; the returned batch owns the native
+    /// result.
+    Batch evaluate(const Dataset& dataset, const Batch& batch) const;
+
+    /// Evaluate against an explicit native schema instead of a dataset schema.
+    Batch evaluate(const Batch& batch, const LanceSchema& schema) const;
 
     uint32_t id() const {
         return lance_mem_wal_sharding_spec_id(handle_.get());
@@ -13892,6 +13924,15 @@ public:
     const LanceNamespace* c_handle() const noexcept { return handle_.get(); }
 };
 
+inline StorageOptionsProvider StorageOptionsProvider::from_namespace(
+    const Namespace& ns,
+    const std::vector<std::string>& table_id) {
+    auto table_json = namespace_detail::json_string_array(table_id);
+    auto* raw = lance_namespace_storage_options_provider_new(
+        ns.c_handle(), table_json.c_str());
+    return StorageOptionsProvider(raw);
+}
+
 /// Move-only owner of a running native REST adapter.
 class RestAdapter {
     Handle<LanceRestAdapter, lance_rest_adapter_close> handle_;
@@ -14042,6 +14083,27 @@ inline LanceSchema LanceSchema::from_arrow(const ArrowSchema* schema) {
     ::LanceSchema* raw = nullptr;
     if (lance_schema_from_arrow(schema, &raw) != 0) check_error();
     return LanceSchema(raw);
+}
+
+inline Batch ShardingSpec::evaluate(
+    const Dataset& dataset, const Batch& batch) const {
+    ::LanceBatch* raw = nullptr;
+    if (lance_mem_wal_evaluate_sharding_spec(
+            const_cast<::LanceDataset*>(dataset.c_handle()),
+            batch.c_handle(), handle_.get(), &raw) != 0) {
+        check_error();
+    }
+    return Batch(raw);
+}
+
+inline Batch ShardingSpec::evaluate(
+    const Batch& batch, const LanceSchema& schema) const {
+    ::LanceBatch* raw = nullptr;
+    if (lance_mem_wal_evaluate_sharding_spec_with_schema(
+            batch.c_handle(), handle_.get(), schema.c_handle(), &raw) != 0) {
+        check_error();
+    }
+    return Batch(raw);
 }
 
 inline void Dataset::initialize_mem_wal(const MemWalInitOptions& options) {
