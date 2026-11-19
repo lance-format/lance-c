@@ -2243,4 +2243,20 @@ fn test_arrow_header_include_orders() {
             "C++20 consumer with {source_name} failed to compile"
         );
     }
+
+    let data_only_include_dir = consumer_dir.join("arrow_abi_data");
+    let data_only_include_dirs = [include_dir.as_path(), data_only_include_dir.as_path()];
+    let source_name = "header_data_only_before_lance.c";
+    let source = consumer_dir.join(source_name);
+    assert!(
+        compile_c_header_test(&source, &data_only_include_dirs),
+        "C11 consumer with {source_name} failed to compile"
+    );
+
+    let source_name = "header_data_only_before_lance.cpp";
+    let source = consumer_dir.join(source_name);
+    assert!(
+        compile_cpp_header_test(&source, &data_only_include_dirs),
+        "C++20 consumer with {source_name} failed to compile"
+    );
 }
