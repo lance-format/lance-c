@@ -469,7 +469,58 @@ typedef struct LanceRestAdapter LanceRestAdapter;
 typedef struct LanceCommitLock LanceCommitLock;
 typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 
+/* ─── Thread safety ─── */
+
+/**
+ * Thread-safety contract for opaque handles and exported streams.
+ *
+ * A handle pointer is a lifetime token, not a lock. A `const` parameter or a
+ * native `Send`/`Sync` bound does not by itself allow arbitrary concurrent
+ * calls through one C pointer; only the operations described here and at the
+ * handle's own declaration may overlap. Handles not listed here are not
+ * implicitly shareable.
+ *
+ * - `LanceDataset`: snapshot reads and in-place mutations may run concurrently.
+ *   Mutations serialize on the handle's internal write lock, which is held for
+ *   the complete native call, including synchronous callbacks. Readers that
+ *   already hold a snapshot keep their old view.
+ * - `LanceSession`: inspection calls may run concurrently, and one session may
+ *   back concurrent opens. Statistics are current values, not one atomic
+ *   snapshot across cache tiers.
+ * - `LanceFileReader`: read-only calls may run concurrently. Each read creates
+ *   an independent stream.
+ * - `LanceNamespace`: ordinary calls may run concurrently. Custom operation
+ *   and context-provider callbacks must be thread-safe.
+ * - `LanceScanner` and `LanceFileWriter`: serialize all calls on one handle.
+ * - `ArrowArrayStream`: serialize `get_schema`, `get_next`, `get_last_error`
+ *   and `release` on one stream. Different streams are independent.
+ *   `get_last_error` returns a borrowed pointer owned by the stream; it is
+ *   valid only until the next operation on that stream or release.
+ *
+ * `lance_*_close` and `lance_*_free` take exclusive ownership of their pointer:
+ * they must not overlap any other use of that pointer. Closing a handle
+ * releases only that handle. Successfully returned children and snapshots keep
+ * the native ownership described at their declarations and may outlive the
+ * producer. Borrowed pointers keep only their documented lifetime; concurrent
+ * use of the producer does not extend it, and a mutable call or close may
+ * invalidate it.
+ *
+ * Synchronous callbacks run inside the native call that invoked them. A
+ * callback must not close or re-enter the handle whose call is still on the
+ * stack; use an independent handle or a snapshot acquired before the call.
+ * Callbacks that native code may run on another thread or concurrently must be
+ * thread-safe as stated at their declaration.
+ */
+
 /* ─── Shared session ─── */
+
+/*
+ * A session handle may be shared across threads. Cache-statistics and
+ * inspection calls may run concurrently, and the same session may back
+ * concurrent opens. The counters are thread-safe current values, not one
+ * atomic snapshot across the index and metadata caches. Closing the handle
+ * does not invalidate children that retain native ownership.
+ */
 
 /**
  * Snapshot of a shared session's cache statistics.
@@ -617,6 +668,17 @@ int32_t lance_session_get_approx_num_items(
 );
 
 /* ─── Dataset lifecycle ─── */
+
+/*
+ * A dataset handle may be shared across threads. Snapshot-based reads may
+ * overlap each other and may overlap in-place mutations. In-place mutations
+ * take the handle's internal write lock for the complete native call, including
+ * synchronous callbacks, so they serialize; a reader that already holds a
+ * snapshot keeps its old view. Snapshot-style operations such as restore and
+ * checkout_* work from a snapshot and return a new handle; they do not mutate
+ * the source handle and are not serialized by its lock. Restore still follows
+ * native commit-conflict rules. lance_dataset_close is exclusive.
+ */
 
 /**
  * Open a Lance dataset.
@@ -5086,6 +5148,16 @@ int32_t lance_dataset_read_blob_ranges(
 );
 
 /* ─── Scanner builder ─── */
+
+/*
+ * A scanner is a stateful builder and iterator; no internal lock makes its
+ * configuration or iteration calls concurrent. All lance_scanner_* calls on
+ * one handle must be serialized by the caller, including planning,
+ * introspection, iteration, poll, and async entry points.
+ * Each exported ArrowArrayStream is independent and may outlive the scanner,
+ * but callbacks on one stream must be serialized. lance_scanner_close is
+ * exclusive and waits for in-flight poll wakers.
+ */
 
 /**
  * Create a scanner for the dataset.
@@ -11025,6 +11097,15 @@ void lance_storage_options_snapshot_close(
 
 /* ─── Native Lance namespaces ─────────────────────────────────────────────── */
 
+/*
+ * Ordinary namespace calls on one handle may run concurrently. Custom
+ * operation callbacks and dynamic context providers may be invoked
+ * concurrently on native worker threads and must be thread-safe; they must not
+ * close or re-enter the originating namespace handle. Children such as
+ * datasets, storage providers and adapters retain native ownership after
+ * lance_namespace_close.
+ */
+
 /**
  * Result of one native namespace operation.
  *
@@ -11068,7 +11149,10 @@ char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* ns);
 int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* ns);
 
 /**
- * Synchronous, infallible dynamic context provider.
+ * Synchronous, infallible dynamic context provider. Native may invoke it
+ * concurrently from REST worker threads, so the callback and `provider_ctx`
+ * must be thread-safe. It must not close or re-enter the originating namespace
+ * handle.
  *
  * Return a JSON object of string values through `out_result_json`. The native
  * REST client strips the `headers.` prefix from keys and applies them after
@@ -11273,9 +11357,12 @@ void lance_rest_adapter_close(LanceRestAdapter* adapter);
  * LANCE_ERR_COMMIT_CONFLICT becomes ConcurrentModification). All other
  * operations keep native Unsupported behavior.
  *
- * Callbacks may synchronously call independent C handles. They run in the
- * established reentrant blocking region and must not assume the same mutating
- * dataset handle is reentrant.
+ * Callbacks may run concurrently on native worker threads and must be
+ * thread-safe. They may synchronously call independent C handles. They run in
+ * the established reentrant blocking region, must not assume the same mutating
+ * dataset handle is reentrant, and must not close or re-enter the namespace
+ * handle that is invoking them. The final release may run while
+ * lance_namespace_close() is retiring that handle and must not access it.
  *
  * Ownership of `client_ctx` and `release` transfers when this function is
  * called, including on construction failure. The context is released exactly
@@ -11723,6 +11810,14 @@ int32_t lance_file_session_get_store_io_stats(
 
 /* ─── Raw Lance-file reader ───────────────────────────────────────────────── */
 
+/*
+ * Read-only calls on one reader may run concurrently. Each read_all,
+ * read_range, or read_indices call creates an independent stream. Exported
+ * streams retain their own native ownership and may outlive the reader, but
+ * callbacks on one stream must be serialized. lance_file_reader_close must not
+ * overlap a call on the reader.
+ */
+
 LanceFileReader* lance_file_reader_open(
     const char* uri_or_path,
     const LanceStorageOptionsAccessor* storage_options,
@@ -11894,6 +11989,14 @@ int32_t lance_file_statistics_get_columns(
 void lance_file_statistics_close(LanceFileStatistics* statistics);
 
 /* ─── Raw Lance-file writer ───────────────────────────────────────────────── */
+
+/*
+ * A writer has no internal lock. All calls on one LanceFileWriter must be
+ * serialized, including write_batch, metadata and global-buffer additions,
+ * finish, abort, and close. write_batch borrows the batch; the writer may
+ * clone its Arrow arrays, and the caller may free the batch after the call
+ * returns. Different writers are independent.
+ */
 
 LanceFileWriter* lance_file_writer_open(
     const char* uri_or_path,
