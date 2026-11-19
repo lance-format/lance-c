@@ -2,7 +2,7 @@
 
 See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
 
-The core workflows use public calls present in v0.2.0-beta.1 and current source, and were exercised against the published beta.1 library. That release pins Lance 15.0.0-beta.25. Behavior that requires a newer Lance core is not part of the beta.1 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
+The core workflows use public calls present in v0.2.0 and current source, and were exercised against the published 0.2.0 library. That release pins Lance 15.0.0-beta.25; a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Behavior that requires a newer Lance core is not part of the 0.2.0 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
 
 ## Write Arrow batches
 
@@ -393,7 +393,7 @@ fts query: 1 2 4
 workflow: PASS
 ```
 
-The example uses only calls and behavior present in v0.2.0-beta.1. It is not a statement that later unreleased APIs are part of the beta.1 archive.
+The example uses only calls and behavior present in v0.2.0. It is not a statement that later unreleased APIs are part of the 0.2.0 archive.
 
 ## Errors and panic recovery
 
@@ -458,8 +458,8 @@ if (lance::version() != LANCE_C_VERSION_STRING) {
 }
 ```
 
-`lance_c_version()` / `lance::version()` return the full version including a
-pre-release suffix such as `0.2.0-beta.1`. The string is owned by the library,
+`lance_c_version()` / `lance::version()` return the full package version,
+including a pre-release suffix when present. The string is owned by the library,
 remains valid for the process lifetime, and must not be freed.
 
 ## Dataset metadata

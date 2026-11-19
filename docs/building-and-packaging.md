@@ -6,7 +6,7 @@ This document provides platform-specific build instructions, binary packaging co
 
 - [Published prebuilt archives](#published-prebuilt-archives)
 - [Linux runtime requirements](#linux-baseline-for-future-packages)
-- [Preview quickstart (`v0.2.0-beta.1`)](#preview-quickstart-v020-beta1)
+- [Try the published package](#try-the-published-package)
 - [Building from source via Cargo](#from-source-via-cargo-rust-developers)
 - [Building from source via CMake](#from-source-via-cmake-cc-developers-and-packagers)
 - [Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)](#windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc)
@@ -24,19 +24,21 @@ Each release `.tar.xz` archive unpacks an install prefix containing:
 - `lib/pkgconfig/lance-c.pc`
 - `share/licenses/lance-c/LICENSE` (and `share/doc/lance-c/README.md` in Windows archives)
 
-In the preview, Linux and macOS release shared libraries (`liblance_c.so`, `liblance_c.dylib`) are stripped of debug/local symbols and restrict their defined dynamic exports to the public `lance_*` C ABI. Windows requires both `lance_c.dll` and `lance_c.dll.lib` to expose only the header-declared `lance_*` symbols. Static archives (`liblance_c.a`, `lance_c.lib`) are unstripped so they retain the symbol table required for static linking.
+In the published archives, Linux and macOS release shared libraries (`liblance_c.so`, `liblance_c.dylib`) are stripped of debug/local symbols and restrict their defined dynamic exports to the public `lance_*` C ABI. Windows requires both `lance_c.dll` and `lance_c.dll.lib` to expose only the header-declared `lance_*` symbols. Static archives (`liblance_c.a`, `lance_c.lib`) are unstripped so they retain the symbol table required for static linking.
 
-### Preview release (`v0.2.0-beta.1`)
+### Stable release (`v0.2.0`)
 
-[`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1) is a GitHub pre-release. It publishes five prebuilt archives, per-archive `.sha256` and `.sha512` files, and a five-line `SHA512SUMS`:
+[`v0.2.0`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) is the first stable release of the 0.2.x line. It pins Lance 15.0.0-beta.25 (`f5dbd55d`); a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. It publishes five prebuilt archives, per-archive `.sha256` and `.sha512` files, and a five-line `SHA512SUMS`:
 
 | Platform | Archive | Runtime & ABI contract |
 | --- | --- | --- |
-| Linux `x86_64` | `lance-c-v0.2.0-beta.1-x86_64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` (`pthread`/`dl` on older glibc); C++20 for `lance.hpp` |
-| Linux `aarch64` | `lance-c-v0.2.0-beta.1-aarch64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`; C++20 for `lance.hpp` |
-| macOS `arm64` | `lance-c-v0.2.0-beta.1-aarch64-apple-darwin.tar.xz` | Apple silicon (`minos 11.0`); C++20 for `lance.hpp` |
-| Windows `x86_64` | `lance-c-v0.2.0-beta.1-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
-| Windows `ARM64` | `lance-c-v0.2.0-beta.1-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
+| Linux `x86_64` | `lance-c-v0.2.0-x86_64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` (`pthread`/`dl` on older glibc); C++20 for `lance.hpp` |
+| Linux `aarch64` | `lance-c-v0.2.0-aarch64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`; C++20 for `lance.hpp` |
+| macOS `arm64` | `lance-c-v0.2.0-aarch64-apple-darwin.tar.xz` | Apple silicon (`minos 11.0`); C++20 for `lance.hpp` |
+| Windows `x86_64` | `lance-c-v0.2.0-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
+| Windows `ARM64` | `lance-c-v0.2.0-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
+
+The 0.2.x prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
 
 <a id="linux-baseline-for-future-packages"></a>
 
@@ -44,7 +46,7 @@ In the preview, Linux and macOS release shared libraries (`liblance_c.so`, `libl
 
 The two Linux archives target glibc 2.28 on x86_64 and AArch64. Source builds link against the build host’s libc.
 
-<a id="preview-quickstart-v020-beta1"></a>
+<a id="try-the-published-package"></a>
 
 ## Try the published package
 
@@ -113,7 +115,7 @@ cc myapp.c $(pkg-config --cflags --libs lance-c) -o myapp
 <a id="windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc"></a>
 ## Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)
 
-Windows prebuilt archives are published starting with [`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1).
+Windows prebuilt archives are published in the [v0.2.0 release](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) and later 0.2.x releases.
 
 ### Building from source on Windows
 
@@ -163,7 +165,7 @@ The install prefix contains `lib/lance_c.dll`, its import library `lib/lance_c.d
 <a id="releasing"></a>
 ## Releasing
 
-Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), which builds five prebuilt `.tar.xz` archives (Linux `x86_64` and `aarch64` targeting `glibc 2.28`, macOS `arm64`, and Windows `x86_64` and `aarch64`), verifies exports/runtime dependencies/consumers, and attaches the archives and checksums to a GitHub Release. Beta tags (`v*-beta.*`) are published as GitHub pre-releases.
+Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), which builds five prebuilt `.tar.xz` archives (Linux `x86_64` and `aarch64` targeting `glibc 2.28`, macOS `arm64`, and Windows `x86_64` and `aarch64`), verifies exports/runtime dependencies/consumers, and attaches the archives and checksums to a GitHub Release. Beta tags (`v*-beta.*`) are published as GitHub pre-releases; stable tags publish a normal release. Generated notes are grouped by [`.github/release.yml`](../.github/release.yml).
 
 <a id="recommended-cut-a-release-via-actions-ui"></a>
 ### Recommended: cut a release via Actions UI
@@ -172,10 +174,10 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
 
 1. Open Actions → **Create Release** → **Run workflow** on `main`.
 2. Choose:
-   - **release_type**: `patch` / `minor` / `major` (or `current` to cut another beta on the same base version, e.g. `v0.2.0-beta.2` after `v0.2.0-beta.1`).
+   - **release_type**: `patch` / `minor` / `major`. Use `current` to keep the version in `Cargo.toml`: with `stable` after the release PR has set the baseline version, or with `preview` to cut another beta on the same base version.
    - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
    - **dry_run**: leave on for the first run to preview the computed tag and version without pushing.
-3. Re-run with **dry_run** off. The workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/lance.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref.
+3. Re-run with **dry_run** off. When the version changes, the workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/lance.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref. With `release_type: current`, it tags the current release commit without another version commit.
 4. Verify that the release page contains all expected platform archives and checksums. Download an archive and run the consumer from the same tag.
 
 > **Branch protection:** If `main` is protected, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or configure `create-release.yml` with a PAT that has `contents: write`.
