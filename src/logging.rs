@@ -13,6 +13,7 @@ use std::ffi::c_char;
 use std::sync::Mutex;
 
 use lance_core::{Error, Result};
+use tracing_core::callsite::rebuild_interest_cache;
 use tracing_log::AsLog;
 use tracing_subscriber::EnvFilter;
 
@@ -44,8 +45,8 @@ static INITIALIZED: Mutex<bool> = Mutex::new(false);
 /// The process-global logger and tracing subscriber can only be installed once.
 /// This function never replaces either one: if the host already installed a
 /// `log` logger or a `tracing` subscriber, that global remains in place and
-/// receives its events. If both are already installed, this function has no
-/// observable effect. Calls are thread-safe; the first successful call's filter
+/// receives its events. If both are already installed, this function leaves
+/// them unchanged. Calls are thread-safe; the first successful call's filter
 /// is final and later calls are no-ops. An invalid filter returns -1 with
 /// `LANCE_ERR_INVALID_ARGUMENT` and leaves logging unconfigured, so a later
 /// valid call can still enable it.
@@ -82,11 +83,19 @@ unsafe fn init_logging_inner(filter: *const c_char) -> Result<i32> {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .finish();
-    // `set_global_default` fails only when the host already installed a
-    // subscriber, in which case that subscriber stays in place.
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        // `set_global_default` builds a `Dispatch` (which registers it and
+        // rebuilds callsite interest) before checking the global slot. The
+        // rejected Dispatch is dropped by now, but the interest and
+        // `LevelFilter::current()` it contributed are not. Rebuild from the
+        // surviving host dispatchers so a failed install leaves no stale level
+        // or callsite interest in the host process. tracing-core has no public
+        // atomic install-if-absent operation, so a concurrent host install has
+        // this same failure path.
+        rebuild_interest_cache();
+    }
 
-    // Match the effective subscriber level so the `log` facade can skip records
+    // Match the surviving subscriber level so the `log` facade can skip records
     // before they reach the tracing dispatcher. If the host installed a `log`
     // logger, this fails without changing its max level or replacing it.
     let _ = tracing_log::LogTracer::builder()

@@ -355,8 +355,8 @@ void lance_free_string(const char* s);
  * The process-global logger and tracing subscriber can only be installed once.
  * This function never replaces either one: if the host already installed a
  * `log` logger or a `tracing` subscriber, that global remains in place and
- * receives its events. If both are already installed, this function has no
- * observable effect. Calls are thread-safe; the first successful call's filter
+ * receives its events. If both are already installed, this function leaves
+ * them unchanged. Calls are thread-safe; the first successful call's filter
  * is final and later calls are no-ops. An invalid filter returns -1 with
  * LANCE_ERR_INVALID_ARGUMENT and leaves logging unconfigured, so a later valid
  * call can still enable it.

@@ -61,6 +61,7 @@ libc = "0.2"
 # Direct for the opt-in stderr subscriber and its log bridge; these versions
 # are already present in Cargo.lock, so no new transitive versions are added.
 tracing = "0.1"
+tracing-core = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Direct for native object-store paths and raw-file sessions.

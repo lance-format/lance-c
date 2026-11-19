@@ -18,6 +18,8 @@ use lance_c::{
     LanceErrorCode, lance_free_string, lance_init_logging, lance_last_error_code,
     lance_last_error_message,
 };
+use tracing::level_filters::LevelFilter as TracingLevelFilter;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
 
 const CHILD_ENV: &str = "LANCE_C_LOGGING_TEST_CHILD";
@@ -32,6 +34,95 @@ const HOST_SUBSCRIBER_LOG_TARGET: &str = "lance_c_logging_host_subscriber_log";
 const HOST_SUBSCRIBER_TRACE_TARGET: &str = "lance_c_logging_host_subscriber_trace";
 const FIRST_TARGET: &str = "lance_c_logging_first";
 const CONCURRENT_TARGET: &str = "lance_c_logging_concurrent";
+const RESTRICTED_TRACE_TARGET: &str = "lance_c_logging_restricted_trace";
+const RESTRICTED_WARN_TARGET: &str = "lance_c_logging_restricted_warn";
+const RESTRICTED_LOG_INFO_TARGET: &str = "lance_c_logging_restricted_log_info";
+const RESTRICTED_LOG_WARN_TARGET: &str = "lance_c_logging_restricted_log_warn";
+const BOTH_TRACE_TARGET: &str = "lance_c_logging_both_trace";
+const BOTH_WARN_TARGET: &str = "lance_c_logging_both_warn";
+const BOTH_LOG_INFO_TARGET: &str = "lance_c_logging_both_log_info";
+const BOTH_LOG_WARN_TARGET: &str = "lance_c_logging_both_log_warn";
+const SCOPED_TARGET: &str = "lance_c_logging_scoped_only";
+
+static LOG_RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+struct RecordingLogger;
+
+impl log::Log for RecordingLogger {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        LOG_RECORDS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("record mutex")
+            .push(record.target().to_owned());
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_host_logger(max_level: log::LevelFilter) -> &'static Mutex<Vec<String>> {
+    log::set_boxed_logger(Box::new(RecordingLogger)).expect("install host logger");
+    log::set_max_level(max_level);
+    LOG_RECORDS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[derive(Default)]
+struct EventTarget {
+    target: Option<String>,
+}
+
+impl tracing::field::Visit for EventTarget {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if matches!(field.name(), "target" | "log.target") {
+            self.target = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+#[derive(Clone, Default)]
+struct TargetLayer {
+    targets: Arc<Mutex<Vec<String>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TargetLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = EventTarget::default();
+        event.record(&mut fields);
+        // `tracing-log` events carry the original `log` target as a field;
+        // native tracing events carry it in the event metadata.
+        let target = fields
+            .target
+            .unwrap_or_else(|| event.metadata().target().to_owned());
+        self.targets.lock().expect("target mutex").push(target);
+    }
+}
+
+fn install_host_subscriber(filter: Option<&str>) -> Arc<Mutex<Vec<String>>> {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let layer = TargetLayer {
+        targets: Arc::clone(&targets),
+    };
+    if let Some(filter) = filter {
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(tracing_subscriber::EnvFilter::new(filter)));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install filtered host subscriber");
+    } else {
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::set_global_default(subscriber).expect("install host subscriber");
+    }
+    targets
+}
 
 fn run_child(test_name: &str) -> std::process::Output {
     let exe = std::env::current_exe().expect("current test executable");
@@ -171,34 +262,13 @@ fn host_log_logger_is_preserved() {
         return;
     }
 
-    static RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-
-    struct RecordingLogger;
-
-    impl log::Log for RecordingLogger {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            RECORDS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .expect("record mutex")
-                .push(record.target().to_owned());
-        }
-
-        fn flush(&self) {}
-    }
-
-    log::set_boxed_logger(Box::new(RecordingLogger)).expect("install host logger");
-    log::set_max_level(log::LevelFilter::Trace);
+    let records = install_host_logger(log::LevelFilter::Warn);
 
     assert_eq!(init_logging("lance_c_logging_host_logger=info"), 0);
-    log::error!(target: HOST_LOGGER_LOG_TARGET, "HOST_LOGGER_LOG_MARKER");
+    assert_eq!(log::max_level(), log::LevelFilter::Warn);
+    log::warn!(target: HOST_LOGGER_LOG_TARGET, "HOST_LOGGER_LOG_MARKER");
     tracing::error!(target: HOST_LOGGER_TRACE_TARGET, "HOST_LOGGER_TRACE_MARKER");
 
-    let records = RECORDS.get().expect("host logger records");
     let records = records.lock().expect("record mutex");
     assert!(
         records
@@ -225,48 +295,7 @@ fn host_tracing_subscriber_is_preserved() {
         return;
     }
 
-    #[derive(Default)]
-    struct EventTarget {
-        target: Option<String>,
-    }
-
-    impl tracing::field::Visit for EventTarget {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if matches!(field.name(), "target" | "log.target") {
-                self.target = Some(value.to_owned());
-            }
-        }
-
-        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-    }
-
-    #[derive(Clone, Default)]
-    struct TargetLayer {
-        targets: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TargetLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _context: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut fields = EventTarget::default();
-            event.record(&mut fields);
-            // `tracing-log` events carry the original `log` target as a field;
-            // native tracing events carry it in the event metadata.
-            let target = fields
-                .target
-                .unwrap_or_else(|| event.metadata().target().to_owned());
-            self.targets.lock().expect("target mutex").push(target);
-        }
-    }
-
-    let targets = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::registry().with(TargetLayer {
-        targets: Arc::clone(&targets),
-    });
-    tracing::subscriber::set_global_default(subscriber).expect("install host subscriber");
+    let targets = install_host_subscriber(None);
 
     assert_eq!(init_logging("lance_c_logging_host_subscriber=info"), 0);
     log::error!(target: HOST_SUBSCRIBER_LOG_TARGET, "HOST_SUBSCRIBER_LOG_MARKER");
@@ -288,6 +317,161 @@ fn host_tracing_subscriber_is_preserved() {
             .any(|target| target == HOST_SUBSCRIBER_TRACE_TARGET),
         "host subscriber did not receive the tracing event: {targets:?}"
     );
+}
+
+#[test]
+fn restricted_host_subscriber_state_is_preserved() {
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = run_child("restricted_host_subscriber_state_is_preserved");
+        assert_child_success(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("RESTRICTED_TRACE_MARKER"),
+            "stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("RESTRICTED_WARN_MARKER"),
+            "stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("RESTRICTED_LOG_INFO_MARKER"),
+            "stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("RESTRICTED_LOG_WARN_MARKER"),
+            "stderr:\n{stderr}"
+        );
+        return;
+    }
+
+    let targets = install_host_subscriber(Some("warn"));
+    assert_eq!(TracingLevelFilter::current(), TracingLevelFilter::WARN);
+    assert_eq!(log::max_level(), log::LevelFilter::Off);
+
+    assert_eq!(init_logging("trace"), 0);
+    assert_eq!(
+        TracingLevelFilter::current(),
+        TracingLevelFilter::WARN,
+        "a failed global install must not raise the host subscriber level"
+    );
+    assert_eq!(
+        log::max_level(),
+        log::LevelFilter::Warn,
+        "the log bridge must use the surviving host subscriber level"
+    );
+
+    tracing::trace!(target: RESTRICTED_TRACE_TARGET, "RESTRICTED_TRACE_MARKER");
+    tracing::warn!(target: RESTRICTED_WARN_TARGET, "RESTRICTED_WARN_MARKER");
+    log::info!(target: RESTRICTED_LOG_INFO_TARGET, "RESTRICTED_LOG_INFO_MARKER");
+    log::warn!(target: RESTRICTED_LOG_WARN_TARGET, "RESTRICTED_LOG_WARN_MARKER");
+
+    let targets = targets.lock().expect("target mutex");
+    assert!(
+        !targets
+            .iter()
+            .any(|target| target == RESTRICTED_TRACE_TARGET),
+        "stale callsite interest delivered a trace event to the warn host: {targets:?}"
+    );
+    assert!(
+        !targets
+            .iter()
+            .any(|target| target == RESTRICTED_LOG_INFO_TARGET),
+        "stale log max level forwarded an info record to the warn host: {targets:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|target| target == RESTRICTED_WARN_TARGET),
+        "host subscriber did not receive the warn tracing event: {targets:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|target| target == RESTRICTED_LOG_WARN_TARGET),
+        "host subscriber did not receive the warn log record: {targets:?}"
+    );
+}
+
+#[test]
+fn both_host_globals_keep_their_filter_and_log_level() {
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = run_child("both_host_globals_keep_their_filter_and_log_level");
+        assert_child_success(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for marker in [
+            "BOTH_TRACE_MARKER",
+            "BOTH_WARN_MARKER",
+            "BOTH_LOG_INFO_MARKER",
+            "BOTH_LOG_WARN_MARKER",
+        ] {
+            assert!(
+                !stderr.contains(marker),
+                "{marker} leaked to stderr:\n{stderr}"
+            );
+        }
+        return;
+    }
+
+    let targets = install_host_subscriber(Some("warn"));
+    let records = install_host_logger(log::LevelFilter::Warn);
+    assert_eq!(TracingLevelFilter::current(), TracingLevelFilter::WARN);
+    assert_eq!(log::max_level(), log::LevelFilter::Warn);
+
+    assert_eq!(init_logging("trace"), 0);
+    assert_eq!(
+        TracingLevelFilter::current(),
+        TracingLevelFilter::WARN,
+        "both-global path must preserve the host subscriber level"
+    );
+    assert_eq!(
+        log::max_level(),
+        log::LevelFilter::Warn,
+        "both-global path must preserve the host logger max level"
+    );
+
+    tracing::trace!(target: BOTH_TRACE_TARGET, "BOTH_TRACE_MARKER");
+    tracing::warn!(target: BOTH_WARN_TARGET, "BOTH_WARN_MARKER");
+    log::info!(target: BOTH_LOG_INFO_TARGET, "BOTH_LOG_INFO_MARKER");
+    log::warn!(target: BOTH_LOG_WARN_TARGET, "BOTH_LOG_WARN_MARKER");
+
+    let targets = targets.lock().expect("target mutex");
+    assert!(
+        !targets.iter().any(|target| target == BOTH_TRACE_TARGET),
+        "both-global path delivered a trace event to the warn host: {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|target| target == BOTH_WARN_TARGET),
+        "host subscriber did not receive the warn tracing event: {targets:?}"
+    );
+
+    let records = records.lock().expect("record mutex");
+    assert!(
+        !records.iter().any(|target| target == BOTH_LOG_INFO_TARGET),
+        "both-global path forwarded an info record to the warn logger: {records:?}"
+    );
+    assert!(
+        records.iter().any(|target| target == BOTH_LOG_WARN_TARGET),
+        "host logger did not receive the warn record: {records:?}"
+    );
+}
+
+#[test]
+fn scoped_host_dispatch_does_not_block_global_install() {
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = run_child("scoped_host_dispatch_does_not_block_global_install");
+        assert_child_success(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("SCOPED_ONLY_MARKER"), "stderr:\n{stderr}");
+        return;
+    }
+
+    let scoped = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::dispatcher::with_default(&scoped, || {
+        assert_eq!(init_logging("lance_c_logging_scoped_only=info"), 0);
+    });
+    drop(scoped);
+
+    tracing::info!(target: SCOPED_TARGET, "SCOPED_ONLY_MARKER");
 }
 
 #[test]
