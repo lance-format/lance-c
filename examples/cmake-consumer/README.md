@@ -9,7 +9,7 @@ The example builds two executables:
 
 ## Build
 
-After installing lance-c (e.g. via `cmake --install` or `vcpkg install`):
+After unpacking the [0.2.x release archive](../../README.md#quickstart), use its install prefix:
 
 ```bash
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/lance-c-install

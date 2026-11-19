@@ -1,17 +1,15 @@
 # Building, Packaging, and Releasing
 
-This document provides platform-specific build instructions, binary packaging contracts, vcpkg and Conan consumer walkthroughs, and release procedures for `lance-c`. For the top-level overview and quickstart, see [`README.md`](../README.md).
+This document provides platform-specific build instructions, binary packaging contracts, and release procedures for `lance-c`. For the top-level overview and quickstart, see [`README.md`](../README.md).
 
 ## Contents
 
 - [Published prebuilt archives](#published-prebuilt-archives)
-- [Linux baseline for 0.2 and future packages](#linux-baseline-for-future-packages)
+- [Linux runtime requirements](#linux-baseline-for-future-packages)
 - [Preview quickstart (`v0.2.0-beta.1`)](#preview-quickstart-v020-beta1)
 - [Building from source via Cargo](#from-source-via-cargo-rust-developers)
 - [Building from source via CMake](#from-source-via-cmake-cc-developers-and-packagers)
 - [Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)](#windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc)
-- [vcpkg overlay port (`v0.1.9`)](#vcpkg-overlay-port-v019)
-- [Conan local recipe (`v0.1.9`)](#conan-local-recipe-v019)
 - [Releasing](#releasing)
 
 ---
@@ -30,7 +28,7 @@ In the preview, Linux and macOS release shared libraries (`liblance_c.so`, `libl
 
 ### Preview release (`v0.2.0-beta.1`)
 
-[`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1) is a GitHub pre-release (so GitHub's *Latest* release badge still resolves to `v0.1.9`). It publishes five prebuilt archives, per-archive `.sha256` and `.sha512` files, and a five-line `SHA512SUMS`:
+[`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1) is a GitHub pre-release. It publishes five prebuilt archives, per-archive `.sha256` and `.sha512` files, and a five-line `SHA512SUMS`:
 
 | Platform | Archive | Runtime & ABI contract |
 | --- | --- | --- |
@@ -40,76 +38,28 @@ In the preview, Linux and macOS release shared libraries (`liblance_c.so`, `libl
 | Windows `x86_64` | `lance-c-v0.2.0-beta.1-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 | Windows `ARM64` | `lance-c-v0.2.0-beta.1-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 
-### Stable release (`v0.1.9`)
-
-[`v0.1.9`](https://github.com/lance-format/lance-c/releases/tag/v0.1.9) is the current stable release. It predates the Windows release rows and the generic `glibc 2.28` Linux build container, and publishes five archives plus `SHA512SUMS`:
-
-| Archive | Highest symbol / target | Selected by (`v0.1.9` recipes) |
-| --- | --- | --- |
-| `lance-c-v0.1.9-x86_64-unknown-linux-gnu-debian12.tar.xz` | `GLIBC_2.35` | vcpkg `x64-linux`, `x64-linux-dynamic`; Conan `Linux/x86_64` |
-| `lance-c-v0.1.9-x86_64-unknown-linux-gnu.tar.xz` | `GLIBC_2.39` | Not selected by current recipes |
-| `lance-c-v0.1.9-aarch64-unknown-linux-gnu-debian12.tar.xz` | `GLIBC_2.35` | Not selected by current recipes |
-| `lance-c-v0.1.9-aarch64-unknown-linux-gnu.tar.xz` | `GLIBC_2.39` | vcpkg `arm64-linux`, `arm64-linux-dynamic`; Conan `Linux/armv8` |
-| `lance-c-v0.1.9-aarch64-apple-darwin.tar.xz` | Apple silicon; dylib `minos 11.0` (416 of 3,298 static archive members declare `14.5`) | vcpkg `arm64-osx`, `arm64-osx-dynamic`; Conan `Macos/armv8` |
-
-None of the Linux shared libraries records `GLIBCXX`, `CXXABI`, `libssl`, or `libcrypto` dynamic dependencies. The `v0.1.9` C++ header (`lance/lance.hpp`) requires C++17.
-
 <a id="linux-baseline-for-future-packages"></a>
-## Linux baseline for 0.2 and future packages
 
-Starting with the `0.2` release line (`v0.2.0-beta.1` and subsequent tags), the release workflow builds one generic Linux archive per architecture (`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`) targeting **glibc 2.28** (`manylinux_2_28`) and does not publish separate `-debian12` variants:
+## Linux runtime requirements
 
-- The `v0.1.9` archives (including the `-debian12` assets referencing `GLIBC_2.35` and standard assets referencing `GLIBC_2.39`) remain immutable at their published URLs and hashes.
-- The `ports/lance-c` vcpkg overlay port and `recipes/lance-c` Conan recipe currently select the `v0.1.9` assets.
-- Packages keep the `lib/` install layout (with no `lib64` or compatibility symlinks) and propagate the `cxx_std_20` compile feature in `0.2+`.
-- Source builds link against the build host's libc and are unaffected by the prebuilt container baseline.
+The two Linux archives target glibc 2.28 on x86_64 and AArch64. Source builds link against the build host’s libc.
 
 <a id="preview-quickstart-v020-beta1"></a>
-## Preview quickstart (`v0.2.0-beta.1`)
 
-To verify the `v0.2.0-beta.1` pre-release from a clean directory on Linux `x86_64` (requires CMake 3.22+ and a C++20 compiler, no Rust toolchain):
+## Try the published package
 
-```bash
-mkdir lance-c-preview && cd lance-c-preview
-
-TAG=v0.2.0-beta.1
-VERSION=0.2.0-beta.1
-ARCHIVE=lance-c-v0.2.0-beta.1-x86_64-unknown-linux-gnu.tar.xz
-
-curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/$ARCHIVE"
-curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/SHA512SUMS"
-sha512sum --ignore-missing -c SHA512SUMS
-mkdir install
-tar -xJf "$ARCHIVE" -C install
-
-curl -fL -o "lance-c-$TAG-source.tar.gz" \
-  "https://github.com/lance-format/lance-c/archive/refs/tags/$TAG.tar.gz"
-tar -xzf "lance-c-$TAG-source.tar.gz"
-
-cmake -S "lance-c-$VERSION/examples/cmake-consumer" -B build \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
-cmake --build build --target consumer
-./build/consumer "lance-c-$VERSION/test_data/v0.27.1/pq_in_schema"
-```
-
-Expected output:
-
-```text
-rows: 512, version: 2
-```
-
-For shared linkage, configure a separate build directory and pass `-DLanceC_LINK=shared`. On macOS `arm64`, set `ARCHIVE=lance-c-v0.2.0-beta.1-aarch64-apple-darwin.tar.xz` and verify the checksum with `grep "  $ARCHIVE$" SHA512SUMS | shasum -a 512 -c -`.
+Follow the [quickstart](../README.md#quickstart) to verify the archive and open the sample dataset. For shared linkage, pass `-DLanceC_LINK=shared` to CMake. On macOS arm64, choose the Apple silicon archive and verify its per-archive checksum with `shasum -a 512 -c "$ARCHIVE.sha512"` after downloading both files.
 
 <a id="from-source-via-cargo-rust-developers"></a>
 ## Building from source via Cargo
 
-Source builds of the current tree require **Rust 1.95.0+**, **CMake 3.22+**, and **`protoc`** (the `v0.1.9` tag declares `rust-version = "1.91.0"`). Baseline build targets are defined in [`.github/baseline.env`](../.github/baseline.env):
+Source builds of the current tree require **Rust 1.95.0+**, **CMake 3.22+**, and **`protoc`**. Baseline build targets are defined in [`.github/baseline.env`](../.github/baseline.env):
 
 | Component | Target / minimum |
 | --- | --- |
-| Rust | 1.95.0+ (`0.2` line / `main`); 1.91.0+ (`v0.1.9`) |
+| Rust | 1.95.0+ |
 | CMake | 3.22+ |
-| C / C++ | C11; C++20 (`0.2` line / `main`) or C++17 (`v0.1.9`) |
+| C / C++ | C11 or C++20 |
 | Compiler | GCC / Clang 20; Apple Clang 15; MSVC (ClangCL on Windows ARM64) |
 | macOS | Apple silicon (`arm64`) only (`MACOSX_DEPLOYMENT_TARGET=11.0`) |
 
@@ -152,7 +102,7 @@ An unversioned `find_package(LanceC CONFIG REQUIRED)` accepts the package in the
 <a id="windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc"></a>
 ## Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)
 
-Windows prebuilt archives are published starting with [`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1) (`v0.1.9` published no Windows archives, and the vcpkg/Conan recipes do not yet map Windows archives).
+Windows prebuilt archives are published starting with [`v0.2.0-beta.1`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1).
 
 ### Building from source on Windows
 
@@ -199,111 +149,6 @@ The install prefix contains `lib/lance_c.dll`, its import library `lib/lance_c.d
   Do not link a `/MD` or debug `/MTd` consumer against the Release `/MT` static archive.
 - **Shared linkage (`-DLanceC_LINK=shared`, `LanceC::lance_c` → `LanceC::lance_c_shared`):** Links through `lance_c.dll.lib`. Because `lance_c.dll` is statically linked against the CRT, it has no redistributable `VCRUNTIME*`, `MSVCP*`, `MSVCR*`, `CONCRT*`, or `VCOMP*` dependency. A shared consumer may use either CRT (`/MT` or `/MD`) and requires `lance_c.dll` beside its executable or on its DLL search path.
 
-<a id="package-managers-v019"></a>
-<a id="vcpkg-overlay-port-v019"></a>
-<a id="vcpkg"></a>
-## vcpkg overlay port (`v0.1.9`)
-
-`lance-c` is not in the public vcpkg registry yet. Use the overlay port in [`ports/lance-c`](../ports/README.md) from a current `main` checkout (do not use the copy inside the `v0.1.9` source tarball, which predates the published release hashes):
-
-```bash
-git clone https://github.com/microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
-git clone https://github.com/lance-format/lance-c.git
-
-# x64-linux installs static; x64-linux-dynamic installs shared.
-TRIPLET=x64-linux
-./vcpkg/vcpkg install lance-c \
-  --overlay-ports="$PWD/lance-c/ports" --triplet "$TRIPLET"
-```
-
-Supported prebuilt triplets for `0.1.9`:
-
-- `x64-linux` (static) and `x64-linux-dynamic` (shared) — uses the Debian 12 `x86_64` archive (`glibc >= 2.35`)
-- `arm64-linux` (static) and `arm64-linux-dynamic` (shared) — uses the standard `aarch64` archive (`glibc >= 2.39`)
-- `arm64-osx` (static) and `arm64-osx-dynamic` (shared) — Apple silicon macOS
-
-Intel macOS (`x64-osx`) is rejected in both prebuilt and `from-source` modes; Windows is not supported by the `0.1.9` port. Other Linux triples can build from source via `vcpkg install 'lance-c[from-source]'` (requires Rust, CMake, and `protoc`).
-
-Configure a minimal C++17 consumer against the vcpkg installation:
-
-```bash
-mkdir consumer && cd consumer
-curl -fLO https://raw.githubusercontent.com/lance-format/lance-c/v0.1.9/examples/cmake-consumer/main.cpp
-
-cat > CMakeLists.txt <<'EOF'
-cmake_minimum_required(VERSION 3.22)
-project(consumer LANGUAGES CXX)
-find_package(LanceC CONFIG REQUIRED)
-add_executable(consumer main.cpp)
-target_compile_features(consumer PRIVATE cxx_std_17)
-target_link_libraries(consumer PRIVATE LanceC::lance_c)
-EOF
-
-TRIPLET=${TRIPLET:-x64-linux}
-VCPKG_ROOT="$(cd ../vcpkg && pwd)"
-cmake -S . -B "build-$TRIPLET" -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
-  -DVCPKG_TARGET_TRIPLET="$TRIPLET"
-cmake --build "build-$TRIPLET"
-./"build-$TRIPLET"/consumer /path/to/dataset.lance
-```
-
-<a id="conan-local-recipe-v019"></a>
-<a id="conan"></a>
-## Conan local recipe (`v0.1.9`)
-
-ConanCenter does not yet provide `lance-c/0.1.9`. Create the local package from [`recipes/lance-c/all`](../recipes/README.md):
-
-```bash
-python3 -m venv .conan-venv
-. .conan-venv/bin/activate
-python -m pip install "conan>=2,<3"
-conan profile detect
-git clone https://github.com/lance-format/lance-c.git
-conan create lance-c/recipes/lance-c/all --version=0.1.9
-```
-
-`conan create` downloads the `v0.1.9` prebuilt archive for Linux `x86_64`/`armv8` or macOS `armv8` and runs the recipe's C and C++ test package. It creates the static package by default; add `-o "&:shared=True"` for shared linkage, or `-o "lance-c/*:from_source=True"` to build from source (requires Rust, CMake, and `protoc`). Intel macOS (`Macos`/`x86_64`) is rejected.
-
-To consume `lance-c/0.1.9` in a project:
-
-```bash
-mkdir consumer && cd consumer
-curl -fLO https://raw.githubusercontent.com/lance-format/lance-c/v0.1.9/examples/cmake-consumer/main.cpp
-```
-
-Create `conanfile.txt`:
-
-```ini
-[requires]
-lance-c/0.1.9
-
-[generators]
-CMakeDeps
-CMakeToolchain
-```
-
-Create `CMakeLists.txt`:
-
-```cmake
-cmake_minimum_required(VERSION 3.22)
-project(consumer LANGUAGES CXX)
-find_package(LanceC CONFIG REQUIRED)
-add_executable(consumer main.cpp)
-target_compile_features(consumer PRIVATE cxx_std_17)
-target_link_libraries(consumer PRIVATE LanceC::lance_c)
-```
-
-Install and build (add `-o "lance-c/*:shared=True"` to `conan install` for shared linkage):
-
-```bash
-conan install . --output-folder=build --build=missing
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
 <a id="releasing"></a>
 ## Releasing
 
@@ -320,10 +165,7 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
    - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
    - **dry_run**: leave on for the first run to preview the computed tag and version without pushing.
 3. Re-run with **dry_run** off. The workflow updates `Cargo.toml` and `Cargo.lock`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref.
-4. Once `release.yml` finishes, copy the `publish` job's emitted hash snippets into:
-   - [`ports/lance-c/portfile.cmake`](../ports/lance-c/portfile.cmake) (SHA512s)
-   - [`recipes/lance-c/all/conandata.yml`](../recipes/lance-c/all/conandata.yml) (SHA256s from the release `.sha256` assets)
-5. Open follow-up PRs to `microsoft/vcpkg` and `conan-io/conan-center-index` mirroring the updated `ports/` and `recipes/` directories.
+4. Verify that the release page contains all expected platform archives and checksums. Download an archive and run the consumer from the same tag.
 
 > **Branch protection:** If `main` is protected, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or configure `create-release.yml` with a PAT that has `contents: write`.
 
