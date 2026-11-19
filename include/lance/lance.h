@@ -33,12 +33,17 @@ extern "C" {
    early because dataset open and write options attach it. */
 typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
 
-/* ─── Arrow C Data Interface forward declarations ─── */
-/* These match the canonical Arrow spec structs. If you already include
-   arrow/c/abi.h, guard with ARROW_C_DATA_INTERFACE. */
+/* ─── Arrow C Data and Stream Interface declarations ─── */
+/* These match the canonical Arrow C ABI. Including arrow/c/abi.h first
+   defines the matching ARROW_C_* guard, so the declarations below are
+   skipped. */
 
 #ifndef ARROW_C_DATA_INTERFACE
 #define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
 
 struct ArrowSchema {
     const char* format;
@@ -65,6 +70,11 @@ struct ArrowArray {
     void* private_data;
 };
 
+#endif /* ARROW_C_DATA_INTERFACE */
+
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
 struct ArrowArrayStream {
     int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
     int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
@@ -73,7 +83,7 @@ struct ArrowArrayStream {
     void* private_data;
 };
 
-#endif /* ARROW_C_DATA_INTERFACE */
+#endif /* ARROW_C_STREAM_INTERFACE */
 
 /* ─── Error handling ─── */
 
@@ -12684,7 +12694,7 @@ int32_t lance_mem_wal_sharding_spec_field_at(
  * Evaluate a sharding spec against the dataset schema.
  *
  * Adds a column named after the spec's `field_id` holding the native shard
- * value. The caller owns `*out_batch` and closes it with lance_batch_close().
+ * value. The caller owns `*out_batch` and frees it with lance_batch_free().
  */
 int32_t lance_mem_wal_evaluate_sharding_spec(
     LanceDataset* dataset,
@@ -12957,7 +12967,7 @@ int32_t lance_lsm_scanner_schema(
 
 /**
  * Execute the scan and return one batch. The caller owns `*out` and closes it
- * with lance_batch_close().
+ * with lance_batch_free().
  */
 int32_t lance_lsm_scanner_to_batch(
     const LanceLsmScanner* scanner,
@@ -13099,7 +13109,7 @@ int32_t lance_mem_wal_plan_explain(
 
 /**
  * Execute the plan and concatenate its batches into one. The caller owns
- * `*out` and closes it with lance_batch_close().
+ * `*out` and frees it with lance_batch_free().
  */
 int32_t lance_mem_wal_plan_to_batch(
     const LanceMemWalPlan* plan,
