@@ -32,11 +32,11 @@
  * or a Git pin. */
 #define LANCE_C_VERSION_MAJOR 0
 #define LANCE_C_VERSION_MINOR 2
-#define LANCE_C_VERSION_PATCH 0
+#define LANCE_C_VERSION_PATCH 1
 /* Pre-release suffix without the leading '-'; empty for a stable release. */
-#define LANCE_C_VERSION_PRE ""
+#define LANCE_C_VERSION_PRE "beta.1"
 /* Full Cargo package version, including any pre-release or build suffix. */
-#define LANCE_C_VERSION_STRING "0.2.0"
+#define LANCE_C_VERSION_STRING "0.2.1-beta.1"
 #define LANCE_C_VERSION_ENCODE(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
 /* Numeric form for #if comparisons. The pre-release suffix is not encoded, so
@@ -3946,9 +3946,9 @@ LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
  * `columns` is a NULL-terminated array of UTF-8 column paths:
  * - NULL selects the fragment's full logical schema.
  * - A non-NULL array whose first entry is NULL is an explicit empty
- *   projection and retains Native take's failure behavior instead of being
- *   treated as full. Missing top-level columns and non-UTF-8 names are errors;
- *   nested paths follow Native `Schema::project` semantics.
+ *   projection. Native take returns a zero-column batch whose row count is the
+ *   requested number of rows. Missing top-level columns and non-UTF-8 names
+ *   are errors; nested paths follow Native `Schema::project` semantics.
  * `indices` may be NULL only when `num_indices` is zero.
  *
  * On success `out` is initialized in caller-owned storage and must have its
@@ -6203,6 +6203,8 @@ int32_t lance_dataset_create_vector_index_with_options_and_progress(
  * Create a scalar index on a column.
  * @param params_json Optional JSON params forwarded unchanged to the native
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
+ *                    An empty string is invalid JSON and is rejected with
+ *                    LANCE_ERR_INVALID_ARGUMENT, not treated as defaults.
  *                    Plugin field names and validation apply; for example
  *                    ZoneMap uses `rows_per_zone`/`use_seeds` and BloomFilter
  *                    uses `number_of_items`/`probability`. MinHash LSH uses

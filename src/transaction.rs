@@ -213,6 +213,11 @@ fn operation_kind(operation: &Operation) -> LanceOperationKind {
         Operation::UpdateMemWalState { .. } => LanceOperationKind::UpdateMemWalState,
         Operation::Clone { .. } => LanceOperationKind::Clone,
         Operation::UpdateBases { .. } => LanceOperationKind::UpdateBases,
+        // Transaction V2 composite operations are not part of the C operation
+        // vocabulary. Report them as Unknown, the existing forward-compatible
+        // value for native variants the binding does not model, so the
+        // published discriminants stay unchanged.
+        Operation::CompositeOperation(_) => LanceOperationKind::Unknown,
         Operation::Unknown { .. } => LanceOperationKind::Unknown,
     }
 }
