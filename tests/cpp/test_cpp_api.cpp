@@ -5167,17 +5167,24 @@ static void test_fragment_read_operations(const std::string& uri) {
 
     std::vector<std::string> empty_columns;
     std::vector<uint32_t> one_index{0};
-    caught = false;
     memset(&stream, 0, sizeof(stream));
-    try {
-        fragment.take(one_index.data(), one_index.size(), empty_columns, &stream);
-    } catch (const lance::Error& error) {
-        caught = true;
-        assert(error.code == LANCE_ERR_NOT_FOUND);
-        assert(std::string(error.what()).find("No data files") !=
-               std::string::npos);
+    fragment.take(one_index.data(), one_index.size(), empty_columns, &stream);
+    ArrowSchema empty_schema{};
+    assert(stream.get_schema(&stream, &empty_schema) == 0);
+    assert(empty_schema.n_children == 0);
+    empty_schema.release(&empty_schema);
+    uint64_t empty_projection_rows = 0;
+    while (true) {
+        ArrowArray array;
+        memset(&array, 0, sizeof(array));
+        assert(stream.get_next(&stream, &array) == 0);
+        if (!array.release) break;
+        assert(array.n_children == 0);
+        empty_projection_rows += static_cast<uint64_t>(array.length);
+        array.release(&array);
     }
-    assert(caught);
+    if (stream.release) stream.release(&stream);
+    assert(empty_projection_rows == one_index.size());
 
     {
         auto scanner = fragment.scan();

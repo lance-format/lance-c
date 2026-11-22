@@ -6816,11 +6816,16 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
     );
 
     let one_index = [0_u32];
-    let native_empty_projection_error = lance_c::runtime::block_on(native_fragment.take(
+    // Core 15.0.0-beta.26 preserves the row count for an empty projection, so
+    // taking one row with no projected columns succeeds with a zero-column
+    // batch of one row instead of reporting a missing column.
+    let native_empty_projection = lance_c::runtime::block_on(native_fragment.take(
         &one_index,
         &fragment_projection(&native_fragment, Some(&[])),
     ))
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(native_empty_projection.num_columns(), 0);
+    assert_eq!(native_empty_projection.num_rows(), one_index.len());
     let mut empty_projection_stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
         unsafe {
@@ -6832,15 +6837,19 @@ fn test_fragment_take_matches_native_projection_and_logical_order() {
                 &mut empty_projection_stream,
             )
         },
-        -1
+        0,
+        "{}",
+        take_last_error_message()
     );
-    assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
-    let message = take_last_error_message();
-    assert!(
-        message.contains(&native_empty_projection_error.to_string()),
-        "C error {message:?} must preserve native error {native_empty_projection_error}"
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut empty_projection_stream) }.unwrap();
+    let empty_projection_batches = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+    assert_eq!(empty_projection_batches.len(), 1);
+    assert_eq!(empty_projection_batches[0].num_columns(), 0);
+    assert_eq!(empty_projection_batches[0].num_rows(), one_index.len());
+    assert_eq!(
+        empty_projection_batches[0].schema(),
+        native_empty_projection.schema()
     );
-    assert!(empty_projection_stream.release.is_none());
 
     unsafe { lance_fragment_close(fragment) };
     unsafe { lance_dataset_close(ds) };
@@ -10688,6 +10697,7 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         files: Vec::new(),
         covering_fields: Vec::new(),
         clustering_id: None,
+        local_fragment_aliases: Default::default(),
         metadata: Default::default(),
     }
     .encode_to_vec();
@@ -10715,6 +10725,7 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         files: Vec::new(),
         covering_fields: Vec::new(),
         clustering_id: None,
+        local_fragment_aliases: Default::default(),
         metadata: Default::default(),
     }
     .encode_to_vec();
@@ -10745,6 +10756,7 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         files: Vec::new(),
         covering_fields: Vec::new(),
         clustering_id: None,
+        local_fragment_aliases: Default::default(),
         metadata: Default::default(),
     }
     .encode_to_vec();
@@ -10759,6 +10771,41 @@ fn test_index_segment_metadata_parse_rejects_malformed_and_dangerous_input() {
         -1
     );
     assert_eq!(metadata, sentinel);
+
+    // A segment from a newer writer that uses local fragment aliases cannot
+    // be interpreted by this build, so parsing must fail instead of exposing
+    // incomplete metadata.
+    let aliased_segment = lance_table::format::pb::IndexMetadata {
+        uuid: Some(lance_table::format::pb::Uuid {
+            uuid: vec![0_u8; 16],
+        }),
+        fields: vec![0],
+        name: "local_fragment_aliases".to_string(),
+        dataset_version: 1,
+        fragment_bitmap: Vec::new(),
+        index_details: None,
+        index_version: Some(0),
+        created_at: None,
+        base_id: None,
+        files: Vec::new(),
+        covering_fields: Vec::new(),
+        clustering_id: None,
+        local_fragment_aliases: std::collections::HashMap::from([(17_u32, 42_u32)]),
+        metadata: Default::default(),
+    }
+    .encode_to_vec();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_metadata_parse(
+                aliased_segment.as_ptr(),
+                aliased_segment.len(),
+                &mut metadata,
+            )
+        },
+        -1
+    );
+    assert_eq!(metadata, sentinel);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11296,6 +11343,7 @@ fn test_index_metadata_complete_inspection_clone_and_native_oracle() {
         files: Vec::new(),
         covering_fields: Vec::new(),
         clustering_id: None,
+        local_fragment_aliases: Default::default(),
         metadata: Default::default(),
     }
     .encode_to_vec();
@@ -13299,6 +13347,9 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
         "{message}"
     );
 
+    // Core 15.0.0-beta.26 rejects malformed scalar-index params, so an empty
+    // string is invalid JSON rather than a request for plugin defaults. NULL
+    // remains the documented way to request those defaults.
     assert_eq!(
         unsafe {
             lance_dataset_create_scalar_index(
@@ -13310,16 +13361,14 @@ fn test_rtree_scalar_index_geometry_queries_and_lifecycle() {
                 false,
             )
         },
-        0,
-        "empty params must retain native default handling: {}",
-        take_last_error_message()
+        -1
     );
-    assert_eq!(
-        unsafe { lance_dataset_drop_index(dataset, c_str("empty_params_rtree").as_ptr()) },
-        0,
-        "{}",
-        take_last_error_message()
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert!(
+        take_last_error_message().contains("Invalid JSON params"),
+        "empty params must be rejected as invalid JSON"
     );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
 
     assert_eq!(
         unsafe {
@@ -29481,6 +29530,29 @@ fn test_native_transaction_protobuf_boundaries() {
     assert_eq!(output_bytes as usize, 0xDEAD_BEEF);
     assert_eq!(output_len, usize::MAX);
     unsafe { lance_transaction_close(transaction) };
+
+    // Transaction V2 composite operations have no C-level operation
+    // vocabulary. They report the forward-compatible Unknown kind without
+    // changing the published discriminants.
+    let composite_message = pb::Transaction {
+        read_version: 18,
+        uuid: "composite-operation".to_string(),
+        operation: Some(pb::transaction::Operation::CompositeOperation(
+            pb_actions::CompositeOperation { steps: Vec::new() },
+        )),
+        tag: String::new(),
+        transaction_properties: std::collections::HashMap::new(),
+    };
+    let composite = transaction_from_proto_bytes(&composite_message.encode_to_vec());
+    let composite_operation = native_transaction_operation(composite);
+    assert_eq!(
+        native_operation_kind(composite_operation),
+        LanceOperationKind::Unknown
+    );
+    unsafe {
+        lance_operation_close(composite_operation);
+        lance_transaction_close(composite);
+    }
 
     let native_empty = lance::dataset::transaction::Transaction::try_from(
         pb::Transaction::decode(&[][..]).unwrap(),

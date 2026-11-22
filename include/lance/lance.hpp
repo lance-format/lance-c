@@ -4642,7 +4642,8 @@ public:
     /// Take fragment-local logical rows by index with an explicit projection.
     /// Indices retain the selected core's ordering and duplicate constraints.
     /// `out` is caller-owned and its non-null `release` must be called exactly
-    /// once. An empty `columns` vector is an explicit empty projection.
+    /// once. An empty `columns` vector is an explicit empty projection and
+    /// produces a zero-column batch with the requested row count.
     void take(const uint32_t* indices, size_t num_indices,
               const std::vector<std::string>& columns,
               ArrowArrayStream* out) const;
@@ -10059,7 +10060,9 @@ public:
         const std::string& name = "",
         bool replace = false);
 
-    /// Create a scalar index on a column.
+    /// Create a scalar index on a column. An empty `params_json` selects the
+    /// native plugin defaults (the wrapper passes NULL); a non-empty value is
+    /// forwarded unchanged as JSON.
     void create_scalar_index(const std::string& column,
                              LanceScalarIndexType index_type,
                              const std::string& name = "",
@@ -10075,7 +10078,8 @@ public:
 
     /// Create a scalar index with optional progress. A null callback disables
     /// observation; a non-null callback has the same synchronous lifetime and
-    /// non-reentrancy rules as create_vector_index_with_progress.
+    /// non-reentrancy rules as create_vector_index_with_progress. `params_json`
+    /// follows create_scalar_index.
     void create_scalar_index_with_progress(
         const std::string& column,
         LanceScalarIndexType index_type,
@@ -10093,6 +10097,8 @@ public:
     }
 
     /// Create a scalar index with the additive native train control.
+    /// `params_json` follows create_scalar_index: empty selects plugin
+    /// defaults and a non-empty value is forwarded unchanged as JSON.
     void create_scalar_index_with_options(
         const std::string& column,
         LanceScalarIndexType index_type,
@@ -10116,7 +10122,8 @@ public:
     /// Create a scalar index with native train controls and optional progress.
     /// A null callback disables observation. The callback follows the same
     /// synchronous lifetime and non-reentrancy rules as
-    /// create_vector_index_with_progress.
+    /// create_vector_index_with_progress. `params_json` follows
+    /// create_scalar_index.
     void create_scalar_index_with_options_and_progress(
         const std::string& column,
         LanceScalarIndexType index_type,
