@@ -142,6 +142,8 @@ jobs:
         run: cargo build --lib
       - name: Verify shared-library exports
         run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
+      - name: Report and free cached test build headroom
+        run: bash .github/scripts/free-macos-consumer-space.sh target/debug
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests

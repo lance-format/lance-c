@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 #
-# Reclaim large test and build executables before the installed-package
-# consumer checks. verify-cmake-consumer.sh only reads the Cargo-built
-# liblance_c.{a,dylib,so} files; dependency rlibs, build scripts, and those
-# shipped libraries stay in place so the Cargo cache remains useful.
+# Reclaim large test and build executables before the test build and before
+# the installed-package consumer checks. verify-cmake-consumer.sh only reads
+# the Cargo-built liblance_c.{a,dylib,so} files; dependency rlibs, build
+# scripts, and those shipped libraries stay in place so the Cargo cache and
+# fingerprints remain useful. Cargo relinks a test executable when it is
+# missing, so removing cached test binaries only trades a relink for disk
+# headroom.
 
 set -euo pipefail
 
@@ -34,7 +37,10 @@ find "$target_dir" -type f -size +10M -perm -0100 \
   ! -name '*.so' \
   ! -name '*.rlib' \
   ! -name '*.rmeta' \
-  ! -name 'build-script-build' \
+  ! -name 'build-script-build*' \
+  ! -name 'build_script_build*' \
+  ! -name 'build-script-main*' \
+  ! -name 'build_script_main*' \
   -print0 >"$candidates"
 
 if [ -s "$candidates" ]; then
