@@ -75,7 +75,10 @@ jobs:
     name: Tests (Linux)
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
-    timeout-minutes: 30
+    # A cold Lance pin builds for ~12 minutes and runs the C/C++ and installed
+    # consumer checks for another ~10. Leave room for the main-branch cache
+    # save, which compresses the multi-gigabyte target directory.
+    timeout-minutes: 45
     env:
       CC: clang
       CXX: clang++
@@ -85,6 +88,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR runs skip saving the multi-gigabyte target cache. Main saves it
+          # once for later PR restores, matching the other cached jobs.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Clang 20
         run: manylinux-install-clang -v 20.1.8.0
       - name: Ensure pkg-config
