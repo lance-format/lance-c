@@ -146,6 +146,8 @@ jobs:
         run: cargo test
       - name: Run C/C++ compilation tests
         run: cargo test --test compile_and_run_test -- --ignored
+      - name: Report and free package-verification disk headroom
+        run: bash .github/scripts/free-macos-consumer-space.sh target/debug
       - name: Verify installed package and consumer data read
         run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
 
