@@ -369,6 +369,215 @@ static void release_int64_batch(struct ArrowArray *array) {
     array->private_data = NULL;
 }
 
+/* ─── Arrow batch import ownership contracts ─── */
+
+/* Count release callbacks so a test can prove how many times the import path
+ * consumed the caller's array and whether the borrowed schema was left alone. */
+typedef struct {
+    int schema_releases;
+    int array_releases;
+} BatchImportReleaseCounts;
+
+static void batch_import_child_schema_release(struct ArrowSchema *schema) {
+    schema->release = NULL;
+}
+
+static void batch_import_child_array_release(struct ArrowArray *array) {
+    array->release = NULL;
+}
+
+static void batch_import_counted_schema_release(struct ArrowSchema *schema) {
+    BatchImportReleaseCounts *counts =
+        (BatchImportReleaseCounts *)schema->private_data;
+    if (counts != NULL) counts->schema_releases += 1;
+    schema->release = NULL;
+}
+
+static void batch_import_counted_array_release(struct ArrowArray *array) {
+    BatchImportReleaseCounts *counts =
+        (BatchImportReleaseCounts *)array->private_data;
+    if (counts != NULL) counts->array_releases += 1;
+    array->release = NULL;
+}
+
+/* A one-column Struct<id: Int32> batch with two rows. */
+typedef struct {
+    BatchImportReleaseCounts counts;
+    struct ArrowSchema root_schema;
+    struct ArrowSchema child_schema;
+    struct ArrowSchema *schema_children[1];
+    struct ArrowArray root_array;
+    struct ArrowArray child_array;
+    struct ArrowArray *array_children[1];
+    const void *root_buffers[1];
+    const void *child_buffers[2];
+    int32_t values[2];
+} BatchImportFixture;
+
+static void init_batch_import_fixture(BatchImportFixture *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->values[0] = 7;
+    fixture->values[1] = 8;
+
+    fixture->schema_children[0] = &fixture->child_schema;
+    fixture->root_schema.format = "+s";
+    fixture->root_schema.n_children = 1;
+    fixture->root_schema.children = fixture->schema_children;
+    fixture->root_schema.release = batch_import_counted_schema_release;
+    fixture->root_schema.private_data = &fixture->counts;
+    fixture->child_schema.format = "i";
+    fixture->child_schema.name = "id";
+    fixture->child_schema.release = batch_import_child_schema_release;
+
+    fixture->root_buffers[0] = NULL;
+    fixture->child_buffers[0] = NULL;
+    fixture->child_buffers[1] = fixture->values;
+    fixture->array_children[0] = &fixture->child_array;
+    fixture->child_array.length = 2;
+    fixture->child_array.n_buffers = 2;
+    fixture->child_array.buffers = fixture->child_buffers;
+    fixture->child_array.release = batch_import_child_array_release;
+    fixture->root_array.length = 2;
+    fixture->root_array.n_buffers = 1;
+    fixture->root_array.buffers = fixture->root_buffers;
+    fixture->root_array.n_children = 1;
+    fixture->root_array.children = fixture->array_children;
+    fixture->root_array.release = batch_import_counted_array_release;
+    fixture->root_array.private_data = &fixture->counts;
+}
+
+/* Cover the documented import contract that is not exercised by the happy-path
+ * imports elsewhere: a non-NULL array is consumed exactly once on every return,
+ * the source slot is left in its canonical released state, the schema stays
+ * borrowed for failures too, and the output slot is unchanged on failure. The
+ * zero-column success form must retain its row count. */
+static void test_batch_import_contracts(void) {
+    printf("  test_batch_import_contracts... ");
+    BatchImportFixture fixture;
+
+    /* NULL out slot: the valid array is still consumed. */
+    init_batch_import_fixture(&fixture);
+    struct ArrowSchema schema_before = fixture.root_schema;
+    ASSERT(lance_batch_from_arrow(&fixture.root_array, &fixture.root_schema,
+                                  NULL) == -1,
+           "NULL out slot must fail");
+    expect_error_contains(LANCE_ERR_INVALID_ARGUMENT, "out must not be NULL",
+                          "batch import NULL out slot");
+    ASSERT(fixture.counts.array_releases == 1,
+           "NULL out slot must consume the array exactly once");
+    ASSERT(fixture.root_array.release == NULL &&
+               fixture.root_array.n_children == 0,
+           "NULL out slot must leave the source slot released");
+    ASSERT(fixture.counts.schema_releases == 0,
+           "NULL out slot must not release the borrowed schema");
+    ASSERT(memcmp(&fixture.root_schema, &schema_before,
+                  sizeof(schema_before)) == 0,
+           "NULL out slot must not modify the borrowed schema");
+
+    /* NULL schema: the array is consumed and the output stays untouched. */
+    init_batch_import_fixture(&fixture);
+    LanceBatch *sentinel = (LanceBatch *)&fixture;
+    LanceBatch *out = sentinel;
+    ASSERT(lance_batch_from_arrow(&fixture.root_array, NULL, &out) == -1,
+           "NULL schema must fail");
+    expect_error_contains(LANCE_ERR_INVALID_ARGUMENT,
+                          "schema must not be NULL",
+                          "batch import NULL schema");
+    ASSERT(fixture.counts.array_releases == 1,
+           "NULL schema must consume the array exactly once");
+    ASSERT(fixture.root_array.release == NULL,
+           "NULL schema must leave the source slot released");
+    ASSERT(out == sentinel, "NULL schema must not write the out slot");
+
+    /* NULL array: nothing is consumed and the schema stays borrowed. */
+    init_batch_import_fixture(&fixture);
+    out = sentinel;
+    ASSERT(lance_batch_from_arrow(NULL, &fixture.root_schema, &out) == -1,
+           "NULL array must fail");
+    expect_error_contains(LANCE_ERR_INVALID_ARGUMENT, "array must not be NULL",
+                          "batch import NULL array");
+    ASSERT(fixture.counts.array_releases == 0 &&
+               fixture.counts.schema_releases == 0,
+           "NULL array must consume nothing");
+    ASSERT(fixture.root_schema.release != NULL,
+           "NULL array must leave the borrowed schema live");
+    ASSERT(out == sentinel, "NULL array must not write the out slot");
+
+    /* Schema/array shape mismatch: conversion fails, but the array is still
+     * consumed exactly once, the schema stays borrowed, and the output slot is
+     * unchanged. */
+    init_batch_import_fixture(&fixture);
+    struct ArrowSchema extra_schema;
+    memset(&extra_schema, 0, sizeof(extra_schema));
+    extra_schema.format = "i";
+    extra_schema.name = "extra";
+    extra_schema.release = batch_import_child_schema_release;
+    struct ArrowSchema *mismatched_children[2] = {&fixture.child_schema,
+                                                  &extra_schema};
+    fixture.root_schema.n_children = 2;
+    fixture.root_schema.children = mismatched_children;
+    struct ArrowSchema mismatched_before = fixture.root_schema;
+    out = sentinel;
+    ASSERT(lance_batch_from_arrow(&fixture.root_array, &fixture.root_schema,
+                                  &out) == -1,
+           "schema/array mismatch must fail");
+    expect_error(LANCE_ERR_INVALID_ARGUMENT, "batch import shape mismatch");
+    ASSERT(fixture.counts.array_releases == 1,
+           "mismatch must consume the array exactly once");
+    ASSERT(fixture.root_array.release == NULL &&
+               fixture.root_array.n_children == 0,
+           "mismatch must leave the source slot released");
+    ASSERT(fixture.counts.schema_releases == 0,
+           "mismatch must not release the borrowed schema");
+    ASSERT(memcmp(&fixture.root_schema, &mismatched_before,
+                  sizeof(mismatched_before)) == 0,
+           "mismatch must not modify the borrowed schema");
+    ASSERT(out == sentinel, "mismatch must not write the out slot");
+
+    /* A zero-column batch keeps its row count through import and export. */
+    BatchImportReleaseCounts empty_counts;
+    memset(&empty_counts, 0, sizeof(empty_counts));
+    const void *empty_buffers[1] = {NULL};
+    struct ArrowSchema empty_schema;
+    memset(&empty_schema, 0, sizeof(empty_schema));
+    empty_schema.format = "+s";
+    empty_schema.release = batch_import_counted_schema_release;
+    empty_schema.private_data = &empty_counts;
+    struct ArrowArray empty_array;
+    memset(&empty_array, 0, sizeof(empty_array));
+    empty_array.length = 3;
+    empty_array.n_buffers = 1;
+    empty_array.buffers = empty_buffers;
+    empty_array.release = batch_import_counted_array_release;
+    empty_array.private_data = &empty_counts;
+    LanceBatch *empty_batch = NULL;
+    ASSERT(lance_batch_from_arrow(&empty_array, &empty_schema, &empty_batch) == 0,
+           "zero-column batch import failed");
+    CHECK_OK();
+    ASSERT(empty_counts.array_releases == 1,
+           "zero-column array must be consumed exactly once");
+    ASSERT(empty_counts.schema_releases == 0,
+           "zero-column schema must stay borrowed");
+    ASSERT(empty_batch != NULL, "zero-column import output");
+    struct ArrowArray exported_array;
+    struct ArrowSchema exported_schema;
+    memset(&exported_array, 0, sizeof(exported_array));
+    memset(&exported_schema, 0, sizeof(exported_schema));
+    ASSERT(lance_batch_to_arrow(empty_batch, &exported_array,
+                                &exported_schema) == 0,
+           "zero-column batch export failed");
+    CHECK_OK();
+    ASSERT(exported_array.length == 3,
+           "zero-column batch must retain its row count");
+    ASSERT(exported_schema.n_children == 0,
+           "zero-column batch must export an empty schema");
+    if (exported_array.release) exported_array.release(&exported_array);
+    if (exported_schema.release) exported_schema.release(&exported_schema);
+    lance_batch_free(empty_batch);
+
+    printf("OK\n");
+}
+
 static int32_t test_batch_udf_mapper(
     void *callback_ctx,
     const struct ArrowArray *input,
@@ -8254,6 +8463,7 @@ int main(int argc, char **argv) {
     test_fragment_snapshot(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
     test_clone_handle(fragment_read_uri);
+    test_batch_import_contracts();
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);
     test_blob_native_read_slice(blob_uri);
