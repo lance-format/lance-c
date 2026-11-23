@@ -2,6 +2,7 @@
 /* SPDX-FileCopyrightText: Copyright The Lance Authors */
 
 #include "lance/lance.h"
+#include "test_local_uri.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -503,7 +504,7 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     char base_uri[4096];
-    snprintf(base_uri, sizeof(base_uri), "file://%s", argv[1]);
+    lance_test_local_uri(base_uri, sizeof(base_uri), argv[1]);
 
     const char *option_keys[] = {"block_size"};
     const char *option_values[] = {"4096"};

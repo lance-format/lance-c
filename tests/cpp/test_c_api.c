@@ -17,12 +17,19 @@
  */
 
 #include "lance/lance.h"
+#include "test_local_uri.h"
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#define test_mkdir(path) _mkdir(path)
+#else
 #include <sys/stat.h>
+#define test_mkdir(path) mkdir(path, 0755)
+#endif
 #include <time.h>
 
 _Static_assert(sizeof(LanceCompactionOptions) == 40,
@@ -2408,7 +2415,7 @@ static void test_managed_blob_descriptor_roundtrip(const char *write_uri) {
         object_path, sizeof(object_path), "%s/managed.bin", object_dir);
     ASSERT(written > 0 && (size_t)written < sizeof(object_path),
            "managed object path too long");
-    (void)mkdir(object_dir, 0755);
+    (void)test_mkdir(object_dir);
     FILE *object = fopen(object_path, "wb");
     ASSERT(object != NULL, "create managed object");
     ASSERT(fwrite("0123456789", 1, 10, object) == 10,
@@ -3286,7 +3293,7 @@ static NativeWriteInput native_write_external_blob_input(const char *write_uri) 
         sizeof(payload_path),
         "%s_native_blob_payload.bin",
         write_uri);
-    snprintf(payload_uri, sizeof(payload_uri), "file://%s", payload_path);
+    lance_test_local_uri(payload_uri, sizeof(payload_uri), payload_path);
 
     unsigned char payload[32];
     for (size_t index = 0; index < sizeof(payload); ++index) {

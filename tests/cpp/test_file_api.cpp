@@ -2,6 +2,7 @@
 /* SPDX-FileCopyrightText: Copyright The Lance Authors */
 
 #include "lance/lance.hpp"
+#include "test_local_uri.h"
 
 #include <cstdint>
 #include <cstring>
@@ -305,7 +306,7 @@ int test_transfer_write_failures(const std::string& base_path) {
         CHECK(output.good(), "create complete write-failure fixture");
     }
     if (failures) return 1;
-    lance::FileSession files("file://" + directory.string());
+    lance::FileSession files(lance_test_local_uri(directory.string()));
 
     struct rlimit original{};
     if (getrlimit(RLIMIT_FSIZE, &original) != 0) return 2;
@@ -399,7 +400,7 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc != 2) return 2;
-    const std::string base_uri = std::string("file://") + argv[1];
+    const std::string base_uri = lance_test_local_uri(argv[1]);
 
     SchemaFixture schema;
     lance::StorageOptions static_options;

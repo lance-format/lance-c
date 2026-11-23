@@ -35,6 +35,9 @@ use std::ffi::CString;
 #[path = "support/abi_layout.rs"]
 mod abi_layout;
 
+#[path = "support/c_toolchain.rs"]
+mod c_toolchain;
+
 #[path = "support/substrait_aggregate.rs"]
 mod substrait_aggregate;
 
@@ -84,6 +87,8 @@ fn build_lance_c() -> (PathBuf, PathBuf) {
                 target_dir.join("liblance_c.dylib")
             } else if cfg!(target_os = "linux") {
                 target_dir.join("liblance_c.so")
+            } else if cfg!(target_os = "windows") {
+                target_dir.join("lance_c.dll")
             } else {
                 panic!("Unsupported OS for C/C++ link test");
             };
@@ -93,6 +98,15 @@ fn build_lance_c() -> (PathBuf, PathBuf) {
                 "Shared library not found at {}",
                 lib_path.display()
             );
+
+            if cfg!(target_os = "windows") {
+                let import_library = c_toolchain::import_library(&lib_path);
+                assert!(
+                    import_library.exists(),
+                    "MSVC import library not found at {}",
+                    import_library.display()
+                );
+            }
 
             let include_dir = manifest_dir.join("include");
             (lib_path, include_dir)
@@ -1196,88 +1210,73 @@ fn create_blob_publication_dataset_on_disk() -> (tempfile::TempDir, String) {
 
 /// Compile a C source file, linking against lance-c.
 fn compile_c_test(source: &Path, output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
-    let lib_dir = lib_path.parent().unwrap();
-    let lib_name = "lance_c";
-
-    let status = Command::new("clang")
-        .args([
-            "-std=c11",
-            "-Wall",
-            "-Wextra",
-            "-o",
-            output.to_str().unwrap(),
-            source.to_str().unwrap(),
-            &format!("-I{}", include_dir.display()),
-            &format!("-L{}", lib_dir.display()),
-            &format!("-l{lib_name}"),
-            // On macOS, set rpath so the dylib is found at runtime.
-            &format!("-Wl,-rpath,{}", lib_dir.display()),
-        ])
-        .status();
-
-    status
-        .expect("C compiler is required for this ignored test")
-        .success()
+    compile_and_link(
+        c_toolchain::Language::C,
+        &[source],
+        &[include_dir],
+        output,
+        lib_path,
+    )
 }
 
 /// Compile C++ translation units together, linking against lance-c.
 fn compile_cpp_test(sources: &[&Path], output: &Path, include_dir: &Path, lib_path: &Path) -> bool {
-    let lib_dir = lib_path.parent().unwrap();
-    let lib_name = "lance_c";
-
-    let status = Command::new("c++")
-        .args(sources)
-        .args([
-            "-std=c++20",
-            "-Wall",
-            "-Wextra",
-            "-pthread",
-            "-o",
-            output.to_str().unwrap(),
-            &format!("-I{}", include_dir.display()),
-            &format!("-L{}", lib_dir.display()),
-            &format!("-l{lib_name}"),
-            &format!("-Wl,-rpath,{}", lib_dir.display()),
-        ])
-        .status();
-
-    status
-        .expect("C++ compiler is required for this ignored test")
-        .success()
+    compile_and_link(
+        c_toolchain::Language::Cpp,
+        sources,
+        &[include_dir],
+        output,
+        lib_path,
+    )
 }
 
 /// Compile a C header-only consumer without linking it.
 fn compile_c_header_test(source: &Path, include_dirs: &[&Path]) -> bool {
-    let status = Command::new("clang")
-        .args(["-std=c11", "-Wall", "-Wextra", "-fsyntax-only"])
-        .arg(source)
-        .args(
-            include_dirs
-                .iter()
-                .map(|dir| format!("-I{}", dir.display())),
-        )
-        .status();
-
-    status
-        .expect("C compiler is required for this ignored test")
-        .success()
+    compile_without_linking(c_toolchain::Language::C, source, include_dirs)
 }
 
 /// Compile a C++ header-only consumer without linking it.
 fn compile_cpp_header_test(source: &Path, include_dirs: &[&Path]) -> bool {
-    let status = Command::new("c++")
-        .args(["-std=c++20", "-Wall", "-Wextra", "-fsyntax-only"])
-        .arg(source)
-        .args(
-            include_dirs
-                .iter()
-                .map(|dir| format!("-I{}", dir.display())),
-        )
-        .status();
+    compile_without_linking(c_toolchain::Language::Cpp, source, include_dirs)
+}
 
-    status
-        .expect("C++ compiler is required for this ignored test")
-        .success()
+/// Compile and link a consumer against the lance-c build tree, then place the
+/// shared library where the platform loader finds it.
+fn compile_and_link(
+    language: c_toolchain::Language,
+    sources: &[&Path],
+    include_dirs: &[&Path],
+    output: &Path,
+    lib_path: &Path,
+) -> bool {
+    let compiled = c_toolchain::compile(&c_toolchain::Compilation {
+        language,
+        sources,
+        includes: include_dirs,
+        output: Some(output),
+        shared_library: Some(lib_path),
+        deny_warnings: false,
+    });
+    if compiled {
+        c_toolchain::install_runtime_library(output, lib_path);
+    }
+    compiled
+}
+
+/// Syntax-check a header-only consumer without writing a binary.
+fn compile_without_linking(
+    language: c_toolchain::Language,
+    source: &Path,
+    include_dirs: &[&Path],
+) -> bool {
+    c_toolchain::compile(&c_toolchain::Compilation {
+        language,
+        sources: &[source],
+        includes: include_dirs,
+        output: None,
+        shared_library: None,
+        deny_warnings: false,
+    })
 }
 
 /// Compile a header-only consumer with extra compiler arguments and return
@@ -1448,7 +1447,7 @@ fn test_c_compilation_and_execution() {
         .join("tests")
         .join("cpp")
         .join("test_c_api.c");
-    let binary = build_dir.path().join("test_c_api");
+    let binary = c_toolchain::executable_path(build_dir.path(), "test_c_api");
 
     assert!(
         compile_c_test(&source, &binary, &include_dir, &lib_path),
@@ -1497,7 +1496,7 @@ fn test_cpp_compilation_and_execution() {
         .join("tests")
         .join("cpp")
         .join("test_cpp_api.cpp");
-    let binary = build_dir.path().join("test_cpp_api");
+    let binary = c_toolchain::executable_path(build_dir.path(), "test_cpp_api");
 
     assert!(
         compile_cpp_test(&[&source], &binary, &include_dir, &lib_path),
@@ -1534,7 +1533,7 @@ fn test_typed_fts_native_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_fts_query.c");
-    let c_binary = build_dir.path().join("test_fts_query_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_fts_query_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C FTS test compilation failed"
@@ -1542,7 +1541,7 @@ fn test_typed_fts_native_compilation_and_execution() {
     run_test_binary_with_args(&c_binary, &[&dataset_uri, &list_dataset_uri, &list_row_id]);
 
     let cpp_source = tests_dir.join("test_fts_query.cpp");
-    let cpp_binary = build_dir.path().join("test_fts_query_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_fts_query_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ FTS test compilation failed"
@@ -1564,7 +1563,7 @@ fn test_native_index_capabilities_consumers() {
 
     let (_c_tmp, c_uri) = create_index_capability_dataset_on_disk("index_caps_c");
     let c_source = tests_dir.join("test_index_capabilities.c");
-    let c_binary = build_dir.path().join("test_index_capabilities_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_index_capabilities_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "focused C index capability consumer failed to compile"
@@ -1573,7 +1572,7 @@ fn test_native_index_capabilities_consumers() {
 
     let (_cpp_tmp, cpp_uri) = create_index_capability_dataset_on_disk("index_caps_cpp");
     let cpp_source = tests_dir.join("test_index_capabilities.cpp");
-    let cpp_binary = build_dir.path().join("test_index_capabilities_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_index_capabilities_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "focused C++ index capability consumer failed to compile"
@@ -1603,7 +1602,7 @@ fn test_native_transaction_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_transaction.c");
-    let c_binary = build_dir.path().join("test_transaction_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_transaction_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C transaction test compilation failed"
@@ -1620,7 +1619,7 @@ fn test_native_transaction_compilation_and_execution() {
     );
 
     let cpp_source = tests_dir.join("test_transaction.cpp");
-    let cpp_binary = build_dir.path().join("test_transaction_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_transaction_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
@@ -1657,7 +1656,7 @@ fn test_native_fragment_mutation_consumers() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_fragment_mutation.c");
-    let c_binary = build_dir.path().join("test_fragment_mutation_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_fragment_mutation_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C fragment mutation consumer failed to compile"
@@ -1668,7 +1667,7 @@ fn test_native_fragment_mutation_consumers() {
     );
 
     let cpp_source = tests_dir.join("test_fragment_mutation.cpp");
-    let cpp_binary = build_dir.path().join("test_fragment_mutation_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_fragment_mutation_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ fragment mutation consumer failed to compile"
@@ -1696,7 +1695,7 @@ fn test_native_data_overlay_consumers() {
 
     let (_c_tmp, c_uri) = create_overlay_dataset_on_disk("data_overlay_c");
     let c_source = tests_dir.join("test_data_overlay.c");
-    let c_binary = build_dir.path().join("test_data_overlay_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_data_overlay_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C data overlay consumer failed to compile"
@@ -1705,7 +1704,7 @@ fn test_native_data_overlay_consumers() {
 
     let (_cpp_tmp, cpp_uri) = create_overlay_dataset_on_disk("data_overlay_cpp");
     let cpp_source = tests_dir.join("test_data_overlay.cpp");
-    let cpp_binary = build_dir.path().join("test_data_overlay_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_data_overlay_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ data overlay consumer failed to compile"
@@ -1737,7 +1736,7 @@ fn test_raw_file_native_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_file_api.c");
-    let c_binary = build_dir.path().join("test_file_api_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_file_api_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C raw-file test compilation failed"
@@ -1746,7 +1745,7 @@ fn test_raw_file_native_compilation_and_execution() {
 
     let cpp_source = tests_dir.join("test_file_api.cpp");
     let cpp_session_source = tests_dir.join("test_file_session.cpp");
-    let cpp_binary = build_dir.path().join("test_file_api_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_file_api_cpp");
     assert!(
         compile_cpp_test(
             &[&cpp_source, &cpp_session_source],
@@ -1789,7 +1788,7 @@ fn test_native_namespace_compilation_and_execution() {
     let c_source = tests_dir.join("test_namespace.c");
     let root = tempfile::tempdir().unwrap();
     let root = root.path().to_str().unwrap();
-    let c_binary = build_dir.path().join("test_namespace_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_namespace_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C native namespace test compilation failed"
@@ -1797,7 +1796,7 @@ fn test_native_namespace_compilation_and_execution() {
     run_test_binary_with_dataset(&c_binary, root);
 
     let cpp_source = tests_dir.join("test_namespace.cpp");
-    let cpp_binary = build_dir.path().join("test_namespace_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_namespace_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ native namespace test compilation failed"
@@ -2082,7 +2081,7 @@ fn test_native_sql_delta_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_sql.c");
-    let c_binary = build_dir.path().join("test_sql_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_sql_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C native SQL test compilation failed"
@@ -2093,7 +2092,7 @@ fn test_native_sql_delta_compilation_and_execution() {
     );
 
     let delta_source = tests_dir.join("test_delta.c");
-    let delta_binary = build_dir.path().join("test_delta_c");
+    let delta_binary = c_toolchain::executable_path(build_dir.path(), "test_delta_c");
     assert!(
         compile_c_test(&delta_source, &delta_binary, &include_dir, &lib_path),
         "C native delta test compilation failed"
@@ -2114,7 +2113,7 @@ fn test_native_sql_delta_compilation_and_execution() {
     );
 
     let cpp_source = tests_dir.join("test_sql_delta.cpp");
-    let cpp_binary = build_dir.path().join("test_sql_delta_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_sql_delta_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ native SQL and delta test compilation failed"
@@ -2200,7 +2199,7 @@ fn test_mem_wal_cpp_compilation_and_execution() {
         .join("tests")
         .join("cpp")
         .join("mem_wal_test.cpp");
-    let binary = build_dir.path().join("mem_wal_test_cpp");
+    let binary = c_toolchain::executable_path(build_dir.path(), "mem_wal_test_cpp");
     assert!(
         compile_cpp_test(&[&source], &binary, &include_dir, &lib_path),
         "C++ MemWAL test compilation failed"
@@ -2221,7 +2220,7 @@ fn test_commit_lock_native_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_commit_lock.c");
-    let c_binary = build_dir.path().join("test_commit_lock_c");
+    let c_binary = c_toolchain::executable_path(build_dir.path(), "test_commit_lock_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C commit-lock test compilation failed"
@@ -2229,7 +2228,7 @@ fn test_commit_lock_native_compilation_and_execution() {
     run_test_binary_with_two_args(&c_binary, &source_uri, scratch_path);
 
     let cpp_source = tests_dir.join("test_commit_lock.cpp");
-    let cpp_binary = build_dir.path().join("test_commit_lock_cpp");
+    let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_commit_lock_cpp");
     assert!(
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ commit-lock test compilation failed"

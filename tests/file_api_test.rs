@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[path = "support/local_uri.rs"]
+mod local_uri;
+
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -22,6 +25,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, Schema};
 use futures::{StreamExt, TryStreamExt};
 use lance_c::*;
+
 use lance_core::cache::LanceCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::format::pbfile;
@@ -2657,7 +2661,7 @@ fn storage_provider_none_some_empty_error_expiry_and_force() {
     };
     let (provider, counters, provider_id) = create_test_provider(context, false);
     let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
-    let local_uri = c_string(&format!("file://{}", root.path().display()));
+    let local_uri = c_string(&local_uri::file_uri(root.path()));
     let local_session =
         unsafe { lance_file_session_new(local_uri.as_ptr(), accessor, ptr::null(), ptr::null()) };
     assert!(!local_session.is_null());
@@ -2807,7 +2811,7 @@ fn read_fixture_with_session(
 #[test]
 fn file_session_operations_diagnostics_and_static_options() {
     let root = tempfile::tempdir().unwrap();
-    let base_uri = format!("file://{}", root.path().display());
+    let base_uri = local_uri::file_uri(root.path());
     let base_uri_c = c_string(&base_uri);
     let block_keys = [c"block_size".as_ptr()];
     let block_values = [c"4096".as_ptr()];
@@ -3042,7 +3046,7 @@ fn file_session_download_preserves_local_source_and_aliases() {
     let expected = b"keep the original source bytes";
     std::fs::write(&source, expected).unwrap();
     std::fs::hard_link(&source, &hard_link).unwrap();
-    let uri = c_string(&format!("file://{}", root.path().display()));
+    let uri = c_string(&local_uri::file_uri(root.path()));
     let files =
         unsafe { lance_file_session_new(uri.as_ptr(), ptr::null(), ptr::null(), ptr::null()) };
     if files.is_null() {
@@ -3100,7 +3104,7 @@ fn file_session_download_preserves_local_source_and_aliases() {
 #[test]
 fn shared_session_cache_is_explicit_and_streams_outlive_parents() {
     let root = tempfile::tempdir().unwrap();
-    let base_uri = format!("file://{}", root.path().display());
+    let base_uri = local_uri::file_uri(root.path());
     let base_uri_c = c_string(&base_uri);
     let cache_session = lance_session_new(8 * 1024 * 1024, 8 * 1024 * 1024);
     assert!(!cache_session.is_null());

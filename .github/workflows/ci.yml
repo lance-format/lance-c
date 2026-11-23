@@ -162,7 +162,7 @@ jobs:
   test-windows:
     name: Tests (Windows x64)
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -230,6 +230,13 @@ jobs:
           -Prefix stage -SourceRoot .
           -WorkDir "$env:RUNNER_TEMP\lance-c-windows-acceptance"
           -AbiBaseline ".github/abi-baseline/v0.2.0-exports.txt"
+      # Package acceptance above covers the Release CMake build. The Rust test
+      # suite and the C/C++ FFI harness build their own debug library, so run
+      # them after the staged-package evidence has been produced.
+      - name: Run Rust tests
+        run: cargo test
+      - name: Run C/C++ compilation tests
+        run: cargo test --test compile_and_run_test -- --ignored
       - name: Upload staged package
         uses: actions/upload-artifact@v4
         with:
@@ -241,7 +248,7 @@ jobs:
   test-windows-arm64:
     name: Tests (Windows ARM64)
     runs-on: windows-11-arm
-    timeout-minutes: 150
+    timeout-minutes: 240
     env:
       RUST_BACKTRACE: "1"
     steps:
@@ -343,6 +350,10 @@ jobs:
           -Architecture ARM64 -CMakeGenerator "Visual Studio 18 2026"
           -CMakeToolset ClangCL
           -AbiBaseline ".github/abi-baseline/v0.2.0-exports.txt"
+      - name: Run Rust tests
+        run: cargo test
+      - name: Run C/C++ compilation tests
+        run: cargo test --test compile_and_run_test -- --ignored
       - name: Upload staged package
         uses: actions/upload-artifact@v4
         with:

@@ -224,6 +224,10 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 When staging existing Windows libraries with `-DLANCE_C_USE_PREBUILT=ON`, you must also pass `-DLANCE_C_CRT_STATIC=ON` (for Release `/MT` inputs) or `OFF` (for dynamic-CRT inputs) so the installed `LanceCConfig.cmake` records accurate metadata. The Windows package export filter wraps MSVC `link.exe`; overriding the linker with `lld-link` is not supported.
 
+### Running the native test suite on Windows
+
+`cargo test` runs the Rust suite, and `cargo test --test compile_and_run_test -- --ignored` compiles every C and C++ consumer under `tests/cpp/` against the freshly built `lance_c.dll` and runs it. Both work from a plain PowerShell window: when `cl.exe` is not on `PATH`, the harness asks `vswhere.exe` for the Visual Studio installation and reads the `vcvarsall.bat` environment for the native architecture, links `lance_c.dll.lib`, and copies the DLL beside each test binary. Set `CC` and `CXX` to use another MSVC-compatible compiler such as `clang-cl`. CI runs both commands on Windows x64 and Windows ARM64.
+
 ### Consuming the Windows package and `/MT` CRT rules
 
 The install prefix contains `lib/lance_c.dll`, its import library `lib/lance_c.dll.lib`, the static library `lib/lance_c.lib`, and the public headers.
