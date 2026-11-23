@@ -7,6 +7,7 @@ This document provides platform-specific build instructions, binary packaging co
 - [Published prebuilt archives](#published-prebuilt-archives)
 - [Linux runtime requirements](#linux-baseline-for-future-packages)
 - [Try the published package](#try-the-published-package)
+- [Choosing static or shared linkage](#choosing-static-or-shared-linkage)
 - [Building from source via Cargo](#from-source-via-cargo-rust-developers)
 - [Building from source via CMake](#from-source-via-cmake-cc-developers-and-packagers)
 - [Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)](#windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc)
@@ -51,6 +52,30 @@ The two Linux archives target glibc 2.28 on x86_64 and AArch64. Source builds li
 ## Try the published package
 
 Follow the [quickstart](../README.md#quickstart) to verify the archive and open the sample dataset. For shared linkage, pass `-DLanceC_LINK=shared` to CMake. On macOS arm64, choose the Apple silicon archive and verify its per-archive checksum with `shasum -a 512 -c "$ARCHIVE.sha512"` after downloading both files.
+
+## Choosing static or shared linkage
+
+Every package installs both the static archive and the shared library, and the two differ in how they expose the native libraries compiled into them.
+
+| | Static (`LanceC_LINK=static`, default) | Shared (`LanceC_LINK=shared`) |
+| --- | --- | --- |
+| Library | `liblance_c.a` / `lance_c.lib` | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll` |
+| Defined symbols | every symbol in the archive members the linker pulls in, including bundled native libraries | only the public `lance_*` C ABI |
+| Deployment | one self-contained executable | ship the shared library beside the executable |
+
+The release static archive is deliberately unstripped: it keeps the symbol table static linking requires and carries the compiled Rust graph together with the native C libraries it embeds, currently AWS-LC and zstd/LZ4. A statically linked consumer therefore defines those libraries' symbols itself. If the same process also links its own copy of an overlapping native library, the linker resolves each symbol against whichever definition it sees, so link order and the set of pulled archive members decide which copy satisfies a reference.
+
+Use shared linkage when the host already links native libraries that overlap the ones lance-c bundles, such as another OpenSSL/BoringSSL-family library, zstd or LZ4, or when several components in one process link lance-c. The shared library hides its embedded copies: its dynamic export table contains only the `lance_*` C ABI, so those symbols never enter the host's symbol space. Use static linkage when the host ships as one self-contained executable and does not link overlapping native libraries.
+
+With CMake, set `LanceC_LINK` before `find_package`:
+
+```cmake
+set(LanceC_LINK shared)
+find_package(LanceC CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE LanceC::lance_c)
+```
+
+The C++ wrapper is header-only, so its linkage follows the C library. On Windows, shared linkage also removes the `/MT` static-CRT requirement for consumers; see [Windows linking](#consuming-the-windows-package-and-mt-crt-rules). pkg-config already selects the shared library when both are installed; [Using pkg-config](#using-pkg-config) shows the explicit static invocation.
 
 <a id="from-source-via-cargo-rust-developers"></a>
 ## Building from source via Cargo
