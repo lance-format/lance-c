@@ -74,13 +74,19 @@ else()
         set(_expected_shared "${TEST_PREFIX}/lib/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
         set(_expected_static "${TEST_PREFIX}/lib/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
     endif()
+    # CACHE PATH normalizes redundant separators in LANCE_C_PREBUILT_DIR.
+    # Normalize only expectations so TEST_PREFIX still exercises that input.
+    cmake_path(NORMAL_PATH _expected_shared)
+    cmake_path(NORMAL_PATH _expected_static)
     if(NOT _shared_links STREQUAL _expected_shared)
-        message(FATAL_ERROR "Shared interface differs: ${_shared_links}")
+        message(FATAL_ERROR
+            "Shared interface differs: expected '${_expected_shared}', got '${_shared_links}'")
     endif()
     set(_expected_static_links "${_expected_static};LanceC_platform_deps")
 endif()
 if(NOT _static_links STREQUAL _expected_static_links)
-    message(FATAL_ERROR "Static dependencies differ: ${_static_links}")
+    message(FATAL_ERROR
+        "Static dependencies differ: expected '${_expected_static_links}', got '${_static_links}'")
 endif()
 get_target_property(_alias LanceC::lance_c ALIASED_TARGET)
 if(NOT _alias STREQUAL "LanceC::lance_c_${LanceC_LINK}")

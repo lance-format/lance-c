@@ -10,7 +10,9 @@ if(NOT DEFINED TEST_ROOT)
     set(TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/build/test-target-interfaces")
 endif()
 file(REMOVE_RECURSE "${TEST_ROOT}")
-set(_prefix "${TEST_ROOT}/prebuilt")
+# Preserve a redundant separator like the one produced by a trailing slash in
+# macOS TMPDIR. Consumers must compare equivalent paths after normalization.
+set(_prefix "${TEST_ROOT}//prebuilt")
 file(MAKE_DIRECTORY "${_prefix}/lib")
 file(COPY "${_repo}/include/" DESTINATION "${_prefix}/include")
 # Only metadata and compilation are tested; these placeholders are never linked.
