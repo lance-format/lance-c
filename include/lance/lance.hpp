@@ -4656,6 +4656,30 @@ public:
     void take(const uint32_t* indices, size_t num_indices,
               ArrowArrayStream* out) const;
 
+    /// Take fragment-local logical rows and return the owning stream.
+    ///
+    /// The projection, explicit-empty-projection behavior and native
+    /// validation are the same as the raw-out overload. The returned
+    /// `ArrowStream` releases the native stream exactly once, on destruction
+    /// or `reset()`; moving it transfers ownership and leaves the source empty.
+    /// `out` from the raw-out overload remains caller-owned.
+    ArrowStream take(const uint32_t* indices, size_t num_indices,
+                     const std::vector<std::string>& columns) const;
+
+    /// Take fragment-local logical rows with all columns and return the owning
+    /// stream. Ownership and validation follow the projecting overload above.
+    ArrowStream take(const uint32_t* indices, size_t num_indices) const;
+
+    /// Borrow indices from a contiguous range and return the owning stream.
+    /// The range is read only during this call. Empty-range and projection
+    /// behavior are inherited from the pointer/count overload above.
+    ArrowStream take(std::span<const uint32_t> indices,
+                     const std::vector<std::string>& columns) const;
+
+    /// Borrow all-column indices from a contiguous range and return the
+    /// owning stream. Ownership follows the overload above.
+    ArrowStream take(std::span<const uint32_t> indices) const;
+
     /// Count fragment rows. `std::nullopt` calls native count_rows(None); an
     /// empty string is passed as an explicit native filter.
     uint64_t count_rows(std::optional<std::string> filter = std::nullopt) const {
@@ -9691,6 +9715,42 @@ public:
         }
     }
 
+    /// Take rows by indices and return the owning stream.
+    ///
+    /// The projection, empty-vector behavior and native validation are the
+    /// same as the raw-out overload. The returned `ArrowStream` releases the
+    /// native stream exactly once, on destruction or `reset()`; moving it
+    /// transfers ownership and leaves the source empty. `out` from the raw-out
+    /// overload remains caller-owned.
+    ArrowStream take(const uint64_t* indices, size_t num_indices,
+                     const std::vector<std::string>& columns) const {
+        ArrowArrayStream raw{};
+        take(indices, num_indices, columns, &raw);
+        return ArrowStream(raw);
+    }
+
+    /// Take all columns by indices and return the owning stream.
+    /// Ownership and validation follow the projecting overload above.
+    ArrowStream take(const uint64_t* indices, size_t num_indices) const {
+        ArrowArrayStream raw{};
+        take(indices, num_indices, &raw);
+        return ArrowStream(raw);
+    }
+
+    /// Borrow indices from a contiguous range and return the owning stream.
+    /// The range is read only during this call. Empty-range and projection
+    /// behavior are inherited from the pointer/count overload above.
+    ArrowStream take(std::span<const uint64_t> indices,
+                     const std::vector<std::string>& columns) const {
+        return take(indices.data(), indices.size(), columns);
+    }
+
+    /// Borrow all-column indices from a contiguous range and return the
+    /// owning stream. Ownership follows the overload above.
+    ArrowStream take(std::span<const uint64_t> indices) const {
+        return take(indices.data(), indices.size());
+    }
+
     /// Take rows by dataset row IDs. `out` is caller-owned and its non-null
     /// `release` must be called exactly once. Deferred iteration/cleanup panics
     /// are contained by the exported stream guard.
@@ -9734,6 +9794,42 @@ public:
     void take_rows(std::span<const uint64_t> row_ids,
                    ArrowArrayStream* out) const {
         take_rows(row_ids.data(), row_ids.size(), out);
+    }
+
+    /// Take rows by dataset row IDs and return the owning stream.
+    ///
+    /// The projection, empty-vector behavior and native validation are the
+    /// same as the raw-out overload. The returned `ArrowStream` releases the
+    /// native stream exactly once, on destruction or `reset()`; moving it
+    /// transfers ownership and leaves the source empty. `out` from the raw-out
+    /// overload remains caller-owned.
+    ArrowStream take_rows(const uint64_t* row_ids, size_t num_row_ids,
+                          const std::vector<std::string>& columns) const {
+        ArrowArrayStream raw{};
+        take_rows(row_ids, num_row_ids, columns, &raw);
+        return ArrowStream(raw);
+    }
+
+    /// Take all columns by dataset row IDs and return the owning stream.
+    /// Ownership and validation follow the projecting overload above.
+    ArrowStream take_rows(const uint64_t* row_ids, size_t num_row_ids) const {
+        ArrowArrayStream raw{};
+        take_rows(row_ids, num_row_ids, &raw);
+        return ArrowStream(raw);
+    }
+
+    /// Borrow row IDs from a contiguous range and return the owning stream.
+    /// The range is read only during this call. Empty-range and projection
+    /// behavior are inherited from the pointer/count overload above.
+    ArrowStream take_rows(std::span<const uint64_t> row_ids,
+                          const std::vector<std::string>& columns) const {
+        return take_rows(row_ids.data(), row_ids.size(), columns);
+    }
+
+    /// Borrow all-column row IDs from a contiguous range and return the
+    /// owning stream. Ownership follows the overload above.
+    ArrowStream take_rows(std::span<const uint64_t> row_ids) const {
+        return take_rows(row_ids.data(), row_ids.size());
     }
 
     /// Take blob handles by dataset row ID; element `i` is for `row_ids[i]`,
@@ -12121,6 +12217,18 @@ public:
             detail::throw_error();
     }
 
+    /// Materialize an independent stream and return the owning handle.
+    ///
+    /// The returned `ArrowStream` releases the native stream exactly once, on
+    /// destruction or `reset()`; moving it transfers ownership and leaves the
+    /// source empty. The raw-out overload above keeps its caller-owned
+    /// contract. The scanner remains valid.
+    ArrowStream to_arrow_stream() {
+        ArrowArrayStream raw{};
+        to_arrow_stream(&raw);
+        return ArrowStream(raw);
+    }
+
     /// Start an async scan with a non-null callback. On success, the callback's
     /// ArrowArrayStream result is library-allocated and must be passed exactly
     /// once to `lance::scanner_async_stream_free`, which also invokes `release`
@@ -12348,6 +12456,33 @@ inline void Fragment::take(
             handle_.get(), indices, num_indices, nullptr, out) != 0) {
         detail::throw_error();
     }
+}
+
+inline ArrowStream Fragment::take(
+    const uint32_t* indices,
+    size_t num_indices,
+    const std::vector<std::string>& columns) const {
+    ArrowArrayStream raw{};
+    take(indices, num_indices, columns, &raw);
+    return ArrowStream(raw);
+}
+
+inline ArrowStream Fragment::take(
+    const uint32_t* indices,
+    size_t num_indices) const {
+    ArrowArrayStream raw{};
+    take(indices, num_indices, &raw);
+    return ArrowStream(raw);
+}
+
+inline ArrowStream Fragment::take(
+    std::span<const uint32_t> indices,
+    const std::vector<std::string>& columns) const {
+    return take(indices.data(), indices.size(), columns);
+}
+
+inline ArrowStream Fragment::take(std::span<const uint32_t> indices) const {
+    return take(indices.data(), indices.size());
 }
 
 inline Fragment Fragment::create(

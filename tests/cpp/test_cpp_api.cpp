@@ -680,7 +680,7 @@ static void assert_scan_schema(
     schema.release(&schema);
 }
 
-static uint64_t drain_scan_rows(ArrowArrayStream& stream) {
+static uint64_t drain_scan_rows_without_release(ArrowArrayStream& stream) {
     uint64_t total = 0;
     while (true) {
         ArrowArray array;
@@ -690,6 +690,11 @@ static uint64_t drain_scan_rows(ArrowArrayStream& stream) {
         total += static_cast<uint64_t>(array.length);
         array.release(&array);
     }
+    return total;
+}
+
+static uint64_t drain_scan_rows(ArrowArrayStream& stream) {
+    const uint64_t total = drain_scan_rows_without_release(stream);
     if (stream.release) stream.release(&stream);
     return total;
 }
@@ -1584,6 +1589,208 @@ static void test_dataset_take_rows(const std::string& uri) {
     assert(drain_scan_rows(empty_braces_stream) == 0);
 
     printf("rows=3, empty=0... ");
+    PASS();
+}
+
+static void counting_stream_release(ArrowArrayStream* stream) {
+    auto* releases = static_cast<int*>(stream->private_data);
+    ++*releases;
+    stream->release = nullptr;
+}
+
+static void test_arrow_stream_release_once() {
+    TEST(test_arrow_stream_release_once);
+
+    int releases = 0;
+    {
+        ArrowArrayStream raw{};
+        raw.private_data = &releases;
+        raw.release = counting_stream_release;
+        lance::ArrowStream source(raw);
+        auto moved = std::move(source);
+        assert(!source);
+        assert(moved);
+        moved.reset();
+        assert(!moved);
+        assert(releases == 1);
+    }
+    assert(releases == 1);
+
+    releases = 0;
+    {
+        ArrowArrayStream raw{};
+        raw.private_data = &releases;
+        raw.release = counting_stream_release;
+        lance::ArrowStream owned(raw);
+        assert(owned);
+    }
+    assert(releases == 1);
+
+    PASS();
+}
+
+static void test_owned_stream_overloads(
+    const std::string& uri,
+    const std::string& fragment_uri) {
+    TEST(test_owned_stream_overloads);
+
+    auto ds = lance::Dataset::open(uri);
+    const uint64_t rows = ds.count_rows();
+    uint64_t indices[] = {0, 1, 2};
+    ArrowArrayStream raw_stream{};
+    ArrowArrayStream* raw_out = &raw_stream;
+
+    // Braced/null arguments with an out pointer stay on the caller-owned
+    // pointer/count overload; the returning overload needs at least one
+    // explicit pointer/count or range argument.
+    static_assert(
+        std::is_same_v<decltype(ds.take_rows({}, {})), lance::ArrowStream>);
+    static_assert(std::is_same_v<decltype(ds.take_rows({}, {}, raw_out)), void>);
+    static_assert(
+        std::is_same_v<decltype(ds.take(nullptr, 0, raw_out)), void>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<const lance::Fragment&>().take(
+                      {}, {}, raw_out)),
+                  void>);
+
+    {
+        auto scanner = ds.scan({"id"});
+        auto owned = scanner.to_arrow_stream();
+        assert(owned);
+        assert_scan_schema(*owned.get(), {{"id", "i"}});
+        assert(drain_scan_rows_without_release(*owned.get()) == rows);
+    }
+
+    {
+        const uint64_t filtered = ds.count_rows("id >= 5");
+        assert(filtered > 0 && filtered < rows);
+        auto scanner = ds.scan({"id"}, "id >= 5");
+        auto owned = scanner.to_arrow_stream();
+        assert(owned);
+        assert_scan_schema(*owned.get(), {{"id", "i"}});
+        assert(drain_scan_rows_without_release(*owned.get()) == filtered);
+    }
+
+    {
+        auto owned = ds.take(indices, 3);
+        assert(owned);
+        assert(drain_scan_rows_without_release(*owned.get()) == 3);
+    }
+
+    {
+        auto owned = ds.take(std::span<const uint64_t>(indices, 3), {"name"});
+        assert(owned);
+        assert_scan_schema(*owned.get(), {{"name", "u"}});
+        assert(drain_scan_rows_without_release(*owned.get()) == 3);
+    }
+
+    {
+        std::vector<std::string> all_columns;
+        auto owned =
+            ds.take(std::span<const uint64_t>(indices, 3), all_columns);
+        assert(owned);
+        assert_scan_schema(*owned.get(),
+                           {{"id", "i"}, {"name", "u"}, {"score", "i"},
+                            {"embedding", nullptr}});
+        assert(drain_scan_rows_without_release(*owned.get()) == 3);
+    }
+
+    {
+        auto owned = ds.take_rows(indices, 3);
+        assert(owned);
+        assert(drain_scan_rows_without_release(*owned.get()) == 3);
+    }
+
+    {
+        auto owned = ds.take_rows(indices, 3, {"id"});
+        assert(owned);
+        assert_scan_schema(*owned.get(), {{"id", "i"}});
+        assert(drain_scan_rows_without_release(*owned.get()) == 3);
+    }
+
+    {
+        auto owned = ds.take_rows(std::span<const uint64_t>{indices, 3});
+        assert(owned);
+        assert(drain_scan_rows_without_release(*owned.get()) == 3);
+    }
+
+    {
+        // A null empty range is valid for take_rows and reads zero rows.
+        auto owned = ds.take_rows(std::span<const uint64_t>{});
+        assert(owned);
+        assert(drain_scan_rows_without_release(*owned.get()) == 0);
+    }
+
+    {
+        // Moving transfers the release-once obligation and empties the source.
+        auto source = ds.take_rows(indices, 3);
+        auto moved = std::move(source);
+        assert(!source);
+        assert(moved);
+        assert(drain_scan_rows_without_release(*moved.get()) == 3);
+    }
+
+    {
+        // Early release drops an unconsumed stream without a second release.
+        auto scanner = ds.scan();
+        auto owned = scanner.to_arrow_stream();
+        assert(owned);
+        owned.reset();
+        assert(!owned);
+    }
+
+    {
+        bool invalid = false;
+        try {
+            (void)ds.take_rows(nullptr, 1);
+        } catch (const lance::Error& error) {
+            invalid = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(invalid);
+    }
+
+    auto latest = lance::Dataset::open(fragment_uri);
+    assert(latest.has_stable_row_ids());
+    auto fragment_ids = latest.fragment_ids();
+    assert(fragment_ids.size() == 2);
+    auto fragment = latest.open_fragment(fragment_ids[0]);
+    const uint64_t fragment_rows = fragment.count_rows();
+    assert(fragment_rows >= 2);
+    std::vector<uint32_t> fragment_indices{
+        0, static_cast<uint32_t>(fragment_rows - 1)};
+
+    {
+        auto owned = fragment.take(fragment_indices);
+        assert(owned);
+        assert(drain_scan_rows_without_release(*owned.get()) == 2);
+    }
+
+    {
+        auto owned =
+            fragment.take(std::span<const uint32_t>{fragment_indices}, {"id"});
+        assert(owned);
+        assert_scan_schema(*owned.get(), {{"id", "i"}});
+        assert(drain_scan_rows_without_release(*owned.get()) == 2);
+    }
+
+    {
+        // Fragment::take keeps its explicit empty-projection semantics.
+        std::vector<std::string> empty_columns;
+        auto owned = fragment.take(
+            std::span<const uint32_t>{fragment_indices}, empty_columns);
+        assert(owned);
+        assert_scan_schema(*owned.get(), {});
+        assert(drain_scan_rows_without_release(*owned.get()) == 2);
+    }
+
+    {
+        // A null empty range is valid for Fragment::take.
+        auto owned = fragment.take(std::span<const uint32_t>{});
+        assert(owned);
+        assert(drain_scan_rows_without_release(*owned.get()) == 0);
+    }
+
     PASS();
 }
 
@@ -5880,6 +6087,8 @@ int main(int argc, char** argv) {
     test_blob_planned_reads(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
+    test_arrow_stream_release_once();
+    test_owned_stream_overloads(uri, fragment_read_uri);
     test_raii_cleanup(uri);
     test_versions(uri);
     test_version_refs_and_tags(uri);
