@@ -96,6 +96,8 @@ jobs:
         run: manylinux-install-clang -v 20.1.8.0
       - name: Ensure pkg-config
         run: command -v pkg-config >/dev/null || dnf install -y pkgconf-pkg-config
+      - name: Compile public headers with GCC and Clang
+        run: bash .github/scripts/verify-cxx-headers.sh
       - uses: ./.github/actions/setup-protoc
       - name: Build library artifacts
         run: cargo build --lib
