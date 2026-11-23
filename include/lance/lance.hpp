@@ -51,19 +51,72 @@ class Error : public std::runtime_error {
 public:
     LanceErrorCode code;
 
-    Error(LanceErrorCode code, std::string msg)
-        : std::runtime_error(std::move(msg)), code(code) {}
+    Error(LanceErrorCode code_value, std::string message)
+        : std::runtime_error(std::move(message)), code(code_value) {}
 };
 
-/// Check thread-local error and throw if non-OK.
-inline void check_error() {
-    LanceErrorCode code = lance_last_error_code();
-    if (code != LANCE_OK) {
-        const char* msg = lance_last_error_message();
-        std::string owned(msg ? msg : "Unknown error");
-        if (msg) lance_free_string(msg);
-        throw Error(code, std::move(owned));
+namespace detail {
+
+/// Deleter for strings allocated by the C API.
+struct FreeString {
+    void operator()(const char* ptr) const noexcept { lance_free_string(ptr); }
+};
+
+/// Owner of a string allocated by the C API.
+using OwnedString = std::unique_ptr<const char, FreeString>;
+
+/// Throw the pending thread-local error.
+///
+/// Call this only after a documented failure sentinel. If the native call
+/// reported failure without setting a thread-local error, throw
+/// `LANCE_ERR_INTERNAL` so the missing detail cannot turn into a null
+/// dereference at the call site.
+[[noreturn]] inline void throw_error() {
+    const LanceErrorCode code = lance_last_error_code();
+    OwnedString message(lance_last_error_message());
+    if (code == LANCE_OK) {
+        throw Error(
+            LANCE_ERR_INTERNAL,
+            "lance-c returned a failure without setting a thread-local error");
     }
+    throw Error(code, message ? std::string(message.get()) : "Unknown error");
+}
+
+/// Take ownership of a string allocated by the C API.
+inline std::string take_string(const char* raw) {
+    if (!raw) throw_error();
+    OwnedString guard(raw);
+    return std::string(raw);
+}
+
+/// Deleter for byte buffers allocated by the C API.
+struct FreeBytes {
+    void operator()(uint8_t* ptr) const noexcept { lance_free_bytes(ptr); }
+};
+
+/// Owner of a byte buffer allocated by the C API.
+using OwnedBytes = std::unique_ptr<uint8_t, FreeBytes>;
+
+/// Take ownership of a byte buffer allocated by the C API. A null buffer is
+/// valid only with `len == 0`, where it denotes an empty result.
+inline std::vector<uint8_t> take_bytes(uint8_t* raw, size_t len) {
+    if (!raw) {
+        if (len != 0) throw_error();
+        return {};
+    }
+    OwnedBytes guard(raw);
+    return std::vector<uint8_t>(raw, raw + len);
+}
+
+} // namespace detail
+
+/// Check the thread-local error state and throw if it is not `LANCE_OK`.
+///
+/// Returns normally when the last call succeeded, so it is valid to call after
+/// a successful operation. Wrapper failure branches use a non-returning helper
+/// instead, so they cannot fall through into an invalid result.
+inline void check_error() {
+    if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 }
 
 /// Opt in to native diagnostic logging on stderr. `filter` uses the same
@@ -76,17 +129,14 @@ inline void init_logging(std::string_view filter = "info") {
                     "logging filter must not contain NUL");
     }
     std::string owned(filter);
-    if (lance_init_logging(owned.c_str()) != 0) check_error();
+    if (lance_init_logging(owned.c_str()) != 0) detail::throw_error();
 }
 
 /// Build a portable IVF_RQ fast-rotation model as native JSON. `num_bits == 0`
 /// selects the native RQ default of 5.
 inline std::string build_rq_model(uint32_t dimension, uint32_t num_bits = 5) {
     const char* json = lance_index_build_rq_model(dimension, num_bits);
-    if (!json) check_error();
-    std::unique_ptr<const char, void (*)(const char*)> guard(json,
-                                                             lance_free_string);
-    return std::string(json);
+    return detail::take_string(json);
 }
 
 /// Release and free a library-allocated ArrowArrayStream returned by
@@ -281,7 +331,7 @@ public:
 
     static Ref version_number(uint64_t version) {
         auto* raw = lance_ref_version_number(version);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Ref(raw);
     }
 
@@ -292,13 +342,13 @@ public:
             branch ? branch->c_str() : nullptr,
             version_number.has_value(),
             version_number.value_or(0));
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Ref(raw);
     }
 
     static Ref tag(const std::string& tag_name) {
         auto* raw = lance_ref_tag(tag_name.c_str());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Ref(raw);
     }
 
@@ -767,21 +817,21 @@ public:
     /// Native data-file path relative to its selected data directory.
     std::string path() const {
         const char* path = lance_data_file_path(handle_.get());
-        if (!path) check_error();
+        if (!path) detail::throw_error();
         return path;
     }
 
     /// Native field IDs in stored order.
     std::vector<int32_t> fields() const {
         size_t count = lance_data_file_field_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<int32_t> out;
         out.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             int32_t field_id = 0;
             if (lance_data_file_field_id_at(
                     handle_.get(), i, &field_id) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(field_id);
         }
@@ -791,14 +841,14 @@ public:
     /// Native column indices in stored order, including the `-1` marker.
     std::vector<int32_t> column_indices() const {
         size_t count = lance_data_file_column_index_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<int32_t> out;
         out.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             int32_t column_index = 0;
             if (lance_data_file_column_index_at(
                     handle_.get(), i, &column_index) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(column_index);
         }
@@ -811,7 +861,7 @@ public:
         uint32_t minor = 0;
         if (lance_data_file_file_version(
                 handle_.get(), &major, &minor) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return {major, minor};
     }
@@ -822,7 +872,7 @@ public:
         uint64_t size = 0;
         if (lance_data_file_file_size(
                 handle_.get(), &present, &size) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!present) return std::nullopt;
         return size;
@@ -834,7 +884,7 @@ public:
         uint32_t base_id = 0;
         if (lance_data_file_base_id(
                 handle_.get(), &present, &base_id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!present) return std::nullopt;
         return base_id;
@@ -843,7 +893,7 @@ public:
     /// Clone this snapshot into an independently owned handle.
     DataFile clone() const {
         auto* raw = lance_data_file_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return DataFile(raw);
     }
 
@@ -864,7 +914,7 @@ public:
         : handle_(nullptr) {
         auto* raw =
             lance_data_replacement_group_new(fragment_id, file.c_handle());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         handle_ =
             Handle<LanceDataReplacementGroup, lance_data_replacement_group_close>(
                 raw);
@@ -877,14 +927,14 @@ public:
 
     uint64_t fragment_id() const {
         uint64_t id = lance_data_replacement_group_fragment_id(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return id;
     }
 
     DataFile file() const {
         LanceDataFile* file = nullptr;
         if (lance_data_replacement_group_file(handle_.get(), &file) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return DataFile(file);
     }
@@ -892,7 +942,7 @@ public:
     /// Clone this snapshot into an independently owned handle.
     DataReplacementGroup clone() const {
         auto* raw = lance_data_replacement_group_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return DataReplacementGroup(raw);
     }
 
@@ -936,7 +986,7 @@ public:
             key_ptrs.empty() ? nullptr : key_ptrs.data(),
             value_ptrs.empty() ? nullptr : value_ptrs.data(), keys.size(),
             replace);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         handle_ = Handle<LanceUpdateMap, lance_update_map_close>(raw);
     }
 
@@ -947,13 +997,13 @@ public:
 
     size_t count() const {
         size_t count = lance_update_map_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
     std::string key_at(size_t index) const {
         const char* key = lance_update_map_key_at(handle_.get(), index);
-        if (!key) check_error();
+        if (!key) detail::throw_error();
         return std::string(key);
     }
 
@@ -962,7 +1012,7 @@ public:
         const char* value = nullptr;
         if (lance_update_map_value_at(handle_.get(), index, &present, &value) !=
             0) {
-            check_error();
+            detail::throw_error();
         }
         if (!present) return std::nullopt;
         return std::string(value);
@@ -970,14 +1020,14 @@ public:
 
     bool replace() const {
         bool replace = lance_update_map_replace(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return replace;
     }
 
     /// Clone this snapshot into an independently owned handle.
     UpdateMap clone() const {
         auto* raw = lance_update_map_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return UpdateMap(raw);
     }
 
@@ -1031,7 +1081,7 @@ public:
             pointers.empty() ? nullptr : pointers.data(),
             lengths.empty() ? nullptr : lengths.data(), bitmaps.size(),
             committed_version);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         handle_ = Handle<LanceDataOverlayFile, lance_data_overlay_file_close>(
             raw);
     }
@@ -1044,7 +1094,7 @@ public:
     /// Complete native data-file metadata owned by the overlay.
     DataFile data_file() const {
         LanceDataFile* file = lance_data_overlay_file_data_file(handle_.get());
-        if (!file) check_error();
+        if (!file) detail::throw_error();
         return DataFile(file);
     }
 
@@ -1052,7 +1102,7 @@ public:
         int32_t kind = 0;
         if (lance_data_overlay_file_coverage_kind(
                 handle_.get(), &kind) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return static_cast<OverlayCoverageKind>(kind);
     }
@@ -1062,7 +1112,7 @@ public:
         uint64_t count = 0;
         if (lance_data_overlay_file_bitmap_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1073,12 +1123,9 @@ public:
         size_t len = 0;
         if (lance_data_overlay_file_bitmap_at(
                 handle_.get(), index, &bytes, &len) != 0) {
-            check_error();
+            detail::throw_error();
         }
-        std::vector<uint8_t> out;
-        if (len != 0) out.assign(bytes, bytes + len);
-        if (bytes) lance_free_bytes(bytes);
-        return out;
+        return detail::take_bytes(bytes, len);
     }
 
     /// Native committed-version stamp. Zero is the pre-commit placeholder.
@@ -1086,7 +1133,7 @@ public:
         uint64_t version = 0;
         if (lance_data_overlay_file_committed_version(
                 handle_.get(), &version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return version;
     }
@@ -1094,7 +1141,7 @@ public:
     /// Clone this snapshot into an independently owned handle.
     DataOverlayFile clone() const {
         auto* raw = lance_data_overlay_file_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return DataOverlayFile(raw);
     }
 
@@ -1124,7 +1171,7 @@ public:
         auto* raw = lance_data_overlay_group_new(
             fragment_id, handles.empty() ? nullptr : handles.data(),
             handles.size());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         handle_ = Handle<LanceDataOverlayGroup, lance_data_overlay_group_close>(
             raw);
     }
@@ -1137,7 +1184,7 @@ public:
     uint64_t fragment_id() const {
         uint64_t id = 0;
         if (lance_data_overlay_group_fragment_id(handle_.get(), &id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return id;
     }
@@ -1146,7 +1193,7 @@ public:
         uint64_t count = 0;
         if (lance_data_overlay_group_overlay_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1156,7 +1203,7 @@ public:
         LanceDataOverlayFile* overlay = nullptr;
         if (lance_data_overlay_group_overlay_at(
                 handle_.get(), index, &overlay) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return DataOverlayFile(overlay);
     }
@@ -1164,7 +1211,7 @@ public:
     /// Clone this snapshot into an independently owned handle.
     DataOverlayGroup clone() const {
         auto* raw = lance_data_overlay_group_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return DataOverlayGroup(raw);
     }
 
@@ -1244,7 +1291,7 @@ public:
         }
         auto* raw = lance_updated_fragment_offsets_new(
             views.empty() ? nullptr : views.data(), views.size());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         handle_ =
             Handle<LanceUpdatedFragmentOffsets,
                    lance_updated_fragment_offsets_close>(raw);
@@ -1261,7 +1308,7 @@ public:
         uint64_t count = 0;
         if (lance_updated_fragment_offsets_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return static_cast<size_t>(count);
     }
@@ -1270,7 +1317,7 @@ public:
         uint64_t id = 0;
         if (lance_updated_fragment_offsets_fragment_id_at(
                 handle_.get(), index, &id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return id;
     }
@@ -1279,7 +1326,7 @@ public:
         uint64_t count = 0;
         if (lance_updated_fragment_offsets_offset_count_at(
                 handle_.get(), index, &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return static_cast<size_t>(count);
     }
@@ -1295,7 +1342,7 @@ public:
         out.resize(count);
         if (lance_updated_fragment_offsets_copy_at(
                 handle_.get(), index, out.data(), out.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return out;
     }
@@ -1303,7 +1350,7 @@ public:
     /// Clone into independently owned native storage.
     UpdatedFragmentOffsets clone() const {
         auto* raw = lance_updated_fragment_offsets_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return UpdatedFragmentOffsets(raw);
     }
 
@@ -1336,7 +1383,7 @@ public:
         if (lance_key_existence_filter_from_proto(
                 bytes.empty() ? nullptr : bytes.data(), bytes.size(),
                 &filter) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return KeyExistenceFilter(filter);
     }
@@ -1344,7 +1391,7 @@ public:
     LanceKeyExistenceFilterKind kind() const {
         LanceKeyExistenceFilterKind kind = LANCE_KEY_EXISTENCE_FILTER_EXACT;
         if (lance_key_existence_filter_kind(handle_.get(), &kind) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return kind;
     }
@@ -1353,7 +1400,7 @@ public:
         uint64_t count = 0;
         if (lance_key_existence_filter_field_id_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<int32_t> out;
         out.reserve(static_cast<size_t>(count));
@@ -1361,7 +1408,7 @@ public:
             int32_t field_id = 0;
             if (lance_key_existence_filter_field_id_at(
                     handle_.get(), index, &field_id) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(field_id);
         }
@@ -1374,7 +1421,7 @@ public:
         uint64_t count = 0;
         if (lance_key_existence_filter_exact_count(handle_.get(), &count) !=
             0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<uint64_t> out;
         out.reserve(static_cast<size_t>(count));
@@ -1382,7 +1429,7 @@ public:
             uint64_t key = 0;
             if (lance_key_existence_filter_exact_key_at(
                     handle_.get(), index, &key) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(key);
         }
@@ -1397,11 +1444,11 @@ public:
         if (lance_key_existence_filter_bloom(
                 handle_.get(), &bitmap, &bitmap_len, &out.num_bits,
                 &out.number_of_items, &out.probability) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (bitmap) {
+            detail::OwnedBytes bitmap_guard(bitmap);
             out.bitmap.assign(bitmap, bitmap + bitmap_len);
-            lance_free_bytes(bitmap);
         }
         return out;
     }
@@ -1413,20 +1460,15 @@ public:
         size_t len = 0;
         if (lance_key_existence_filter_to_proto(
                 handle_.get(), &bytes, &len) != 0) {
-            check_error();
+            detail::throw_error();
         }
-        std::vector<uint8_t> out;
-        if (bytes) {
-            out.assign(bytes, bytes + len);
-            lance_free_bytes(bytes);
-        }
-        return out;
+        return detail::take_bytes(bytes, len);
     }
 
     /// Clone into independently owned native storage.
     KeyExistenceFilter clone() const {
         auto* raw = lance_key_existence_filter_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return KeyExistenceFilter(raw);
     }
 
@@ -1465,7 +1507,7 @@ public:
     /// Clone into independently owned native storage.
     RewriteGroup clone() const {
         auto* raw = lance_rewrite_group_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return RewriteGroup(raw);
     }
 
@@ -1497,23 +1539,20 @@ public:
     std::array<uint8_t, 16> old_id() const {
         std::array<uint8_t, 16> out = {};
         if (lance_rewritten_index_old_id(handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     std::array<uint8_t, 16> new_id() const {
         std::array<uint8_t, 16> out = {};
         if (lance_rewritten_index_new_id(handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     std::string details_type_url() const {
         const char* raw = lance_rewritten_index_details_type_url(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     std::vector<uint8_t> details_value() const {
@@ -1521,27 +1560,22 @@ public:
         size_t len = 0;
         if (lance_rewritten_index_details_value(
                 handle_.get(), &bytes, &len) != 0) {
-            check_error();
+            detail::throw_error();
         }
-        std::vector<uint8_t> out;
-        if (bytes) {
-            out.assign(bytes, bytes + len);
-            lance_free_bytes(bytes);
-        }
-        return out;
+        return detail::take_bytes(bytes, len);
     }
 
     uint32_t version() const {
         uint32_t version = 0;
         if (lance_rewritten_index_version(handle_.get(), &version) != 0)
-            check_error();
+            detail::throw_error();
         return version;
     }
 
     bool has_files() const {
         bool present = false;
         if (lance_rewritten_index_has_files(handle_.get(), &present) != 0)
-            check_error();
+            detail::throw_error();
         return present;
     }
 
@@ -1550,19 +1584,19 @@ public:
     std::vector<IndexFile> files() const {
         uint64_t count = 0;
         if (lance_rewritten_index_file_count(handle_.get(), &count) != 0)
-            check_error();
+            detail::throw_error();
         std::vector<IndexFile> out;
         out.reserve(static_cast<size_t>(count));
         for (size_t index = 0; index < count; ++index) {
             const char* path =
                 lance_rewritten_index_file_path_at(handle_.get(), index);
-            if (!path) check_error();
+            if (!path) detail::throw_error();
+            detail::OwnedString path_guard(path);
             IndexFile file;
             file.path.assign(path);
-            lance_free_string(path);
             if (lance_rewritten_index_file_size_at(
                     handle_.get(), index, &file.size_bytes) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(std::move(file));
         }
@@ -1572,7 +1606,7 @@ public:
     /// Clone into independently owned native storage.
     RewrittenIndex clone() const {
         auto* raw = lance_rewritten_index_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return RewrittenIndex(raw);
     }
 
@@ -1594,7 +1628,7 @@ public:
 
     OperationKind kind() const {
         LanceOperationKind raw{};
-        if (lance_operation_kind(handle_.get(), &raw) != 0) check_error();
+        if (lance_operation_kind(handle_.get(), &raw) != 0) detail::throw_error();
         return static_cast<OperationKind>(raw);
     }
 
@@ -1603,7 +1637,7 @@ public:
     uint64_t fragment_count() const {
         uint64_t count = 0;
         if (lance_operation_fragment_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1614,7 +1648,7 @@ public:
         bool value = false;
         if (lance_operation_preserves_nullability(
                 handle_.get(), &value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return value;
     }
@@ -1623,7 +1657,7 @@ public:
     uint64_t append_fragment_count() const {
         uint64_t count = 0;
         if (lance_operation_append_fragment_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1635,7 +1669,7 @@ public:
     uint64_t restore_version() const {
         uint64_t version = 0;
         if (lance_operation_restore_version(handle_.get(), &version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return version;
     }
@@ -1644,7 +1678,7 @@ public:
     uint32_t reserve_fragments_count() const {
         uint32_t count = 0;
         if (lance_operation_reserve_fragments_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1653,7 +1687,7 @@ public:
     uint64_t update_bases_count() const {
         uint64_t count = 0;
         if (lance_operation_update_bases_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1663,7 +1697,7 @@ public:
     LanceBasePathView update_bases_at(size_t index) const {
         LanceBasePathView base{};
         if (lance_operation_update_bases_at(handle_.get(), index, &base) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return base;
     }
@@ -1676,7 +1710,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_overwrite_fragment_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1693,7 +1727,7 @@ public:
         bool present = false;
         if (lance_operation_overwrite_has_config_upsert_values(
                 handle_.get(), &present) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return present;
     }
@@ -1703,7 +1737,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_overwrite_config_upsert_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1712,7 +1746,7 @@ public:
     std::string config_upsert_key_at(size_t index) const {
         const char* key = lance_operation_overwrite_config_upsert_key_at(
             handle_.get(), index);
-        if (!key) check_error();
+        if (!key) detail::throw_error();
         return std::string(key);
     }
 
@@ -1720,7 +1754,7 @@ public:
     std::string config_upsert_value_at(size_t index) const {
         const char* value = lance_operation_overwrite_config_upsert_value_at(
             handle_.get(), index);
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return std::string(value);
     }
 
@@ -1730,7 +1764,7 @@ public:
         bool present = false;
         if (lance_operation_overwrite_has_initial_bases(
                 handle_.get(), &present) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return present;
     }
@@ -1740,7 +1774,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_overwrite_initial_base_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1751,7 +1785,7 @@ public:
         LanceBasePathView base{};
         if (lance_operation_overwrite_initial_base_at(
                 handle_.get(), index, &base) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return base;
     }
@@ -1778,7 +1812,7 @@ public:
     uint64_t merge_fragment_count() const {
         uint64_t count = 0;
         if (lance_operation_merge_fragment_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -1794,7 +1828,7 @@ public:
         bool value = false;
         if (lance_operation_merge_preserves_nullability(
                 handle_.get(), &value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return value;
     }
@@ -1806,7 +1840,7 @@ public:
     bool clone_is_shallow() const {
         bool value = false;
         if (lance_operation_clone_is_shallow(handle_.get(), &value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return value;
     }
@@ -1817,7 +1851,7 @@ public:
         const char* value = nullptr;
         if (lance_operation_clone_ref_name(
                 handle_.get(), &present, &value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!present) return std::nullopt;
         return std::string(value);
@@ -1827,7 +1861,7 @@ public:
     uint64_t clone_ref_version() const {
         uint64_t version = 0;
         if (lance_operation_clone_ref_version(handle_.get(), &version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return version;
     }
@@ -1835,7 +1869,7 @@ public:
     /// Borrowed native reference path of a Clone operation.
     std::string clone_ref_path() const {
         const char* path = lance_operation_clone_ref_path(handle_.get());
-        if (!path) check_error();
+        if (!path) detail::throw_error();
         return std::string(path);
     }
 
@@ -1845,7 +1879,7 @@ public:
         const char* value = nullptr;
         if (lance_operation_clone_branch_name(
                 handle_.get(), &present, &value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!present) return std::nullopt;
         return std::string(value);
@@ -1856,7 +1890,7 @@ public:
         LanceUpdateMap* map = nullptr;
         if (lance_operation_update_config_config_updates(
                 handle_.get(), &map) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!map) return std::nullopt;
         return UpdateMap(map);
@@ -1867,7 +1901,7 @@ public:
         LanceUpdateMap* map = nullptr;
         if (lance_operation_update_config_table_metadata_updates(
                 handle_.get(), &map) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!map) return std::nullopt;
         return UpdateMap(map);
@@ -1878,7 +1912,7 @@ public:
         LanceUpdateMap* map = nullptr;
         if (lance_operation_update_config_schema_metadata_updates(
                 handle_.get(), &map) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!map) return std::nullopt;
         return UpdateMap(map);
@@ -1889,7 +1923,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_config_field_metadata_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::map<int32_t, UpdateMap> out;
         for (uint64_t i = 0; i < count; ++i) {
@@ -1898,7 +1932,7 @@ public:
             if (lance_operation_update_config_field_metadata_at(
                     handle_.get(), static_cast<size_t>(i), &field_id, &map) !=
                 0) {
-                check_error();
+                detail::throw_error();
             }
             if (!map) {
                 throw Error(LANCE_ERR_INTERNAL,
@@ -1953,14 +1987,14 @@ public:
     /// Construct an owned native Restore operation.
     static Operation make_restore(uint64_t version) {
         auto* operation = lance_operation_restore_new(version);
-        if (!operation) check_error();
+        if (!operation) detail::throw_error();
         return Operation(operation);
     }
 
     /// Construct an owned native ReserveFragments operation.
     static Operation make_reserve_fragments(uint32_t num_fragments) {
         auto* operation = lance_operation_reserve_fragments_new(num_fragments);
-        if (!operation) check_error();
+        if (!operation) detail::throw_error();
         return Operation(operation);
     }
 
@@ -2014,7 +2048,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_data_replacement_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2024,7 +2058,7 @@ public:
         LanceDataReplacementGroup* group = nullptr;
         if (lance_operation_data_replacement_at(
                 handle_.get(), index, &group) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return DataReplacementGroup(group);
     }
@@ -2034,7 +2068,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_data_overlay_group_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2044,7 +2078,7 @@ public:
         LanceDataOverlayGroup* group = nullptr;
         if (lance_operation_data_overlay_group_at(
                 handle_.get(), index, &group) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return DataOverlayGroup(group);
     }
@@ -2054,7 +2088,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_delete_updated_fragment_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2063,10 +2097,7 @@ public:
     std::string delete_updated_fragment_metadata_json(size_t index) const {
         const char* raw = lance_operation_delete_updated_fragment_metadata_json_at(
             handle_.get(), index);
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     /// Number of fully deleted fragment IDs in a Delete operation.
@@ -2074,7 +2105,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_delete_deleted_fragment_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2084,7 +2115,7 @@ public:
         uint64_t id = 0;
         if (lance_operation_delete_deleted_fragment_id_at(
                 handle_.get(), index, &id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return id;
     }
@@ -2092,10 +2123,7 @@ public:
     /// Delete predicate captured by the native operation.
     std::string delete_predicate() const {
         const char* raw = lance_operation_delete_predicate(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     /// Construct an owned native Update operation. Fragment handles are
@@ -2135,7 +2163,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_removed_fragment_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2145,7 +2173,7 @@ public:
         uint64_t id = 0;
         if (lance_operation_update_removed_fragment_id_at(
                 handle_.get(), index, &id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return id;
     }
@@ -2155,7 +2183,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_updated_fragment_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2168,7 +2196,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_new_fragment_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2181,7 +2209,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_fields_modified_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2191,7 +2219,7 @@ public:
         uint32_t field_id = 0;
         if (lance_operation_update_fields_modified_at(
                 handle_.get(), index, &field_id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return field_id;
     }
@@ -2201,7 +2229,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_compacted_sstable_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2214,7 +2242,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_fields_for_preserving_frag_bitmap_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2224,7 +2252,7 @@ public:
         uint32_t field_id = 0;
         if (lance_operation_update_fields_for_preserving_frag_bitmap_at(
                 handle_.get(), index, &field_id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return field_id;
     }
@@ -2235,7 +2263,7 @@ public:
         int32_t mode = 0;
         if (lance_operation_update_mode(
                 handle_.get(), &present, &mode) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!present) return std::nullopt;
         return static_cast<UpdateMode>(mode);
@@ -2257,7 +2285,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_rewrite_group_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2270,7 +2298,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_rewrite_rewritten_index_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2289,7 +2317,7 @@ public:
         uint64_t count = 0;
         if (lance_operation_update_mem_wal_state_compacted_sstable_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -2334,26 +2362,23 @@ public:
     uint64_t read_version() const {
         uint64_t version = 0;
         if (lance_transaction_read_version(handle_.get(), &version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return version;
     }
 
     std::string uuid() const {
         const char* uuid = lance_transaction_uuid(handle_.get());
-        if (!uuid) check_error();
-        std::string out(uuid);
-        lance_free_string(uuid);
-        return out;
+        return detail::take_string(uuid);
     }
 
     std::optional<std::string> tag() const {
         const char* tag = nullptr;
         int32_t present = lance_transaction_tag(handle_.get(), &tag);
-        if (present < 0) check_error();
+        if (present < 0) detail::throw_error();
         if (present == 0) {
             if (tag) {
-                lance_free_string(tag);
+                detail::OwnedString tag_guard(tag);
                 throw Error(LANCE_ERR_INTERNAL,
                             "lance_transaction_tag reported absent with a non-null pointer");
             }
@@ -2363,15 +2388,13 @@ public:
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_transaction_tag reported present with a null pointer");
         }
-        std::string out(tag);
-        lance_free_string(tag);
-        return out;
+        return detail::take_string(tag);
     }
 
     bool has_properties() const {
         bool present = false;
         if (lance_transaction_has_properties(handle_.get(), &present) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return present;
     }
@@ -2379,23 +2402,20 @@ public:
     std::map<std::string, std::string> properties() const {
         uint64_t count = 0;
         if (lance_transaction_property_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
 
         std::map<std::string, std::string> out;
         for (uint64_t i = 0; i < count; ++i) {
             const char* key = lance_transaction_property_key_at(
                 handle_.get(), static_cast<size_t>(i));
-            if (!key) check_error();
+            if (!key) detail::throw_error();
+            detail::OwnedString key_guard(key);
             const char* value = lance_transaction_property_value_at(
                 handle_.get(), static_cast<size_t>(i));
-            if (!value) {
-                lance_free_string(key);
-                check_error();
-            }
+            if (!value) detail::throw_error();
+            detail::OwnedString value_guard(value);
             out.emplace(key, value);
-            lance_free_string(key);
-            lance_free_string(value);
         }
         return out;
     }
@@ -2403,7 +2423,7 @@ public:
     Operation operation() const {
         LanceOperation* raw = nullptr;
         if (lance_transaction_operation(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!raw) {
             throw Error(LANCE_ERR_INTERNAL,
@@ -2440,7 +2460,7 @@ public:
 
         auto* transaction = lance_transaction_new(
             read_version, operation.c_handle(), &raw);
-        if (!transaction) check_error();
+        if (!transaction) detail::throw_error();
         return Transaction(transaction);
     }
 
@@ -2449,22 +2469,19 @@ public:
         uint8_t* bytes = nullptr;
         size_t len = 0;
         if (lance_transaction_to_proto(handle_.get(), &bytes, &len) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (len > 0 && !bytes) {
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_transaction_to_proto returned a null buffer");
         }
-        std::vector<uint8_t> out;
-        if (len > 0) out.assign(bytes, bytes + len);
-        lance_free_bytes(bytes);
-        return out;
+        return detail::take_bytes(bytes, len);
     }
 
     /// Parse one complete native protobuf Transaction.
     static Transaction from_proto(const std::vector<uint8_t>& bytes) {
         auto* raw = lance_transaction_from_proto(bytes.data(), bytes.size());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Transaction(raw);
     }
 
@@ -3071,7 +3088,7 @@ inline CommitLock::CommitLock(Acquire acquire)
     auto* raw = lance_commit_lock_new(&callbacks);
     // On failure the library never takes context ownership, so `state_`
     // remains local and is destroyed here.
-    if (raw == nullptr) check_error();
+    if (raw == nullptr) detail::throw_error();
     handle_ = Handle<LanceCommitLock, lance_commit_lock_close>(raw);
     // On success the native context owns the state and releases it exactly
     // once when the last owner drops.
@@ -3093,7 +3110,7 @@ class StorageOptionsProvider {
 
     explicit StorageOptionsProvider(LanceStorageOptionsProvider* provider)
         : handle_(provider) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
 public:
@@ -3115,10 +3132,8 @@ public:
 
     std::string provider_id() const {
         char* value = lance_storage_options_provider_id(handle_.get());
-        if (value == nullptr) check_error();
-        std::string out(value);
-        lance_free_string(value);
-        return out;
+        if (value == nullptr) detail::throw_error();
+        return detail::take_string(value);
     }
 };
 
@@ -3235,7 +3250,7 @@ inline StorageOptionsProvider::StorageOptionsProvider(
     Fetch force_fetch)
     : handle_(storage_options_detail::create_provider(
           provider_id, std::move(fetch), std::move(force_fetch))) {
-    if (!handle_) check_error();
+    if (!handle_) detail::throw_error();
 }
 
 class StorageOptionsAccessor {
@@ -3265,7 +3280,7 @@ public:
         }
         auto* raw = lance_storage_options_accessor_new(
             input_ptr, provider ? provider->c_handle() : nullptr);
-        if (raw == nullptr) check_error();
+        if (raw == nullptr) detail::throw_error();
         handle_ = Handle<LanceStorageOptionsAccessor,
                          lance_storage_options_accessor_close>(raw);
     }
@@ -3273,25 +3288,25 @@ public:
     /// Resolve with native cache and expiration behavior.
     std::optional<StorageOptions> snapshot() const {
         auto* raw = lance_storage_options_accessor_snapshot(handle_.get());
-        if (raw == nullptr) check_error();
+        if (raw == nullptr) detail::throw_error();
         Handle<LanceStorageOptionsSnapshot,
                lance_storage_options_snapshot_close>
             snapshot(raw);
         int32_t has_options =
             lance_storage_options_snapshot_has_options(snapshot.get());
-        if (has_options < 0) check_error();
+        if (has_options < 0) detail::throw_error();
         if (has_options == 0) return std::nullopt;
         StorageOptions options;
         uint64_t count =
             lance_storage_options_snapshot_count(snapshot.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         for (uint64_t index = 0; index < count; index++) {
             const char* key = lance_storage_options_snapshot_key_at(
                 snapshot.get(), static_cast<std::size_t>(index));
-            if (!key) check_error();
+            if (!key) detail::throw_error();
             const char* value = lance_storage_options_snapshot_value_at(
                 snapshot.get(), static_cast<std::size_t>(index));
-            if (!value) check_error();
+            if (!value) detail::throw_error();
             options.emplace(key, value);
         }
         return options;
@@ -3424,7 +3439,7 @@ public:
         const SessionCacheSpec& index_cache,
         const SessionCacheSpec& metadata_cache)
         : handle_(create(index_cache, metadata_cache)) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     Session(uint64_t index_cache_size_bytes, uint64_t metadata_cache_size_bytes)
@@ -3435,7 +3450,7 @@ public:
     LanceSessionCacheStats cache_stats() const {
         LanceSessionCacheStats stats{};
         if (lance_session_get_cache_stats(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 
@@ -3443,7 +3458,7 @@ public:
     uint64_t size_bytes() const {
         uint64_t size = 0;
         if (lance_session_get_size_bytes(handle_.get(), &size) != 0)
-            check_error();
+            detail::throw_error();
         return size;
     }
 
@@ -3451,7 +3466,7 @@ public:
     uint64_t approx_num_items() const {
         uint64_t count = 0;
         if (lance_session_get_approx_num_items(handle_.get(), &count) != 0)
-            check_error();
+            detail::throw_error();
         return count;
     }
 
@@ -3786,7 +3801,7 @@ inline NativeWriteOptions::NativeWriteOptions(
     auto* raw = lance_native_write_options_new(&c_spec);
     if (raw == nullptr) {
         // Ownership of the progress context transfers only on success.
-        check_error();
+        detail::throw_error();
     }
     handle_ = Handle<LanceNativeWriteOptions, lance_native_write_options_close>(
         raw);
@@ -3860,7 +3875,7 @@ public:
 
         auto* query = lance_fts_query_match_new(
             terms.c_str(), column ? column->c_str() : nullptr, &c_options);
-        if (!query) check_error();
+        if (!query) detail::throw_error();
         return FtsQuery(query);
     }
 
@@ -3878,7 +3893,7 @@ public:
 
         auto* query = lance_fts_query_phrase_new(
             terms.c_str(), column ? column->c_str() : nullptr, &c_options);
-        if (!query) check_error();
+        if (!query) detail::throw_error();
         return FtsQuery(query);
     }
 
@@ -3897,7 +3912,7 @@ public:
 
         auto* result = lance_fts_query_boolean_new(
             occurs.data(), queries.data(), clauses.size());
-        if (!result) check_error();
+        if (!result) detail::throw_error();
         return FtsQuery(result);
     }
 
@@ -3913,7 +3928,7 @@ public:
 
         auto* query = lance_fts_query_boost_new(
             positive.c_handle(), negative.c_handle(), &c_options);
-        if (!query) check_error();
+        if (!query) detail::throw_error();
         return FtsQuery(query);
     }
 
@@ -3936,7 +3951,7 @@ public:
 
         auto* query = lance_fts_query_multi_match_new(
             terms.c_str(), column_ptrs.data(), column_ptrs.size(), &c_options);
-        if (!query) check_error();
+        if (!query) detail::throw_error();
         return FtsQuery(query);
     }
 
@@ -3959,7 +3974,7 @@ public:
 
         auto* query = lance_fts_query_combined_fields_new(
             terms.c_str(), column_ptrs.data(), column_ptrs.size(), &c_options);
-        if (!query) check_error();
+        if (!query) detail::throw_error();
         return FtsQuery(query);
     }
 
@@ -3998,14 +4013,14 @@ public:
         auto* tokens = lance_fts_tokenize(
             text.data(), text.size(),
             params_json ? params_json->c_str() : nullptr);
-        if (!tokens) check_error();
+        if (!tokens) detail::throw_error();
         return FtsTokenList(tokens);
     }
 
     /// Number of tokens. Throws on a NULL handle.
     size_t size() const {
         uint64_t count = lance_fts_token_list_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return static_cast<size_t>(count);
     }
 
@@ -4015,7 +4030,7 @@ public:
     FtsToken at(size_t index) const {
         LanceFtsTokenView view{};
         if (lance_fts_token_list_get(handle_.get(), index, &view) != 0)
-            check_error();
+            detail::throw_error();
         if (view.text == nullptr && view.text_len != 0)
             throw std::runtime_error(
                 "native token view has NULL text with a nonzero length");
@@ -4039,7 +4054,7 @@ public:
 /// Native process-wide object-store IOPS counter, with no reset semantics.
 inline uint64_t process_iops_counter() {
     uint64_t value = lance_process_iops_counter();
-    if (lance_last_error_code() != LANCE_OK) check_error();
+    if (lance_last_error_code() != LANCE_OK) detail::throw_error();
     return value;
 }
 
@@ -4047,7 +4062,7 @@ inline uint64_t process_iops_counter() {
 /// semantics.
 inline uint64_t process_bytes_read_counter() {
     uint64_t value = lance_process_bytes_read_counter();
-    if (lance_last_error_code() != LANCE_OK) check_error();
+    if (lance_last_error_code() != LANCE_OK) detail::throw_error();
     return value;
 }
 
@@ -4060,9 +4075,9 @@ struct ProcessIoCounters {
 inline ProcessIoCounters process_io_counters() {
     ProcessIoCounters counters;
     counters.iops = lance_process_iops_counter();
-    if (lance_last_error_code() != LANCE_OK) check_error();
+    if (lance_last_error_code() != LANCE_OK) detail::throw_error();
     counters.bytes_read = lance_process_bytes_read_counter();
-    if (lance_last_error_code() != LANCE_OK) check_error();
+    if (lance_last_error_code() != LANCE_OK) detail::throw_error();
     return counters;
 }
 
@@ -4070,10 +4085,7 @@ inline ProcessIoCounters process_io_counters() {
 /// `lance_simd_info_json()`: `tier`, `target_arch`, and `host_features`.
 inline std::string simd_info_json() {
     const char* raw = lance_simd_info_json();
-    if (!raw) check_error();
-    std::unique_ptr<const char, void (*)(const char*)> guard(
-        raw, lance_free_string);
-    return std::string(raw);
+    return detail::take_string(raw);
 }
 
 // ─── Blob file ───────────────────────────────────────────────────────────────
@@ -4102,7 +4114,7 @@ inline void blob_field(
     const std::string& name,
     bool nullable,
     ArrowSchema* out) {
-    if (lance_blob_field(name.c_str(), nullable, out) != 0) check_error();
+    if (lance_blob_field(name.c_str(), nullable, out) != 0) detail::throw_error();
 }
 
 /// Export the native blob v2 field with explicit storage thresholds.
@@ -4126,7 +4138,7 @@ inline void blob_field_with_options(
             static_cast<uint64_t>(*options.dedicated_size_threshold);
     }
     if (lance_blob_field_with_options(name.c_str(), nullable, &raw, out) != 0)
-        check_error();
+        detail::throw_error();
 }
 
 /// RAII owner of a native writer-prepared blob descriptor array builder.
@@ -4143,13 +4155,13 @@ class BlobDescriptorArrayBuilder {
 public:
     explicit BlobDescriptorArrayBuilder(const std::string& column)
         : handle_(lance_blob_descriptor_array_builder_new(column.c_str())) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     void append_inline(const uint8_t* data, size_t len) {
         if (lance_blob_descriptor_array_builder_append_inline(
                 handle_.get(), data, len) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -4159,13 +4171,13 @@ public:
 
     void append_null() {
         if (lance_blob_descriptor_array_builder_append_null(handle_.get()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     void append_packed(uint32_t blob_id, uint64_t offset, uint64_t length) {
         if (lance_blob_descriptor_array_builder_append_packed(
                 handle_.get(), blob_id, offset, length) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -4182,14 +4194,14 @@ public:
         }
         if (lance_blob_descriptor_array_builder_extend_packed(
                 handle_.get(), blob_id, raw.data(), raw.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
     void append_dedicated(uint32_t blob_id, uint64_t length) {
         if (lance_blob_descriptor_array_builder_append_dedicated(
                 handle_.get(), blob_id, length) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -4201,7 +4213,7 @@ public:
         if (lance_blob_descriptor_array_builder_append_managed(
                 handle_.get(), uri.c_str(), offset, length, base_id.has_value(),
                 base_id.value_or(0)) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -4211,7 +4223,7 @@ public:
                          uint64_t length) {
         if (lance_blob_descriptor_array_builder_append_external(
                 handle_.get(), base_id, uri.c_str(), offset, length) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -4220,14 +4232,14 @@ public:
         if (lance_blob_descriptor_array_builder_push_external(
                 handle_.get(), uri.c_str(), range.has_value(),
                 range ? range->offset : 0, range ? range->length : 0) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
     /// Export the prepared field. `out` is caller-owned and must be released.
     void field(ArrowSchema* out) const {
         if (lance_blob_descriptor_array_builder_field(handle_.get(), out) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Consume the native builder and export its prepared array and field.
@@ -4235,7 +4247,7 @@ public:
     void finish(ArrowArray* out_array, ArrowSchema* out_schema) {
         if (lance_blob_descriptor_array_builder_finish(
                 handle_.get(), out_array, out_schema) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 };
@@ -4259,23 +4271,20 @@ public:
     /// Native blob ID. Throws when the writer is NULL or finished.
     uint32_t blob_id() const {
         uint32_t value = lance_packed_blob_writer_blob_id(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     /// Native sidecar path. Throws when the writer is NULL or finished.
     std::string path() const {
         const char* raw = lance_packed_blob_writer_path(handle_.get());
-        if (!raw) check_error();
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            raw, lance_free_string);
-        return std::string(raw);
+        return detail::take_string(raw);
     }
 
     /// Append one payload. A null pointer with zero length is valid.
     void write_blob(const uint8_t* data, size_t len) {
         if (lance_packed_blob_writer_write_blob(handle_.get(), data, len) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     void write_blob(const std::vector<uint8_t>& data) {
@@ -4286,7 +4295,7 @@ public:
     void write_blobs(ArrowArray* payloads, const ArrowSchema* schema) {
         if (lance_packed_blob_writer_write_blobs(
                 handle_.get(), payloads, schema) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -4297,7 +4306,7 @@ public:
         ArrowSchema* out_schema) {
         if (lance_packed_blob_writer_finish_array(
                 handle_.get(), field_name.c_str(), out_array, out_schema) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 };
@@ -4321,23 +4330,20 @@ public:
     /// Native blob ID. Throws when the writer is NULL or finished.
     uint32_t blob_id() const {
         uint32_t value = lance_dedicated_blob_writer_blob_id(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     /// Native sidecar path. Throws when the writer is NULL or finished.
     std::string path() const {
         const char* raw = lance_dedicated_blob_writer_path(handle_.get());
-        if (!raw) check_error();
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            raw, lance_free_string);
-        return std::string(raw);
+        return detail::take_string(raw);
     }
 
     /// Append bytes. Repeated calls concatenate.
     void write(const uint8_t* data, size_t len) {
         if (lance_dedicated_blob_writer_write(handle_.get(), data, len) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     void write(const std::vector<uint8_t>& data) {
@@ -4351,7 +4357,7 @@ public:
         ArrowSchema* out_schema) {
         if (lance_dedicated_blob_writer_finish_array(
                 handle_.get(), field_name.c_str(), out_array, out_schema) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 };
@@ -4396,7 +4402,7 @@ public:
     /// Size of the blob in bytes. Independent of the cursor.
     uint64_t size() const {
         uint64_t n = lance_blob_file_size(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return n;
     }
 
@@ -4407,7 +4413,7 @@ public:
         uint64_t remaining = cursor >= blob_size ? 0 : blob_size - cursor;
         std::vector<uint8_t> out(static_cast<size_t>(remaining));
         if (lance_blob_file_read(handle_.get(), out.data(), out.size()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
@@ -4418,7 +4424,7 @@ public:
         size_t bytes_read = 0;
         if (lance_blob_file_read_up_to(
                 handle_.get(), out.data(), len, &bytes_read) != 0)
-            check_error();
+            detail::throw_error();
         out.resize(bytes_read);
         return out;
     }
@@ -4430,7 +4436,7 @@ public:
         size_t bytes_read = 0;
         if (lance_blob_file_read_up_to(
                 handle_.get(), dst, len, &bytes_read) != 0)
-            check_error();
+            detail::throw_error();
         return bytes_read;
     }
 
@@ -4440,7 +4446,7 @@ public:
         std::vector<uint8_t> out(len);
         if (lance_blob_file_read_range(
                 handle_.get(), offset, out.data(), len) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
@@ -4470,7 +4476,7 @@ public:
         if (lance_blob_file_read_ranges(
                 handle_.get(), c_ranges.data(), c_ranges.size(),
                 destinations.data(), destination_lens.data()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return out;
     }
@@ -4478,33 +4484,33 @@ public:
     /// Set the native sequential read-ahead size. Zero disables read-ahead.
     void set_buffer_size(size_t buffer_size) {
         if (lance_blob_file_set_buffer_size(handle_.get(), buffer_size) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Move the cursor. Seeking past the end is allowed; reads then return
     /// no bytes.
     void seek(uint64_t pos) {
-        if (lance_blob_file_seek(handle_.get(), pos) != 0) check_error();
+        if (lance_blob_file_seek(handle_.get(), pos) != 0) detail::throw_error();
     }
 
     /// Current cursor position, in bytes from the start of the blob.
     uint64_t tell() const {
         uint64_t pos = 0;
-        if (lance_blob_file_tell(handle_.get(), &pos) != 0) check_error();
+        if (lance_blob_file_tell(handle_.get(), &pos) != 0) detail::throw_error();
         return pos;
     }
 
     /// Mark the native blob file closed. Idempotent. The allocation remains
     /// owned until destruction.
     void close() {
-        if (lance_blob_file_mark_closed(handle_.get()) != 0) check_error();
+        if (lance_blob_file_mark_closed(handle_.get()) != 0) detail::throw_error();
     }
 
     /// Native closed state.
     bool closed() const {
         bool value = false;
         if (lance_blob_file_is_closed(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 };
@@ -4543,21 +4549,21 @@ public:
     /// Native fragment ID.
     uint64_t id() const {
         uint64_t value = lance_fragment_id(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     /// Number of Native base data files; excludes overlays and the deletion file.
     uint64_t data_file_count() const {
         uint64_t value = lance_fragment_data_file_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     /// Whether this handle retains a dataset-bound native fragment.
     bool is_bound() const {
         bool value = false;
-        if (lance_fragment_is_bound(handle_.get(), &value) != 0) check_error();
+        if (lance_fragment_is_bound(handle_.get(), &value) != 0) detail::throw_error();
         return value;
     }
 
@@ -4565,7 +4571,7 @@ public:
     DataFile data_file_at(size_t index) const {
         LanceDataFile* raw = nullptr;
         if (lance_fragment_data_file_at(handle_.get(), index, &raw) != 0)
-            check_error();
+            detail::throw_error();
         if (!raw) {
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_fragment_data_file_at returned success with "
@@ -4580,7 +4586,7 @@ public:
         LanceDataFile* raw = nullptr;
         if (lance_fragment_data_file_for_field(
                 handle_.get(), field_id, &raw) != 0)
-            check_error();
+            detail::throw_error();
         if (!raw) return std::nullopt;
         return DataFile(raw);
     }
@@ -4590,16 +4596,13 @@ public:
     /// the optional physical_rows value.
     std::string metadata_json() const {
         const char* raw = lance_fragment_metadata_json(handle_.get());
-        if (!raw) check_error();
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            raw, lance_free_string);
-        return std::string(raw);
+        return detail::take_string(raw);
     }
 
     /// Export the logical dataset schema through Arrow C Data Interface.
     /// `out` is caller-owned; release it exactly once.
     void schema(ArrowSchema* out) const {
-        if (lance_fragment_schema(handle_.get(), out) != 0) check_error();
+        if (lance_fragment_schema(handle_.get(), out) != 0) detail::throw_error();
     }
 
     /// Clone the fragment's native schema from its staged dataset snapshot.
@@ -4609,7 +4612,7 @@ public:
     uint64_t physical_rows() const {
         uint64_t value = 0;
         if (lance_fragment_physical_rows(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -4617,7 +4620,7 @@ public:
     uint64_t deleted_rows() const {
         uint64_t value = 0;
         if (lance_fragment_deleted_rows(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -4625,7 +4628,7 @@ public:
     uint64_t logical_rows() const {
         uint64_t value = 0;
         if (lance_fragment_logical_rows(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -4633,7 +4636,7 @@ public:
     uint64_t read_version() const {
         uint64_t value = 0;
         if (lance_fragment_read_version(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -4659,7 +4662,7 @@ public:
         uint64_t value = 0;
         if (lance_fragment_count_rows(
                 handle_.get(), filter ? filter->c_str() : nullptr, &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -4804,7 +4807,7 @@ inline Fragment Fragment::from_data_files(
         handles.empty() ? nullptr : handles.data(),
         handles.size(),
         physical_rows ? &rows : nullptr);
-    if (!fragment) check_error();
+    if (!fragment) detail::throw_error();
     return Fragment(fragment);
 }
 
@@ -4813,7 +4816,7 @@ inline std::optional<Fragment> Fragment::delete_if(
     LanceFragment* raw = nullptr;
     if (lance_fragment_delete(
             handle_.get(), predicate.c_str(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!raw) return std::nullopt;
     return Fragment(raw);
@@ -4828,7 +4831,7 @@ class FragmentUpdateColumnsResult {
 public:
     explicit FragmentUpdateColumnsResult(LanceFragmentUpdateColumnsResult* result)
         : handle_(result) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     FragmentUpdateColumnsResult(FragmentUpdateColumnsResult&&) noexcept = default;
@@ -4843,7 +4846,7 @@ public:
         LanceFragment* raw = nullptr;
         if (lance_fragment_update_columns_result_fragment(
                 handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!raw) {
             throw Error(LANCE_ERR_INTERNAL,
@@ -4857,7 +4860,7 @@ public:
         uint64_t count = 0;
         if (lance_fragment_update_columns_result_fields_modified_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<uint32_t> out;
         out.reserve(static_cast<std::size_t>(count));
@@ -4866,7 +4869,7 @@ public:
             if (lance_fragment_update_columns_result_fields_modified_at(
                     handle_.get(), static_cast<std::size_t>(i),
                     &field_id) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(field_id);
         }
@@ -4878,7 +4881,7 @@ public:
         uint64_t count = 0;
         if (lance_fragment_update_columns_result_matched_offset_count(
                 handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<uint32_t> out;
         if (count > out.max_size()) {
@@ -4887,7 +4890,7 @@ public:
         out.resize(static_cast<std::size_t>(count));
         if (lance_fragment_update_columns_result_matched_offsets(
                 handle_.get(), out.data(), out.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return out;
     }
@@ -4899,7 +4902,7 @@ public:
         std::size_t len = 0;
         if (lance_fragment_update_columns_result_matched_offsets_serialize(
                 handle_.get(), &bytes, &len) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::unique_ptr<uint8_t, void (*)(uint8_t*)> guard(
             bytes, lance_free_bytes);
@@ -4923,7 +4926,7 @@ class LanceSchema {
 
 public:
     explicit LanceSchema(::LanceSchema* schema) : handle_(schema) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     LanceSchema(LanceSchema&&) noexcept = default;
@@ -4934,7 +4937,7 @@ public:
     /// Independently owned native clone.
     LanceSchema clone() const {
         ::LanceSchema* raw = lance_schema_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return LanceSchema(raw);
     }
 
@@ -4959,7 +4962,7 @@ public:
         if (lance_schema_project(
                 schema.c_handle(), paths.empty() ? nullptr : paths.data(),
                 paths.size(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return LanceSchema(raw);
     }
@@ -4970,7 +4973,7 @@ public:
         int32_t id = 0;
         if (lance_schema_field_id(
                 handle_.get(), column.c_str(), &id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return id;
     }
@@ -4984,7 +4987,7 @@ public:
     /// Export an Arrow interoperability view. `out` is caller-owned and must
     /// be released exactly once. Arrow cannot represent every native detail.
     void to_arrow(ArrowSchema* out) const {
-        if (lance_schema_to_arrow(handle_.get(), out) != 0) check_error();
+        if (lance_schema_to_arrow(handle_.get(), out) != 0) detail::throw_error();
     }
 
     const ::LanceSchema* c_handle() const { return handle_.get(); }
@@ -5037,7 +5040,7 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_sql(
     if (lance_fragment_add_columns_sql(
             handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
             batch_size_ptr, &out_fragment, &out_schema) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_fragment_schema_pair(
         out_fragment, out_schema);
@@ -5049,7 +5052,7 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_nulls(
     ::LanceSchema* out_schema = nullptr;
     if (lance_fragment_add_columns_nulls(
             handle_.get(), columns, &out_fragment, &out_schema) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_fragment_schema_pair(
         out_fragment, out_schema);
@@ -5064,7 +5067,7 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_reader(
     if (lance_fragment_add_columns_stream(
             handle_.get(), stream, batch_size_ptr, &out_fragment,
             &out_schema) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_fragment_schema_pair(
         out_fragment, out_schema);
@@ -5081,7 +5084,7 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
     if (lance_fragment_add_columns_batch_udf(
             handle_.get(), &call.raw, call.read_columns_ptr,
             call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_fragment_schema_pair(
         out_fragment, out_schema);
@@ -5098,7 +5101,7 @@ inline std::pair<Fragment, LanceSchema> Fragment::add_columns_batch_udf(
     if (lance_fragment_add_columns_batch_udf_v2(
             handle_.get(), &call.raw_v2, call.read_columns_ptr,
             call.batch_size_ptr, &out_fragment, &out_schema) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_fragment_schema_pair(
         out_fragment, out_schema);
@@ -5113,7 +5116,7 @@ inline std::pair<Fragment, LanceSchema> Fragment::merge_columns(
     if (lance_fragment_merge_columns(
             handle_.get(), stream, left_on.c_str(), right_on.c_str(),
             &out_fragment, &out_schema) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_fragment_schema_pair(
         out_fragment, out_schema);
@@ -5127,7 +5130,7 @@ inline FragmentUpdateColumnsResult Fragment::update_columns(
     if (lance_fragment_update_columns(
             handle_.get(), stream, left_on.c_str(), right_on.c_str(),
             &result) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!result) {
         throw Error(LANCE_ERR_INTERNAL,
@@ -5141,7 +5144,7 @@ inline DataReplacementGroup Fragment::write_columns(
     LanceDataReplacementGroup* group = nullptr;
     if (lance_fragment_write_columns(
             handle_.get(), schema.c_handle(), stream, &group) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_replacement_group(group);
 }
@@ -5154,7 +5157,7 @@ inline DataReplacementGroup Fragment::write_column_with_version(
     if (lance_fragment_write_column_with_version(
             handle_.get(), schema.c_handle(), stream,
             static_cast<int32_t>(file_version), &group) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return fragment_mutation_detail::take_replacement_group(group);
 }
@@ -5165,7 +5168,7 @@ inline std::optional<Fragment> Fragment::delete_rows(
     if (lance_fragment_delete_rows(
             handle_.get(), offsets.empty() ? nullptr : offsets.data(),
             offsets.size(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!raw) return std::nullopt;
     return Fragment(raw);
@@ -5174,7 +5177,7 @@ inline std::optional<Fragment> Fragment::delete_rows(
 inline LanceSchema LanceSchema::from_fragment(const Fragment& fragment) {
     ::LanceSchema* raw = nullptr;
     if (lance_fragment_schema_clone(fragment.c_handle(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return LanceSchema(raw);
 }
@@ -5182,7 +5185,7 @@ inline LanceSchema LanceSchema::from_fragment(const Fragment& fragment) {
 inline LanceSchema LanceSchema::from_operation(const Operation& operation) {
     ::LanceSchema* raw = nullptr;
     if (lance_operation_schema_clone(operation.c_handle(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return LanceSchema(raw);
 }
@@ -5192,7 +5195,7 @@ inline Operation Operation::make_project(
     LanceOperation* raw = nullptr;
     if (lance_operation_project_new(
             schema.c_handle(), preserves_nullability, &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Operation(raw);
 }
@@ -5200,7 +5203,7 @@ inline Operation Operation::make_project(
 inline Fragment Operation::append_fragment_at(size_t index) const {
     LanceFragment* raw = nullptr;
     if (lance_operation_append_fragment_at(handle_.get(), index, &raw) != 0)
-        check_error();
+        detail::throw_error();
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_operation_append_fragment_at returned success "
@@ -5212,7 +5215,7 @@ inline Fragment Operation::append_fragment_at(size_t index) const {
 inline std::vector<BasePath> Operation::update_bases() const {
     uint64_t count = 0;
     if (lance_operation_update_bases_count(handle_.get(), &count) != 0)
-        check_error();
+        detail::throw_error();
 
     std::vector<BasePath> out;
     out.reserve(static_cast<size_t>(count));
@@ -5220,7 +5223,7 @@ inline std::vector<BasePath> Operation::update_bases() const {
         LanceBasePathView view{};
         if (lance_operation_update_bases_at(
                 handle_.get(), static_cast<size_t>(i), &view) != 0)
-            check_error();
+            detail::throw_error();
         BasePath base;
         base.id = view.id;
         base.path = view.path ? view.path : "";
@@ -5235,7 +5238,7 @@ inline std::vector<BasePath> Operation::update_bases() const {
 inline Fragment Operation::overwrite_fragment_at(size_t index) const {
     LanceFragment* raw = nullptr;
     if (lance_operation_overwrite_fragment_at(handle_.get(), index, &raw) != 0)
-        check_error();
+        detail::throw_error();
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_operation_overwrite_fragment_at returned success "
@@ -5247,7 +5250,7 @@ inline Fragment Operation::overwrite_fragment_at(size_t index) const {
 inline LanceSchema Operation::overwrite_schema() const {
     ::LanceSchema* raw = nullptr;
     if (lance_operation_overwrite_schema_clone(handle_.get(), &raw) != 0)
-        check_error();
+        detail::throw_error();
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_operation_overwrite_schema_clone returned success "
@@ -5259,7 +5262,7 @@ inline LanceSchema Operation::overwrite_schema() const {
 inline Fragment Operation::merge_fragment_at(size_t index) const {
     LanceFragment* raw = nullptr;
     if (lance_operation_merge_fragment_at(handle_.get(), index, &raw) != 0)
-        check_error();
+        detail::throw_error();
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_operation_merge_fragment_at returned success "
@@ -5271,7 +5274,7 @@ inline Fragment Operation::merge_fragment_at(size_t index) const {
 inline LanceSchema Operation::merge_schema() const {
     ::LanceSchema* raw = nullptr;
     if (lance_operation_merge_schema_clone(handle_.get(), &raw) != 0)
-        check_error();
+        detail::throw_error();
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_operation_merge_schema_clone returned success "
@@ -5283,7 +5286,7 @@ inline LanceSchema Operation::merge_schema() const {
 inline LanceSchema Operation::project_schema() const {
     ::LanceSchema* raw = nullptr;
     if (lance_operation_project_schema_clone(handle_.get(), &raw) != 0)
-        check_error();
+        detail::throw_error();
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_operation_project_schema_clone returned success "
@@ -5358,7 +5361,7 @@ inline Operation Operation::make_overwrite(
         schema.c_handle(),
         fragment_handles.empty() ? nullptr : fragment_handles.data(),
         fragment_handles.size(), config_map, initial_base_list);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Operation(raw);
 }
 
@@ -5379,7 +5382,7 @@ inline Operation Operation::make_merge(
         schema.c_handle(),
         fragment_handles.empty() ? nullptr : fragment_handles.data(),
         fragment_handles.size(), preserves_nullability);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Operation(raw);
 }
 
@@ -5390,7 +5393,7 @@ inline Operation Operation::make_clone(
     auto* raw = lance_operation_clone_new(
         is_shallow, ref_name ? ref_name->c_str() : nullptr, ref_version,
         ref_path.c_str(), branch_name ? branch_name->c_str() : nullptr);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Operation(raw);
 }
 
@@ -5421,7 +5424,7 @@ inline Operation Operation::make_update_config(
     c_options.field_metadata_update_count = field_updates.size();
 
     auto* raw = lance_operation_update_config_new(&c_options);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Operation(raw);
 }
 
@@ -5438,7 +5441,7 @@ inline Operation Operation::make_append(
     }
     auto* operation = lance_operation_append_new(
         handles.empty() ? nullptr : handles.data(), handles.size());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
@@ -5456,7 +5459,7 @@ inline Operation Operation::make_update_bases(
     }
     auto* operation = lance_operation_update_bases_new(
         raw.empty() ? nullptr : raw.data(), raw.size());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
@@ -5477,7 +5480,7 @@ inline Operation Operation::make_delete(
         handles.empty() ? nullptr : handles.data(), handles.size(),
         deleted_fragment_ids.empty() ? nullptr : deleted_fragment_ids.data(),
         deleted_fragment_ids.size(), predicate.c_str());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
@@ -5494,7 +5497,7 @@ inline Operation Operation::make_data_replacement(
     }
     auto* operation = lance_operation_data_replacement_new(
         handles.empty() ? nullptr : handles.data(), handles.size());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
@@ -5511,7 +5514,7 @@ inline Operation Operation::make_data_overlay(
     }
     auto* operation = lance_operation_data_overlay_new(
         handles.empty() ? nullptr : handles.data(), handles.size());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
@@ -5571,7 +5574,7 @@ class CompactionOptions {
 
 public:
     CompactionOptions() : handle_(lance_compaction_options_v2_new()) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     explicit CompactionOptions(LanceCompactionOptionsV2* options)
@@ -5587,38 +5590,38 @@ public:
 
     CompactionOptions clone() const {
         auto* raw = lance_compaction_options_v2_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return CompactionOptions(raw);
     }
 
     CompactionOptions& set_target_rows_per_fragment(uint64_t value) {
         if (lance_compaction_options_v2_set_target_rows_per_fragment(
-                handle_.get(), value) != 0) check_error();
+                handle_.get(), value) != 0) detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_max_rows_per_group(uint64_t value) {
         if (lance_compaction_options_v2_set_max_rows_per_group(
-                handle_.get(), value) != 0) check_error();
+                handle_.get(), value) != 0) detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_max_bytes_per_file(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_max_bytes_per_file(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_materialize_deletions(bool value) {
         if (lance_compaction_options_v2_set_materialize_deletions(
-                handle_.get(), value) != 0) check_error();
+                handle_.get(), value) != 0) detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_materialize_deletions_threshold(float value) {
         if (lance_compaction_options_v2_set_materialize_deletions_threshold(
-                handle_.get(), value) != 0) check_error();
+                handle_.get(), value) != 0) detail::throw_error();
         return *this;
     }
 
@@ -5627,34 +5630,34 @@ public:
     CompactionOptions& set_num_threads(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_num_threads(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_batch_size(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_batch_size(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_io_buffer_size(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_io_buffer_size(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_defer_index_remap(bool value) {
         if (lance_compaction_options_v2_set_defer_index_remap(
-                handle_.get(), value) != 0) check_error();
+                handle_.get(), value) != 0) detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_index_remap_mode(LanceIndexRemapMode value) {
         if (lance_compaction_options_v2_set_index_remap_mode(
                 handle_.get(), static_cast<int32_t>(value)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5663,7 +5666,7 @@ public:
         int32_t raw = value ? static_cast<int32_t>(*value) : 0;
         if (lance_compaction_options_v2_set_compaction_mode(
                 handle_.get(), value.has_value(), raw) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5671,7 +5674,7 @@ public:
         std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5679,21 +5682,21 @@ public:
         std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_max_source_fragments(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_max_source_rows(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_max_source_rows(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     CompactionOptions& set_max_source_bytes(std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_max_source_bytes(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5703,7 +5706,7 @@ public:
                 handle_.get(),
                 fragment_ids.empty() ? nullptr : fragment_ids.data(),
                 fragment_ids.size()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5711,7 +5714,7 @@ public:
         std::optional<uint64_t> value) {
         if (lance_compaction_options_v2_set_max_overlays_per_fragment(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5719,7 +5722,7 @@ public:
         std::optional<std::string> selector) {
         if (lance_compaction_options_v2_set_data_storage_version(
                 handle_.get(), selector ? selector->c_str() : nullptr) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5744,7 +5747,7 @@ public:
         }
         if (lance_compaction_options_v2_set_transaction_properties(
                 handle_.get(), properties_ptr) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -5765,27 +5768,27 @@ public:
 
     uint64_t read_version() const {
         uint64_t value = lance_rewrite_result_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     LanceCompactionMetrics metrics() const {
         LanceCompactionMetrics value{};
         if (lance_rewrite_result_metrics(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
     size_t original_fragment_count() const {
         size_t count =
             lance_rewrite_result_original_fragment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
     size_t new_fragment_count() const {
         size_t count = lance_rewrite_result_new_fragment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -5793,20 +5796,14 @@ public:
         const char* json =
             lance_rewrite_result_original_fragment_metadata_json_at(
                 handle_.get(), index);
-        if (!json) check_error();
-        std::string out(json);
-        lance_free_string(json);
-        return out;
+        return detail::take_string(json);
     }
 
     std::string new_fragment_metadata_json(size_t index) const {
         const char* json =
             lance_rewrite_result_new_fragment_metadata_json_at(
                 handle_.get(), index);
-        if (!json) check_error();
-        std::string out(json);
-        lance_free_string(json);
-        return out;
+        return detail::take_string(json);
     }
 
     /// Clone one original fragment as an owned native snapshot. The handle
@@ -5819,16 +5816,13 @@ public:
 
     std::string json() const {
         const char* raw = lance_rewrite_result_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static RewriteResult from_json(std::string_view json) {
         std::string owned(json);
         auto* result = lance_rewrite_result_from_json(owned.c_str());
-        if (!result) check_error();
+        if (!result) detail::throw_error();
         return RewriteResult(result);
     }
 
@@ -5849,13 +5843,13 @@ public:
 
     uint64_t read_version() const {
         uint64_t value = lance_compaction_task_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     size_t fragment_count() const {
         size_t count = lance_compaction_task_fragment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -5863,10 +5857,7 @@ public:
         const char* raw =
             lance_compaction_task_fragment_metadata_json_at(
                 handle_.get(), index);
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     std::vector<std::string> fragment_metadata_json() const {
@@ -5880,7 +5871,7 @@ public:
     CompactionOptions options() const {
         auto* options =
             lance_compaction_task_options_clone(handle_.get());
-        if (!options) check_error();
+        if (!options) detail::throw_error();
         return CompactionOptions(options);
     }
 
@@ -5888,16 +5879,13 @@ public:
 
     std::string json() const {
         const char* raw = lance_compaction_task_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static CompactionTask from_json(std::string_view json) {
         std::string owned(json);
         auto* task = lance_compaction_task_from_json(owned.c_str());
-        if (!task) check_error();
+        if (!task) detail::throw_error();
         return CompactionTask(task);
     }
 
@@ -5918,41 +5906,38 @@ public:
 
     uint64_t read_version() const {
         uint64_t value = lance_compaction_plan_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     size_t num_tasks() const {
         size_t count = lance_compaction_plan_task_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
     CompactionTask task(size_t index) const {
         auto* task = lance_compaction_plan_task_at(handle_.get(), index);
-        if (!task) check_error();
+        if (!task) detail::throw_error();
         return CompactionTask(task);
     }
 
     CompactionOptions options() const {
         auto* options =
             lance_compaction_plan_options_clone(handle_.get());
-        if (!options) check_error();
+        if (!options) detail::throw_error();
         return CompactionOptions(options);
     }
 
     std::string json() const {
         const char* raw = lance_compaction_plan_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static CompactionPlan from_json(std::string_view json) {
         std::string owned(json);
         auto* plan = lance_compaction_plan_from_json(owned.c_str());
-        if (!plan) check_error();
+        if (!plan) detail::throw_error();
         return CompactionPlan(plan);
     }
 
@@ -5966,7 +5951,7 @@ class OptimizeIndicesOptions {
 
 public:
     OptimizeIndicesOptions() : handle_(lance_optimize_indices_options_new()) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     explicit OptimizeIndicesOptions(LanceOptimizeIndicesOptions* options)
@@ -5980,7 +5965,7 @@ public:
 
     OptimizeIndicesOptions clone() const {
         auto* raw = lance_optimize_indices_options_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return OptimizeIndicesOptions(raw);
     }
 
@@ -5988,14 +5973,14 @@ public:
         std::optional<uint64_t> value) {
         if (lance_optimize_indices_options_set_num_indices_to_merge(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     OptimizeIndicesOptions& set_enable_partition_rebalancing(bool value) {
         if (lance_optimize_indices_options_set_enable_partition_rebalancing(
                 handle_.get(), value) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -6011,14 +5996,14 @@ public:
                 names.has_value(),
                 raw.empty() ? nullptr : raw.data(),
                 raw.size()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     OptimizeIndicesOptions& set_retrain(bool value) {
         if (lance_optimize_indices_options_set_retrain(
                 handle_.get(), value) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -6043,7 +6028,7 @@ public:
         }
         if (lance_optimize_indices_options_set_transaction_properties(
                 handle_.get(), properties_ptr) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -6051,7 +6036,7 @@ public:
         std::optional<uint64_t> value) {
         if (lance_optimize_indices_options_set_max_rows_per_task(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -6059,7 +6044,7 @@ public:
         std::optional<uint64_t> value) {
         if (lance_optimize_indices_options_set_max_rows_per_segment(
                 handle_.get(), value.has_value(), value.value_or(0)) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -6085,19 +6070,19 @@ public:
         std::array<uint8_t, 16> out = {};
         if (lance_index_segment_result_plan_id(
                 handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     uint64_t read_version() const {
         uint64_t value = lance_index_segment_result_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     uint32_t group() const {
         uint32_t value = lance_index_segment_result_group(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
@@ -6105,7 +6090,7 @@ public:
 
     size_t replace_count() const {
         size_t count = lance_index_segment_result_replace_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -6113,22 +6098,19 @@ public:
         std::array<uint8_t, 16> out = {};
         if (lance_index_segment_result_replace_uuid_at(
                 handle_.get(), index, out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     std::string json() const {
         const char* raw = lance_index_segment_result_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static IndexSegmentResult from_json(std::string_view json) {
         std::string owned(json);
         auto* result = lance_index_segment_result_from_json(owned.c_str());
-        if (!result) check_error();
+        if (!result) detail::throw_error();
         return IndexSegmentResult(result);
     }
 
@@ -6151,25 +6133,25 @@ public:
         std::array<uint8_t, 16> out = {};
         if (lance_optimize_index_task_plan_id(
                 handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     uint64_t read_version() const {
         uint64_t value = lance_optimize_index_task_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     uint32_t group() const {
         uint32_t value = lance_optimize_index_task_group(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     size_t fragment_count() const {
         size_t count = lance_optimize_index_task_fragment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -6177,7 +6159,7 @@ public:
         uint32_t value = 0;
         if (lance_optimize_index_task_fragment_id_at(
                 handle_.get(), index, &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -6194,7 +6176,7 @@ public:
     size_t old_segment_count() const {
         size_t count =
             lance_optimize_index_task_old_segment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -6205,7 +6187,7 @@ public:
         uint64_t value = 0;
         if (lance_optimize_index_task_num_indices_to_merge(
                 handle_.get(), &has_value, &value) != 0)
-            check_error();
+            detail::throw_error();
         return has_value ? std::optional<uint64_t>(value) : std::nullopt;
     }
 
@@ -6213,14 +6195,14 @@ public:
         bool value = false;
         if (lance_optimize_index_task_enable_partition_rebalancing(
                 handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
     bool retrain() const {
         bool value = false;
         if (lance_optimize_index_task_retrain(handle_.get(), &value) != 0)
-            check_error();
+            detail::throw_error();
         return value;
     }
 
@@ -6228,16 +6210,13 @@ public:
 
     std::string json() const {
         const char* raw = lance_optimize_index_task_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static OptimizeIndexTask from_json(std::string_view json) {
         std::string owned(json);
         auto* task = lance_optimize_index_task_from_json(owned.c_str());
-        if (!task) check_error();
+        if (!task) detail::throw_error();
         return OptimizeIndexTask(task);
     }
 
@@ -6261,26 +6240,26 @@ public:
         std::array<uint8_t, 16> out = {};
         if (lance_optimize_index_merge_plan_id(
                 handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     uint64_t read_version() const {
         uint64_t value = lance_optimize_index_merge_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     uint32_t group() const {
         uint32_t value = lance_optimize_index_merge_group(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     size_t old_segment_count() const {
         size_t count =
             lance_optimize_index_merge_old_segment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -6288,7 +6267,7 @@ public:
 
     size_t replace_count() const {
         size_t count = lance_optimize_index_merge_replace_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
@@ -6296,7 +6275,7 @@ public:
         std::array<uint8_t, 16> out = {};
         if (lance_optimize_index_merge_replace_uuid_at(
                 handle_.get(), index, out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
@@ -6306,16 +6285,13 @@ public:
 
     std::string json() const {
         const char* raw = lance_optimize_index_merge_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static OptimizeIndexMerge from_json(std::string_view json) {
         std::string owned(json);
         auto* merge = lance_optimize_index_merge_from_json(owned.c_str());
-        if (!merge) check_error();
+        if (!merge) detail::throw_error();
         return OptimizeIndexMerge(merge);
     }
 
@@ -6340,54 +6316,51 @@ public:
         std::array<uint8_t, 16> out = {};
         if (lance_optimize_indices_plan_id(
                 handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     uint64_t read_version() const {
         uint64_t value =
             lance_optimize_indices_plan_read_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     size_t num_tasks() const {
         size_t count = lance_optimize_indices_plan_task_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
     size_t num_merges() const {
         size_t count = lance_optimize_indices_plan_merge_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
     OptimizeIndexTask task(size_t index) const {
         auto* task = lance_optimize_indices_plan_task_at(handle_.get(), index);
-        if (!task) check_error();
+        if (!task) detail::throw_error();
         return OptimizeIndexTask(task);
     }
 
     OptimizeIndexMerge merge(size_t index) const {
         auto* merge =
             lance_optimize_indices_plan_merge_at(handle_.get(), index);
-        if (!merge) check_error();
+        if (!merge) detail::throw_error();
         return OptimizeIndexMerge(merge);
     }
 
     std::string json() const {
         const char* raw = lance_optimize_indices_plan_json(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     static OptimizeIndicesPlan from_json(std::string_view json) {
         std::string owned(json);
         auto* plan = lance_optimize_indices_plan_from_json(owned.c_str());
-        if (!plan) check_error();
+        if (!plan) detail::throw_error();
         return OptimizeIndicesPlan(plan);
     }
 
@@ -6432,7 +6405,7 @@ struct CompactedSsTable {
         ::LanceCompactedSsTable raw{};
         if (lance_mem_wal_compacted_sstable_new(shard_id.c_str(), generation,
                                                 &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         CompactedSsTable value;
         std::memcpy(value.shard_id.data(), raw.shard_id,
@@ -6630,7 +6603,7 @@ class ShardingField {
 
 public:
     explicit ShardingField(::LanceMemWalShardingField* field) : handle_(field) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     ShardingField(ShardingField&&) noexcept = default;
@@ -6665,7 +6638,7 @@ public:
                 values.empty() ? nullptr : values.data(),
                 keys.size(),
                 &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardingField(raw);
     }
@@ -6673,21 +6646,21 @@ public:
     ShardingField clone() const {
         ::LanceMemWalShardingField* raw = nullptr;
         if (lance_mem_wal_sharding_field_clone(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardingField(raw);
     }
 
     std::string id() const {
         const char* value = lance_mem_wal_sharding_field_id(handle_.get());
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return value;
     }
 
     std::vector<int32_t> source_ids() const {
         size_t count = 0;
         const int32_t* values = lance_mem_wal_sharding_field_source_ids(handle_.get(), &count);
-        if (!values && count != 0) check_error();
+        if (!values && count != 0) detail::throw_error();
         return values ? std::vector<int32_t>(values, values + count)
                       : std::vector<int32_t>{};
     }
@@ -6706,7 +6679,7 @@ public:
 
     std::string result_type() const {
         const char* value = lance_mem_wal_sharding_field_result_type(handle_.get());
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return value;
     }
 
@@ -6718,9 +6691,9 @@ public:
             const char* value = nullptr;
             if (lance_mem_wal_sharding_field_parameter_at(
                     handle_.get(), i, &key, &value) != 0) {
-                check_error();
+                detail::throw_error();
             }
-            if (!key || !value) check_error();
+            if (!key || !value) detail::throw_error();
             result.emplace(key, value);
         }
         return result;
@@ -6742,7 +6715,7 @@ class ShardingSpec {
 
 public:
     explicit ShardingSpec(::LanceMemWalShardingSpec* spec) : handle_(spec) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     ShardingSpec(ShardingSpec&&) noexcept = default;
@@ -6758,7 +6731,7 @@ public:
         ::LanceMemWalShardingSpec* spec = nullptr;
         if (lance_mem_wal_sharding_spec_new(
                 spec_id, raw.empty() ? nullptr : raw.data(), raw.size(), &spec) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardingSpec(spec);
     }
@@ -6766,7 +6739,7 @@ public:
     ShardingSpec clone() const {
         ::LanceMemWalShardingSpec* raw = nullptr;
         if (lance_mem_wal_sharding_spec_clone(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardingSpec(raw);
     }
@@ -6790,7 +6763,7 @@ public:
     ShardingField field_at(size_t index) const {
         ::LanceMemWalShardingField* raw = nullptr;
         if (lance_mem_wal_sharding_spec_field_at(handle_.get(), index, &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardingField(raw);
     }
@@ -6822,7 +6795,7 @@ class ShardSnapshot {
 
 public:
     explicit ShardSnapshot(::LanceMemWalShardSnapshot* snapshot) : handle_(snapshot) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     ShardSnapshot(ShardSnapshot&&) noexcept = default;
@@ -6833,7 +6806,7 @@ public:
     static ShardSnapshot create(const std::string& shard_id) {
         ::LanceMemWalShardSnapshot* raw = nullptr;
         if (lance_mem_wal_shard_snapshot_new(shard_id.c_str(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardSnapshot(raw);
     }
@@ -6841,14 +6814,14 @@ public:
     ShardSnapshot clone() const {
         ::LanceMemWalShardSnapshot* raw = nullptr;
         if (lance_mem_wal_shard_snapshot_clone(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardSnapshot(raw);
     }
 
     std::string shard_id() const {
         const char* value = lance_mem_wal_shard_snapshot_shard_id(handle_.get());
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return value;
     }
 
@@ -6858,7 +6831,7 @@ public:
 
     ShardSnapshot& set_spec_id(uint32_t value) {
         if (lance_mem_wal_shard_snapshot_with_spec_id(handle_.get(), value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -6870,7 +6843,7 @@ public:
     ShardSnapshot& set_current_generation(uint64_t value) {
         if (lance_mem_wal_shard_snapshot_with_current_generation(
                 handle_.get(), value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -6878,7 +6851,7 @@ public:
     ShardSnapshot& add_sstable(uint64_t generation, const std::string& path) {
         if (lance_mem_wal_shard_snapshot_with_sstable(
                 handle_.get(), generation, path.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -6892,9 +6865,9 @@ public:
             const char* path = nullptr;
             if (lance_mem_wal_shard_snapshot_sstable_at(
                     handle_.get(), i, &generation, &path) != 0) {
-                check_error();
+                detail::throw_error();
             }
-            if (!path) check_error();
+            if (!path) detail::throw_error();
             result.push_back(SsTable{generation, path});
         }
         return result;
@@ -6962,7 +6935,7 @@ class ShardWriter {
 
 public:
     explicit ShardWriter(::LanceShardWriter* writer) : handle_(writer) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
 
     ~ShardWriter() = default;
@@ -6978,14 +6951,14 @@ public:
 
     std::string shard_id() const {
         const char* value = lance_shard_writer_shard_id(handle_.get());
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return value;
     }
 
     ShardWriteResult put(ArrowArrayStream* stream) {
         ::LanceShardWriteResult raw{};
         if (lance_shard_writer_put(handle_.get(), stream, &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardWriteResult{raw.batch_position_begin,
                                 raw.batch_position_end};
@@ -6994,7 +6967,7 @@ public:
     ShardWriteResult delete_rows(ArrowArrayStream* stream) {
         ::LanceShardWriteResult raw{};
         if (lance_shard_writer_delete(handle_.get(), stream, &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ShardWriteResult{raw.batch_position_begin,
                                 raw.batch_position_end};
@@ -7002,7 +6975,7 @@ public:
 
     ShardWriterStats stats() const {
         ::LanceShardWriterStats raw{};
-        if (lance_shard_writer_stats(handle_.get(), &raw) != 0) check_error();
+        if (lance_shard_writer_stats(handle_.get(), &raw) != 0) detail::throw_error();
         return ShardWriterStats{
             raw.put_count, raw.put_time_nanos,
             raw.wal_flush_count, raw.wal_flush_time_nanos, raw.wal_flush_bytes,
@@ -7016,7 +6989,7 @@ public:
     ShardMemTableStats memtable_stats() const {
         ::LanceShardMemTableStats raw{};
         if (lance_shard_writer_memtable_stats(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         ShardMemTableStats stats;
         stats.is_live = raw.is_live != 0;
@@ -7053,7 +7026,7 @@ public:
     /// scanner using a default snapshot.
     std::optional<ShardSnapshot> snapshot() const {
         ::LanceMemWalShardSnapshot* raw = nullptr;
-        if (lance_shard_writer_snapshot(handle_.get(), &raw) != 0) check_error();
+        if (lance_shard_writer_snapshot(handle_.get(), &raw) != 0) detail::throw_error();
         if (!raw) return std::nullopt;
         return ShardSnapshot(raw);
     }
@@ -7061,7 +7034,7 @@ public:
     LsmScanner lsm_scanner(std::vector<ShardSnapshot> snapshots);
 
     void close() {
-        if (lance_shard_writer_close(handle_.get()) != 0) check_error();
+        if (lance_shard_writer_close(handle_.get()) != 0) detail::throw_error();
     }
 
     const ::LanceShardWriter* c_handle() const { return handle_.get(); }
@@ -7073,7 +7046,7 @@ class LsmScanner {
 
 public:
     explicit LsmScanner(::LanceLsmScanner* scanner) : handle_(scanner) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
     ~LsmScanner() = default;
     LsmScanner(LsmScanner&&) noexcept = default;
@@ -7091,14 +7064,14 @@ public:
         if (lance_lsm_scanner_project(
                 handle_.get(), raw.empty() ? nullptr : raw.data(),
                 raw.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
 
     LsmScanner& filter(const std::string& expression) {
         if (lance_lsm_scanner_filter(handle_.get(), expression.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -7108,21 +7081,21 @@ public:
         if (lance_lsm_scanner_limit(
                 handle_.get(), limit.value_or(0), limit.has_value(),
                 offset.value_or(0), offset.has_value()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
 
     LsmScanner& with_row_address() {
         if (lance_lsm_scanner_with_row_address(handle_.get()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
 
     LsmScanner& with_memtable_gen() {
         if (lance_lsm_scanner_with_memtable_gen(handle_.get()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -7133,7 +7106,7 @@ public:
     uint64_t count_rows() const {
         uint64_t count = 0;
         if (lance_lsm_scanner_count_rows(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -7141,7 +7114,7 @@ public:
     ArrowStream to_reader() const {
         ArrowArrayStream raw{};
         if (lance_lsm_scanner_to_arrow_stream(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(raw);
     }
@@ -7155,7 +7128,7 @@ class ExecutionPlan {
 
 public:
     explicit ExecutionPlan(::LanceMemWalPlan* plan) : handle_(plan) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
     ~ExecutionPlan() = default;
     ExecutionPlan(ExecutionPlan&&) noexcept = default;
@@ -7169,10 +7142,9 @@ public:
     std::string explain() const {
         char* text = nullptr;
         if (lance_mem_wal_plan_explain(handle_.get(), &text) != 0) {
-            check_error();
+            detail::throw_error();
         }
-        std::unique_ptr<char, decltype(&lance_free_string)> guard(text, lance_free_string);
-        return std::string(text);
+        return detail::take_string(text);
     }
 
     Batch to_batch() const;
@@ -7182,7 +7154,7 @@ public:
     ArrowStream to_reader() const {
         ArrowArrayStream raw{};
         if (lance_mem_wal_plan_to_arrow_stream(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(raw);
     }
@@ -7212,7 +7184,7 @@ public:
 private:
     explicit LsmPointLookupPlanner(::LanceLsmPointLookupPlanner* planner)
         : handle_(planner) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
     friend class Dataset;
 };
@@ -7246,7 +7218,7 @@ public:
 private:
     explicit LsmVectorSearchPlanner(::LanceLsmVectorSearchPlanner* planner)
         : handle_(planner) {
-        if (!handle_) check_error();
+        if (!handle_) detail::throw_error();
     }
     friend class Dataset;
 };
@@ -7458,52 +7430,52 @@ class Dataset {
         CleanupExplanation out;
         out.read_version =
             lance_cleanup_explanation_read_version(explanation);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         LanceRemovalStats stats{};
         if (lance_cleanup_explanation_stats(explanation, &stats) != 0)
-            check_error();
+            detail::throw_error();
         out.stats = from_c_removal_stats(stats);
 
         const uint64_t candidate_count =
             lance_cleanup_explanation_candidate_count(explanation);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         out.candidate_files.reserve(static_cast<size_t>(candidate_count));
         for (uint64_t i = 0; i < candidate_count; ++i) {
             const auto index = static_cast<size_t>(i);
             CleanupCandidateFile candidate;
             const char* path =
                 lance_cleanup_explanation_candidate_path_at(explanation, index);
-            if (!path) check_error();
+            if (!path) detail::throw_error();
             candidate.path = path;
 
             const int32_t kind =
                 lance_cleanup_explanation_candidate_kind_at(explanation, index);
-            if (kind < 0) check_error();
+            if (kind < 0) detail::throw_error();
             candidate.kind = static_cast<CleanupFileKind>(kind);
             const int32_t unverified =
                 lance_cleanup_explanation_candidate_unverified_at(
                     explanation, index);
-            if (unverified < 0) check_error();
+            if (unverified < 0) detail::throw_error();
             candidate.unverified = unverified != 0;
             candidate.size_bytes =
                 lance_cleanup_explanation_candidate_size_bytes_at(
                     explanation, index);
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             out.candidate_files.push_back(std::move(candidate));
         }
 
         const int32_t truncated =
             lance_cleanup_explanation_candidate_files_truncated(explanation);
-        if (truncated < 0) check_error();
+        if (truncated < 0) detail::throw_error();
         out.candidate_files_truncated = truncated != 0;
         out.candidate_file_limit =
             lance_cleanup_explanation_candidate_file_limit(explanation);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         const uint64_t branch_count =
             lance_cleanup_explanation_referenced_branch_count(explanation);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         out.referenced_branches.reserve(static_cast<size_t>(branch_count));
         for (uint64_t i = 0; i < branch_count; ++i) {
             const auto index = static_cast<size_t>(i);
@@ -7511,28 +7483,28 @@ class Dataset {
             const char* name =
                 lance_cleanup_explanation_referenced_branch_name_at(
                     explanation, index);
-            if (!name) check_error();
+            if (!name) detail::throw_error();
             branch.name = name;
             branch.referenced_version =
                 lance_cleanup_explanation_referenced_branch_version_at(
                     explanation, index);
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             const int32_t candidate =
                 lance_cleanup_explanation_referenced_branch_cleanup_candidate_at(
                     explanation, index);
-            if (candidate < 0) check_error();
+            if (candidate < 0) detail::throw_error();
             branch.cleanup_candidate = candidate != 0;
             out.referenced_branches.push_back(std::move(branch));
         }
 
         const uint64_t warning_count =
             lance_cleanup_explanation_warning_count(explanation);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         out.warnings.reserve(static_cast<size_t>(warning_count));
         for (uint64_t i = 0; i < warning_count; ++i) {
             const char* warning = lance_cleanup_explanation_warning_at(
                 explanation, static_cast<size_t>(i));
-            if (!warning) check_error();
+            if (!warning) detail::throw_error();
             out.warnings.emplace_back(warning);
         }
         return out;
@@ -7541,19 +7513,19 @@ class Dataset {
     static VersionDetails read_version(const LanceVersion* version) {
         VersionDetails out;
         out.id = lance_version_id(version);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         out.timestamp_ns = lance_version_timestamp_ns(version);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         uint64_t count = lance_version_metadata_count(version);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         for (uint64_t i = 0; i < count; ++i) {
             const char* key = lance_version_metadata_key_at(
                 version, static_cast<size_t>(i));
-            if (!key) check_error();
+            if (!key) detail::throw_error();
             const char* value = lance_version_metadata_value_at(
                 version, static_cast<size_t>(i));
-            if (!value) check_error();
+            if (!value) detail::throw_error();
             out.metadata.emplace(key, value);
         }
         return out;
@@ -7562,17 +7534,17 @@ class Dataset {
     static TagInfo read_tag(const LanceTag* tag) {
         TagInfo out;
         const char* name = lance_tag_name(tag);
-        if (!name) check_error();
+        if (!name) detail::throw_error();
         out.name = name;
 
         out.version = lance_tag_version(tag);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         out.manifest_size = lance_tag_manifest_size(tag);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         const char* branch = nullptr;
         int32_t has_branch = lance_tag_branch(tag, &branch);
-        if (has_branch < 0) check_error();
+        if (has_branch < 0) detail::throw_error();
         if (has_branch) {
             if (!branch) {
                 throw Error(LANCE_ERR_INTERNAL,
@@ -7583,23 +7555,23 @@ class Dataset {
 
         int64_t timestamp = 0;
         int32_t has_created = lance_tag_created_at_ns(tag, &timestamp);
-        if (has_created < 0) check_error();
+        if (has_created < 0) detail::throw_error();
         if (has_created) out.created_at_ns = timestamp;
 
         timestamp = 0;
         int32_t has_updated = lance_tag_updated_at_ns(tag, &timestamp);
-        if (has_updated < 0) check_error();
+        if (has_updated < 0) detail::throw_error();
         if (has_updated) out.updated_at_ns = timestamp;
 
         uint64_t metadata_count = lance_tag_metadata_count(tag);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         for (uint64_t i = 0; i < metadata_count; ++i) {
             const char* key = lance_tag_metadata_key_at(
                 tag, static_cast<size_t>(i));
-            if (!key) check_error();
+            if (!key) detail::throw_error();
             const char* value = lance_tag_metadata_value_at(
                 tag, static_cast<size_t>(i));
-            if (!value) check_error();
+            if (!value) detail::throw_error();
             out.metadata.emplace(key, value);
         }
         return out;
@@ -7610,7 +7582,7 @@ class Dataset {
     ///
     /// Leak-freedom also rests on the C side: all `lance_dataset_take_blobs*`
     /// entry points fill `out` all-or-nothing and leave it untouched on error.
-    /// A partial fill before an error would leak, because `check_error()`
+    /// A partial fill before an error would leak, because `detail::throw_error()`
     /// throws before this runs and `raw` owns nothing.
     static void adopt_blobs(const std::vector<LanceBlobFile*>& raw,
                             std::vector<std::optional<BlobFile>>& blobs) {
@@ -7645,10 +7617,7 @@ class Dataset {
             : lance_dataset_update_metadata_json(
                   dataset, keys.data(), raw_values.data(), values.size(),
                   static_cast<LanceMetadataUpdateMode>(mode));
-        if (!json) check_error();
-        std::string out(json);
-        lance_free_string(json);
-        return out;
+        return detail::take_string(json);
     }
 
     static void run_field_metadata_update(
@@ -7680,7 +7649,7 @@ class Dataset {
                 dataset,
                 updates.empty() ? nullptr : raw.data(),
                 updates.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -7705,14 +7674,6 @@ class Dataset {
         void* callback_ctx) noexcept {
         delete static_cast<TrackedFilesProgressCapture*>(callback_ctx);
     }
-
-    static std::string take_owned_string(const char* raw) {
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
-    }
-
 
     /// Shared write path. `native_options` selects the native-defaults entry
     /// point; otherwise `legacy_params` selects the legacy 20/14 entry point.
@@ -7792,11 +7753,11 @@ class Dataset {
                 opts_ptr,
                 &out);
         }
-        if (rc != 0) check_error();
+        if (rc != 0) detail::throw_error();
         // Defensive null guard: a conforming Rust impl never returns rc == 0
         // with `out == nullptr`, but constructing a Dataset around a null
         // handle would silently crash on the first method call. Throw
-        // explicitly rather than going through `check_error()` because the
+        // explicitly rather than going through `detail::throw_error()` because the
         // thread-local code is `LANCE_OK` on this path (rc == 0).
         if (!out) {
             throw Error(LANCE_ERR_INTERNAL,
@@ -7820,7 +7781,7 @@ public:
             storage_opts.empty() ? nullptr : kv.data();
 
         auto* ds = lance_dataset_open(uri.c_str(), opts_ptr, version);
-        if (!ds) check_error();
+        if (!ds) detail::throw_error();
         return Dataset(ds);
     }
 
@@ -7838,7 +7799,7 @@ public:
 
         auto* ds = lance_dataset_open_with_session(
             uri.c_str(), opts_ptr, version, session.c_handle());
-        if (!ds) check_error();
+        if (!ds) detail::throw_error();
         return Dataset(ds);
     }
 
@@ -7867,7 +7828,7 @@ public:
             &c_options,
             session ? session->c_handle() : nullptr,
             options.base_store_params ? &base_store.list : nullptr);
-        if (!ds) check_error();
+        if (!ds) detail::throw_error();
         return Dataset(ds);
     }
 
@@ -7891,7 +7852,7 @@ public:
             session ? session->c_handle() : nullptr,
             commit_lock ? commit_lock->c_handle() : nullptr,
             &ds);
-        if (rc != 0) check_error();
+        if (rc != 0) detail::throw_error();
         if (ds == nullptr) {
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_dataset_open_with_commit_lock returned success "
@@ -8063,7 +8024,7 @@ public:
                 session ? session->c_handle() : nullptr,
                 commit_lock ? commit_lock->c_handle() : nullptr,
                 &out) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!out) {
             throw Error(
@@ -8098,7 +8059,7 @@ public:
                 static_cast<int32_t>(mode),
                 options.c_handle(),
                 &out) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!out) {
             throw Error(
@@ -8133,7 +8094,7 @@ public:
                 static_cast<int32_t>(mode),
                 options.c_handle(),
                 &transaction) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!transaction) {
             throw Error(
@@ -8216,7 +8177,7 @@ public:
                 storage_ptr,
                 session ? session->c_handle() : nullptr,
                 &transaction) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!transaction) {
             throw Error(
@@ -8274,7 +8235,7 @@ public:
                 storage_options_accessor.c_handle(),
                 session ? session->c_handle() : nullptr,
                 &transaction) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!transaction) {
             throw Error(
@@ -8322,7 +8283,7 @@ public:
                 session ? session->c_handle() : nullptr,
                 commit_lock ? commit_lock->c_handle() : nullptr,
                 &transaction) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!transaction) {
             throw Error(
@@ -8355,7 +8316,7 @@ public:
                 storage_ptr,
                 session ? session->c_handle() : nullptr,
                 &dataset) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!dataset) {
             throw Error(LANCE_ERR_INTERNAL,
@@ -8383,7 +8344,7 @@ public:
                 storage_options_accessor.c_handle(),
                 session ? session->c_handle() : nullptr,
                 &dataset) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!dataset) {
             throw Error(
@@ -8418,7 +8379,7 @@ public:
                 session ? session->c_handle() : nullptr,
                 commit_lock ? commit_lock->c_handle() : nullptr,
                 &dataset) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!dataset) {
             throw Error(
@@ -8471,14 +8432,14 @@ public:
     /// or deep clone operation. Throws lance::Error on failure.
     Dataset clone_handle() const {
         auto* ds = lance_dataset_clone_handle(handle_.get());
-        if (!ds) check_error();
+        if (!ds) detail::throw_error();
         return Dataset(ds);
     }
 
     /// Number of rows in the dataset.
     uint64_t count_rows() const {
         uint64_t n = lance_dataset_count_rows(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return n;
     }
 
@@ -8489,14 +8450,14 @@ public:
     uint64_t count_rows(const std::string& filter) const {
         uint64_t n =
             lance_dataset_count_rows_filtered(handle_.get(), filter.c_str());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return n;
     }
 
     /// Version of this dataset snapshot.
     uint64_t version() const {
         uint64_t v = lance_dataset_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return v;
     }
 
@@ -8506,16 +8467,13 @@ public:
     /// Throws lance::Error on failure.
     std::string uri() const {
         const char* value = lance_dataset_uri(handle_.get());
-        if (!value) check_error();
-        std::string out(value);
-        lance_free_string(value);
-        return out;
+        return detail::take_string(value);
     }
 
     /// Latest version ID (queries object store).
     uint64_t latest_version() const {
         uint64_t v = lance_dataset_latest_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return v;
     }
 
@@ -8524,10 +8482,7 @@ public:
     /// Throws lance::Error on failure.
     std::string metadata_json() const {
         const char* json = lance_dataset_metadata_json(handle_.get());
-        if (!json) check_error();
-        std::string out(json);
-        lance_free_string(json);
-        return out;
+        return detail::take_string(json);
     }
 
     /// Merge or replace table metadata and return the complete updated map as
@@ -8566,10 +8521,7 @@ public:
     std::string data_storage_version() const {
         const char* version =
             lance_dataset_data_storage_version(handle_.get());
-        if (!version) check_error();
-        std::string out(version);
-        lance_free_string(version);
-        return out;
+        return detail::take_string(version);
     }
 
     /// Whether the current snapshot uses stable row IDs.
@@ -8577,7 +8529,7 @@ public:
     bool has_stable_row_ids() const {
         bool stable = false;
         if (lance_dataset_has_stable_row_ids(handle_.get(), &stable) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return stable;
     }
@@ -8587,14 +8539,14 @@ public:
     std::vector<int32_t> field_ids() const {
         size_t count = 0;
         if (lance_dataset_field_id_count(handle_.get(), &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<int32_t> out;
         out.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             int32_t field_id = 0;
             if (lance_dataset_field_id_at(handle_.get(), i, &field_id) != 0) {
-                check_error();
+                detail::throw_error();
             }
             out.push_back(field_id);
         }
@@ -8607,7 +8559,7 @@ public:
         int32_t field_id = 0;
         LanceFieldReference raw = field.c_handle();
         if (lance_dataset_resolve_field_id(handle_.get(), &raw, &field_id) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return field_id;
     }
@@ -8616,30 +8568,27 @@ public:
     /// Throws lance::Error on failure.
     std::string field_path(int32_t field_id) const {
         const char* path = lance_dataset_field_path(handle_.get(), field_id);
-        if (!path) check_error();
-        std::string out(path);
-        lance_free_string(path);
-        return out;
+        return detail::take_string(path);
     }
 
     /// Snapshot the dataset's version history, ordered by version id.
     /// Throws lance::Error on failure.
     std::vector<VersionInfo> versions() const {
         auto* raw = lance_dataset_versions(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceVersions, lance_versions_close> snap(raw);
 
         uint64_t n = lance_versions_count(snap.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<VersionInfo> out;
         out.reserve(static_cast<size_t>(n));
         for (uint64_t i = 0; i < n; i++) {
             VersionInfo info;
             info.id = lance_versions_id_at(snap.get(), static_cast<size_t>(i));
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             info.timestamp_ms =
                 lance_versions_timestamp_ms_at(snap.get(), static_cast<size_t>(i));
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             out.push_back(info);
         }
         return out;
@@ -8652,7 +8601,7 @@ public:
     LanceObjectStoreIoStats io_stats_snapshot() const {
         LanceObjectStoreIoStats stats{};
         if (lance_dataset_io_stats_snapshot(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 
@@ -8662,7 +8611,7 @@ public:
     LanceObjectStoreIoStats io_stats_incremental() const {
         LanceObjectStoreIoStats stats{};
         if (lance_dataset_io_stats_incremental(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 
@@ -8674,19 +8623,19 @@ public:
     /// throws with LANCE_ERR_INTERNAL. Throws lance::Error on failure.
     std::map<std::string, std::string> config() const {
         auto* raw = lance_dataset_config(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceDatasetConfig, lance_dataset_config_close> snap(raw);
 
         uint64_t n = lance_dataset_config_count(snap.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::map<std::string, std::string> out;
         for (uint64_t i = 0; i < n; i++) {
             const char* key =
                 lance_dataset_config_key_at(snap.get(), static_cast<size_t>(i));
-            if (!key) check_error();
+            if (!key) detail::throw_error();
             const char* value =
                 lance_dataset_config_value_at(snap.get(), static_cast<size_t>(i));
-            if (!value) check_error();
+            if (!value) detail::throw_error();
             out.emplace(key, value);
         }
         return out;
@@ -8717,7 +8666,7 @@ public:
             updates.empty() ? nullptr : values.data(),
             updates.size(),
             static_cast<LanceMetadataUpdateMode>(mode));
-        return take_owned_string(json);
+        return detail::take_string(json);
     }
 
     /// Apply native merge-style config updates, committing a new manifest.
@@ -8730,7 +8679,8 @@ public:
     /// `id`, `name`, `path` and `is_dataset_root`. Throws lance::Error on
     /// failure.
     std::string base_paths_json() const {
-        return take_owned_string(lance_dataset_base_paths_json(handle_.get()));
+        return detail::take_string(
+            lance_dataset_base_paths_json(handle_.get()));
     }
 
     /// Register native base paths in one add-bases transaction.
@@ -8779,7 +8729,7 @@ public:
                 raw.data(),
                 raw.size(),
                 properties_ptr) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -8808,7 +8758,7 @@ public:
         ArrowArrayStream raw{};
         if (lance_dataset_tracked_files_stream(
                 handle_.get(), &options, &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(raw);
     }
@@ -8819,7 +8769,7 @@ public:
     ArrowStream all_files_stream() const {
         ArrowArrayStream raw{};
         if (lance_dataset_all_files_stream(handle_.get(), &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(raw);
     }
@@ -8831,7 +8781,7 @@ public:
         LanceTransaction* transaction = nullptr;
         if (lance_dataset_read_transaction(
                 handle_.get(), &transaction) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!transaction) return std::nullopt;
         return Transaction(transaction);
@@ -8844,7 +8794,7 @@ public:
         LanceTransaction* transaction = nullptr;
         if (lance_dataset_read_transaction_by_version(
                 handle_.get(), version, &transaction) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!transaction) return std::nullopt;
         return Transaction(transaction);
@@ -8855,7 +8805,7 @@ public:
     /// Throws lance::Error on failure.
     VersionDetails current_version() const {
         auto* raw = lance_dataset_current_version(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceVersion, lance_version_close> version(raw);
         return read_version(version.get());
     }
@@ -8865,17 +8815,17 @@ public:
     /// must fit i64 nanoseconds; versions() retains millisecond precision.
     std::vector<VersionDetails> version_details() const {
         auto* raw = lance_dataset_versions(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceVersions, lance_versions_close> snap(raw);
 
         uint64_t count = lance_versions_count(snap.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<VersionDetails> out;
         out.reserve(static_cast<size_t>(count));
         for (uint64_t i = 0; i < count; ++i) {
             const LanceVersion* version =
                 lance_versions_at(snap.get(), static_cast<size_t>(i));
-            if (!version) check_error();
+            if (!version) detail::throw_error();
             out.push_back(read_version(version));
         }
         return out;
@@ -8884,17 +8834,17 @@ public:
     /// Lightweight attached-version refs ordered by version id.
     std::vector<uint64_t> version_refs() const {
         auto* raw = lance_dataset_version_refs(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceVersionRefs, lance_version_refs_close> refs(raw);
 
         uint64_t count = lance_version_refs_count(refs.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<uint64_t> out;
         out.reserve(static_cast<size_t>(count));
         for (uint64_t i = 0; i < count; ++i) {
             uint64_t id =
                 lance_version_refs_id_at(refs.get(), static_cast<size_t>(i));
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             out.push_back(id);
         }
         return out;
@@ -8904,7 +8854,7 @@ public:
     Dataset checkout(const Ref& reference) const {
         auto* out = lance_dataset_checkout_ref(
             handle_.get(), reference.c_handle());
-        if (!out) check_error();
+        if (!out) detail::throw_error();
         return Dataset(out);
     }
 
@@ -8941,7 +8891,7 @@ public:
                 reference ? reference->c_handle() : nullptr,
                 storage_options ? storage_options->c_handle() : nullptr,
                 &out) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return Dataset(out);
     }
@@ -8975,7 +8925,7 @@ public:
                 reference ? reference->c_handle() : nullptr,
                 storage_options ? storage_options->c_handle() : nullptr,
                 &out) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return Dataset(out);
     }
@@ -9002,7 +8952,7 @@ public:
             branch_name.c_str(),
             reference.c_handle(),
             storage_opts_ptr);
-        if (!out) check_error();
+        if (!out) detail::throw_error();
         return Dataset(out);
     }
 
@@ -9011,7 +8961,7 @@ public:
     Dataset checkout_branch(const std::string& branch_name) const {
         auto* out =
             lance_dataset_checkout_branch(handle_.get(), branch_name.c_str());
-        if (!out) check_error();
+        if (!out) detail::throw_error();
         return Dataset(out);
     }
 
@@ -9019,30 +8969,21 @@ public:
     /// serde objects; map order is unspecified.
     std::string branches_json() const {
         const char* json = lance_dataset_branches_json(handle_.get());
-        if (!json) check_error();
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            json, lance_free_string);
-        return std::string(json);
+        return detail::take_string(json);
     }
 
     /// JSON object for one native BranchContents value.
     std::string get_branch_json(const std::string& branch_name) const {
         const char* json =
             lance_dataset_branch_get_json(handle_.get(), branch_name.c_str());
-        if (!json) check_error();
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            json, lance_free_string);
-        return std::string(json);
+        return detail::take_string(json);
     }
 
     /// JSON object for this dataset snapshot's native BranchIdentifier.
     std::string branch_identifier_json() const {
         const char* json =
             lance_dataset_branch_identifier_json(handle_.get());
-        if (!json) check_error();
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            json, lance_free_string);
-        return std::string(json);
+        return detail::take_string(json);
     }
 
     /// Delete a branch. Child-branch and tag references surface as
@@ -9050,7 +8991,7 @@ public:
     void delete_branch(const std::string& branch_name) const {
         if (lance_dataset_branch_delete(
                 handle_.get(), branch_name.c_str()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Delete a branch while bypassing only a missing BranchContents. Native
@@ -9058,7 +8999,7 @@ public:
     void force_delete_branch(const std::string& branch_name) const {
         if (lance_dataset_branch_force_delete(
                 handle_.get(), branch_name.c_str()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Replace all metadata entries on a branch. An empty vector writes an
@@ -9070,22 +9011,22 @@ public:
         const char* const* metadata_ptr = metadata.empty() ? nullptr : kv.data();
         if (lance_dataset_branch_replace_metadata(
                 handle_.get(), branch_name.c_str(), metadata_ptr) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Snapshot all tags. Entry order is unspecified.
     std::vector<TagInfo> tags() const {
         auto* raw = lance_dataset_tags(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceTags, lance_tags_close> tags(raw);
 
         uint64_t count = lance_tags_count(tags.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<TagInfo> out;
         out.reserve(static_cast<size_t>(count));
         for (uint64_t i = 0; i < count; ++i) {
             const LanceTag* tag = lance_tags_at(tags.get(), static_cast<size_t>(i));
-            if (!tag) check_error();
+            if (!tag) detail::throw_error();
             out.push_back(read_tag(tag));
         }
         return out;
@@ -9094,7 +9035,7 @@ public:
     /// Fetch one tag by name.
     TagInfo get_tag(const std::string& name) const {
         auto* raw = lance_dataset_tag_get(handle_.get(), name.c_str());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceTag, lance_tag_close> tag(raw);
         return read_tag(tag.get());
     }
@@ -9103,20 +9044,20 @@ public:
     void create_tag(const std::string& name, const Ref& reference) const {
         if (lance_dataset_tag_create(
                 handle_.get(), name.c_str(), reference.c_handle()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Update an existing tag to a native ref. Metadata is preserved natively.
     void update_tag(const std::string& name, const Ref& reference) const {
         if (lance_dataset_tag_update(
                 handle_.get(), name.c_str(), reference.c_handle()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Delete a tag.
     void delete_tag(const std::string& name) const {
         if (lance_dataset_tag_delete(handle_.get(), name.c_str()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Replace all metadata entries on a tag. An empty map writes empty
@@ -9128,7 +9069,7 @@ public:
         const char* const* metadata_ptr = metadata.empty() ? nullptr : kv.data();
         if (lance_dataset_tag_replace_metadata(
                 handle_.get(), name.c_str(), metadata_ptr) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Compute per-field data statistics (compressed on-disk byte size) for
@@ -9136,20 +9077,20 @@ public:
     /// fragment. Throws lance::Error on failure.
     std::vector<FieldStatistics> calculate_data_stats() const {
         auto* raw = lance_dataset_calculate_data_stats(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceDataStatistics, lance_data_statistics_close> snap(raw);
 
         uint64_t n = lance_data_statistics_count(snap.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<FieldStatistics> out;
         out.reserve(static_cast<size_t>(n));
         for (uint64_t i = 0; i < n; i++) {
             FieldStatistics fs;
             fs.id = lance_data_statistics_field_id_at(snap.get(), static_cast<size_t>(i));
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             fs.bytes_on_disk =
                 lance_data_statistics_bytes_on_disk_at(snap.get(), static_cast<size_t>(i));
-            if (lance_last_error_code() != LANCE_OK) check_error();
+            if (lance_last_error_code() != LANCE_OK) detail::throw_error();
             out.push_back(fs);
         }
         return out;
@@ -9175,7 +9116,7 @@ public:
         LanceRemovalStats stats{};
         if (lance_dataset_cleanup_old_versions(
                 handle_.get(), &raw, &stats) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return from_c_removal_stats(stats);
     }
@@ -9198,7 +9139,7 @@ public:
                 &raw_policy,
                 &raw_operation,
                 &stats) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return from_c_removal_stats(stats);
     }
@@ -9218,7 +9159,7 @@ public:
             to_c_cleanup_operation(operation);
         auto* raw = lance_dataset_cleanup_explain(
             handle_.get(), &raw_policy, &raw_operation);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         Handle<LanceCleanupExplanation, lance_cleanup_explanation_close> snap(
             raw);
         return read_cleanup_explanation(snap.get());
@@ -9227,7 +9168,7 @@ public:
     /// Validate native fragments, stable row IDs and indices. Throws
     /// lance::Error on failure.
     void validate() const {
-        if (lance_dataset_validate(handle_.get()) != 0) check_error();
+        if (lance_dataset_validate(handle_.get()) != 0) detail::throw_error();
     }
 
     /// Count rows hidden by deletion files across all fragments.
@@ -9235,7 +9176,7 @@ public:
     uint64_t count_deleted_rows() const {
         uint64_t rows = 0;
         if (lance_dataset_count_deleted_rows(handle_.get(), &rows) != 0)
-            check_error();
+            detail::throw_error();
         return rows;
     }
 
@@ -9246,7 +9187,7 @@ public:
         uint64_t count = 0;
         if (lance_dataset_num_small_files(
                 handle_.get(), max_rows_per_group, &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return count;
     }
@@ -9257,7 +9198,7 @@ public:
     /// Throws lance::Error on failure.
     Dataset restore(uint64_t version) const {
         auto* out = lance_dataset_restore(handle_.get(), version);
-        if (!out) check_error();
+        if (!out) detail::throw_error();
         return Dataset(out);
     }
 
@@ -9271,7 +9212,7 @@ public:
     uint64_t delete_rows(const std::string& predicate) {
         uint64_t num_deleted = 0;
         if (lance_dataset_delete(handle_.get(), predicate.c_str(), &num_deleted) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return num_deleted;
     }
@@ -9304,7 +9245,7 @@ public:
                 val_ptrs.data(),
                 updates.size(),
                 &num_updated) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return num_updated;
     }
@@ -9332,7 +9273,7 @@ public:
         const std::string& right_on) {
         if (lance_dataset_merge(
                 handle_.get(), left_on.c_str(), right_on.c_str(), source) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9362,7 +9303,7 @@ public:
                 source,
                 params,
                 &result) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return result;
     }
@@ -9420,7 +9361,7 @@ public:
                 raw_compacted.empty() ? nullptr : raw_compacted.data(),
                 raw_compacted.size(),
                 &result) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return result;
     }
@@ -9433,7 +9374,7 @@ public:
         const LanceCompactionOptions* options = nullptr) {
         LanceCompactionMetrics metrics{};
         if (lance_dataset_compact_files(handle_.get(), options, &metrics) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return metrics;
     }
@@ -9447,7 +9388,7 @@ public:
                 handle_.get(),
                 options ? options->c_handle() : nullptr,
                 &metrics) != 0)
-            check_error();
+            detail::throw_error();
         return metrics;
     }
 
@@ -9456,7 +9397,7 @@ public:
         const CompactionOptions* options = nullptr) const {
         auto* plan = lance_dataset_plan_compaction(
             handle_.get(), options ? options->c_handle() : nullptr);
-        if (!plan) check_error();
+        if (!plan) detail::throw_error();
         return CompactionPlan(plan);
     }
 
@@ -9474,7 +9415,7 @@ public:
                 raw.size(),
                 options ? options->c_handle() : nullptr,
                 &metrics) != 0)
-            check_error();
+            detail::throw_error();
         return metrics;
     }
 
@@ -9484,7 +9425,7 @@ public:
         if (lance_dataset_optimize_indices(
                 handle_.get(),
                 options ? options->c_handle() : nullptr) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Plan the native distributed index optimization workflow.
@@ -9492,7 +9433,7 @@ public:
         const OptimizeIndicesOptions* options = nullptr) const {
         auto* plan = lance_dataset_plan_optimize_indices(
             handle_.get(), options ? options->c_handle() : nullptr);
-        if (!plan) check_error();
+        if (!plan) detail::throw_error();
         return OptimizeIndicesPlan(plan);
     }
 
@@ -9508,18 +9449,18 @@ public:
                 raw.empty() ? nullptr : raw.data(),
                 raw.size(),
                 options ? options->c_handle() : nullptr) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Migrate manifest paths to native v2 naming through core.
     void migrate_manifest_paths_v2() {
         if (lance_dataset_migrate_manifest_paths_v2(handle_.get()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Delete every row through native `Dataset::truncate_table`.
     void truncate_table() {
-        if (lance_dataset_truncate_table(handle_.get()) != 0) check_error();
+        if (lance_dataset_truncate_table(handle_.get()) != 0) detail::throw_error();
     }
 
     /// Drop columns from the dataset's schema and commit a new manifest.
@@ -9544,7 +9485,7 @@ public:
         // message rather than the misleading "columns must not be NULL".
         if (lance_dataset_drop_columns(
                 handle_.get(), col_ptrs.data(), columns.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9577,7 +9518,7 @@ public:
         }
         if (lance_dataset_alter_columns(
                 handle_.get(), raw.data(), raw.size()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9609,7 +9550,7 @@ public:
         // Rust layer rejects before it indexes the pointer.
         if (lance_dataset_add_columns_sql(
                 handle_.get(), raw.data(), raw.size(), batch_size) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9637,7 +9578,7 @@ public:
         if (lance_dataset_add_columns_batch_udf(
                 handle_.get(), &call.raw, call.read_columns_ptr,
                 call.batch_size_ptr) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9654,7 +9595,7 @@ public:
         if (lance_dataset_add_columns_batch_udf_v2(
                 handle_.get(), &call.raw_v2, call.read_columns_ptr,
                 call.batch_size_ptr) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9669,7 +9610,7 @@ public:
     /// metadata-only and the legacy format cannot represent them that way).
     void add_columns_nulls(const ArrowSchema* schema) {
         if (lance_dataset_add_columns_nulls(handle_.get(), schema) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9692,14 +9633,14 @@ public:
         // before the C call without first arming a stream-release guard.
         if (lance_dataset_add_columns_stream(
                 handle_.get(), stream, batch_size) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
     /// Export the schema as an Arrow C Data Interface struct.
     void schema(ArrowSchema* out) const {
         if (lance_dataset_schema(handle_.get(), out) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9718,7 +9659,7 @@ public:
         const uint32_t* base_id_ptr = base_id ? &*base_id : nullptr;
         if (lance_dataset_create_data_file(
                 handle_.get(), path.c_str(), base_id_ptr, &file) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return DataFile(file);
     }
@@ -9738,7 +9679,7 @@ public:
         const char* const* cols_ptr = columns.empty() ? nullptr : col_ptrs.data();
 
         if (lance_dataset_take(handle_.get(), indices, num_indices, cols_ptr, out) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9746,7 +9687,7 @@ public:
     void take(const uint64_t* indices, size_t num_indices,
               ArrowArrayStream* out) const {
         if (lance_dataset_take(handle_.get(), indices, num_indices, nullptr, out) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9763,7 +9704,7 @@ public:
 
         if (lance_dataset_take_rows(
                 handle_.get(), row_ids, num_row_ids, cols_ptr, out) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9784,7 +9725,7 @@ public:
                    ArrowArrayStream* out) const {
         if (lance_dataset_take_rows(
                 handle_.get(), row_ids, num_row_ids, nullptr, out) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -9807,7 +9748,7 @@ public:
         if (num_row_ids > 0 &&
             lance_dataset_take_blobs(handle_.get(), row_ids, num_row_ids,
                                      column.c_str(), raw.data()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         adopt_blobs(raw, blobs);
         return blobs;
@@ -9826,7 +9767,7 @@ public:
             lance_dataset_take_blobs_by_indices(
                 handle_.get(), indices, num_indices,
                 column.c_str(), raw.data()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         adopt_blobs(raw, blobs);
         return blobs;
@@ -9849,7 +9790,7 @@ public:
         if (lance_dataset_take_blobs_by_addresses(
                 handle_.get(), row_addresses, num_row_addresses,
                 column.c_str(), out) != 0) {
-            check_error();
+            detail::throw_error();
         }
         adopt_blobs(raw, blobs);
         return blobs;
@@ -9881,7 +9822,7 @@ public:
         if (lance_dataset_read_blobs(
                 handle_.get(), column.c_str(), static_cast<int32_t>(selector),
                 rows_ptr, rows.size(), &raw, &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -9918,7 +9859,7 @@ public:
         if (lance_dataset_read_blob_ranges(
                 handle_.get(), column.c_str(), static_cast<int32_t>(selector),
                 requests_ptr, raw_requests.size(), &raw, &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -9976,7 +9917,7 @@ public:
             handle_.get(), column.c_str(), query.c_str(),
             static_cast<int32_t>(match_operator), max_fuzzy_distance,
             static_cast<int32_t>(coverage_mode));
-        if (!context) check_error();
+        if (!context) detail::throw_error();
         return FtsQueryContext(context);
     }
 
@@ -9990,14 +9931,14 @@ public:
         auto* context = lance_dataset_prepare_fts_phrase_query(
             handle_.get(), column.c_str(), query.c_str(), slop,
             static_cast<int32_t>(coverage_mode));
-        if (!context) check_error();
+        if (!context) detail::throw_error();
         return FtsQueryContext(context);
     }
 
     /// Number of fragments in the dataset.
     uint64_t fragment_count() const {
         uint64_t n = lance_dataset_fragment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return n;
     }
 
@@ -10007,7 +9948,7 @@ public:
         std::vector<uint64_t> ids(count);
         if (count > 0) {
             if (lance_dataset_fragment_ids(handle_.get(), ids.data()) != 0)
-                check_error();
+                detail::throw_error();
         }
         return ids;
     }
@@ -10018,7 +9959,7 @@ public:
     Fragment open_fragment(uint64_t fragment_id) const {
         auto* fragment =
             lance_dataset_open_fragment(handle_.get(), fragment_id);
-        if (!fragment) check_error();
+        if (!fragment) detail::throw_error();
         return Fragment(fragment);
     }
 
@@ -10030,7 +9971,7 @@ public:
         const char* name_c = name.empty() ? nullptr : name.c_str();
         if (lance_dataset_create_vector_index(handle_.get(), column.c_str(),
                                                name_c, &params, replace) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Create a vector index from legacy parameters with optional progress.
@@ -10054,7 +9995,7 @@ public:
         if (lance_dataset_create_vector_index_with_progress(
                 handle_.get(), column.c_str(), name_c, &params, callback,
                 callback_ctx, replace) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Create a vector index from additive native options.
@@ -10092,7 +10033,7 @@ public:
         if (lance_dataset_create_scalar_index(handle_.get(), column.c_str(),
                                                name_c, index_type,
                                                json_c, replace) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Create a scalar index with optional progress. A null callback disables
@@ -10112,7 +10053,7 @@ public:
         if (lance_dataset_create_scalar_index_with_progress(
                 handle_.get(), column.c_str(), name_c, index_type, json_c,
                 callback, callback_ctx, replace) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Create a scalar index with the additive native train control.
@@ -10135,7 +10076,7 @@ public:
         if (lance_dataset_create_scalar_index_with_options(
                 handle_.get(), column.c_str(), name_c, index_type, json_c,
                 &scalar_options, replace) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Create a scalar index with native train controls and optional progress.
@@ -10162,7 +10103,7 @@ public:
         if (lance_dataset_create_scalar_index_with_options_and_progress(
                 handle_.get(), column.c_str(), name_c, index_type, json_c,
                 &scalar_options, callback, callback_ctx, replace) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Create a single-use builder for an uncommitted scalar index segment.
@@ -10259,7 +10200,7 @@ public:
     /// Drop an index by name.
     void drop_index(const std::string& name) {
         if (lance_dataset_drop_index(handle_.get(), name.c_str()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Synchronously prewarm all segments of an index in this snapshot.
@@ -10267,7 +10208,7 @@ public:
     /// Throws lance::Error on failure, including an absent or empty index name.
     void prewarm_index(const std::string& index_name) const {
         if (lance_dataset_prewarm_index(handle_.get(), index_name.c_str()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Prewarm selected segments with native FTS position controls.
@@ -10286,23 +10227,20 @@ public:
         }
         if (lance_dataset_prewarm_index_with_options(
                 handle_.get(), index_name.c_str(), &prewarm) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Number of user indexes (excludes system indexes).
     uint64_t index_count() const {
         uint64_t n = lance_dataset_index_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return n;
     }
 
     /// JSON array describing all user indexes.
     std::string list_indices_json() const {
         const char* json = lance_dataset_index_list_json(handle_.get());
-        if (!json) check_error();
-        std::string out(json);
-        lance_free_string(json);
-        return out;
+        return detail::take_string(json);
     }
 
     /// JSON array with one entry per non-system physical index segment.
@@ -10312,10 +10250,7 @@ public:
     /// recorded. Throws lance::Error on failure.
     std::string index_segments_json() const {
         const char* json = lance_dataset_index_segments_json(handle_.get());
-        if (!json) check_error();
-        std::string out(json);
-        lance_free_string(json);
-        return out;
+        return detail::take_string(json);
     }
 
     /// Merge distributed Inverted index files. Files only; does not commit.
@@ -10329,7 +10264,7 @@ public:
                 handle_.get(), index_uuid.data(), index_type.c_str(),
                 batch_readhead.has_value(), batch_readhead.value_or(0), callback,
                 callback_ctx) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Merge existing uncommitted segments into one uncommitted segment.
@@ -10353,7 +10288,7 @@ public:
                 handle_.get(), bytes.empty() ? nullptr : bytes.data(),
                 lens.empty() ? nullptr : lens.data(), bytes.size(), &output,
                 &output_len) != 0)
-            check_error();
+            detail::throw_error();
         guard.bytes = output;
         if (!output || output_len == 0) {
             throw Error(LANCE_ERR_INTERNAL,
@@ -10366,7 +10301,7 @@ public:
     /// Throws lance::Error with code NotFound if the index does not exist.
     uint64_t index_segment_count(const std::string& index_name) const {
         uint64_t n = lance_dataset_index_segment_count(handle_.get(), index_name.c_str());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return n;
     }
 
@@ -10382,7 +10317,7 @@ public:
         if (lance_dataset_index_segments(handle_.get(), index_name.c_str(),
                                           reinterpret_cast<uint8_t*>(out.data()),
                                           static_cast<size_t>(count), &written) != 0)
-            check_error();
+            detail::throw_error();
         out.resize(static_cast<size_t>(written));
         return out;
     }
@@ -10419,7 +10354,7 @@ public:
         if (lance_dataset_commit_index_segments(
                 handle_.get(), index_name.c_str(), column.c_str(), bytes.data(),
                 lens.data(), segment_metadata.size()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Access the underlying C handle (does not transfer ownership).
@@ -10457,7 +10392,7 @@ public:
         auto* raw = handle_.release();
         ArrowArrayStream stream{};
         if (lance_sql_query_into_stream(raw, &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -10484,7 +10419,7 @@ public:
     SqlQueryBuilder& table_name(const std::string& name) {
         if (lance_sql_query_builder_set_table_name(handle_.get(),
                                                     name.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10494,7 +10429,7 @@ public:
     SqlQueryBuilder& with_row_id(bool enabled = true) {
         if (lance_sql_query_builder_set_with_row_id(handle_.get(), enabled) !=
             0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10504,7 +10439,7 @@ public:
     SqlQueryBuilder& with_row_addr(bool enabled = true) {
         if (lance_sql_query_builder_set_with_row_addr(handle_.get(), enabled) !=
             0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10513,7 +10448,7 @@ public:
     SqlQueryBuilder& blob_handling(LanceBlobHandling handling) {
         if (lance_sql_query_builder_set_blob_handling(handle_.get(),
                                                        handling) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10522,7 +10457,7 @@ public:
     /// validates the value's range on build.
     SqlQueryBuilder& batch_size(uint64_t rows) {
         if (lance_sql_query_builder_set_batch_size(handle_.get(), rows) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10531,7 +10466,7 @@ public:
     SqlQueryBuilder& batch_size_bytes(uint64_t bytes) {
         if (lance_sql_query_builder_set_batch_size_bytes(handle_.get(),
                                                          bytes) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10543,7 +10478,7 @@ public:
         auto* raw = handle_.release();
         LanceSqlQuery* query = nullptr;
         if (lance_sql_query_builder_build(raw, &query) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return SqlQuery(query);
     }
@@ -10578,7 +10513,7 @@ public:
         size_t count = 0;
         if (lance_dataset_delta_list_transactions(handle_.get(), &transactions,
                                                    &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         auto free_transactions = [count](LanceTransaction** items) {
             lance_transaction_array_free(items, count);
@@ -10602,7 +10537,7 @@ public:
     ArrowStream get_inserted_rows() const {
         ArrowArrayStream stream{};
         if (lance_dataset_delta_get_inserted_rows(handle_.get(), &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -10614,7 +10549,7 @@ public:
     ArrowStream get_updated_rows() const {
         ArrowArrayStream stream{};
         if (lance_dataset_delta_get_updated_rows(handle_.get(), &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -10626,7 +10561,7 @@ public:
     ArrowStream get_upserted_rows() const {
         ArrowArrayStream stream{};
         if (lance_dataset_delta_get_upserted_rows(handle_.get(), &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -10639,7 +10574,7 @@ public:
     ArrowStream get_deleted_row_ids() const {
         ArrowArrayStream stream{};
         if (lance_dataset_delta_get_deleted_row_ids(handle_.get(), &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -10665,7 +10600,7 @@ public:
     DatasetDeltaBuilder& compared_against_version(uint64_t version) {
         if (lance_dataset_delta_builder_set_compared_against_version(
                 handle_.get(), version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10675,7 +10610,7 @@ public:
     DatasetDeltaBuilder& begin_version(uint64_t version) {
         if (lance_dataset_delta_builder_set_begin_version(handle_.get(),
                                                            version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10684,7 +10619,7 @@ public:
     DatasetDeltaBuilder& end_version(uint64_t version) {
         if (lance_dataset_delta_builder_set_end_version(handle_.get(),
                                                          version) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10695,7 +10630,7 @@ public:
     DatasetDeltaBuilder& begin_timestamp(const LanceDeltaTimestamp& timestamp) {
         if (lance_dataset_delta_builder_set_begin_timestamp(handle_.get(),
                                                              &timestamp) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10704,7 +10639,7 @@ public:
     DatasetDeltaBuilder& end_timestamp(const LanceDeltaTimestamp& timestamp) {
         if (lance_dataset_delta_builder_set_end_timestamp(handle_.get(),
                                                            &timestamp) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return *this;
     }
@@ -10717,7 +10652,7 @@ public:
         auto* raw = handle_.release();
         LanceDatasetDelta* delta = nullptr;
         if (lance_dataset_delta_builder_build(raw, &delta) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return DatasetDelta(delta);
     }
@@ -10730,7 +10665,7 @@ inline LanceSchema Dataset::native_schema() const {
 inline LanceSchema LanceSchema::from_dataset(const Dataset& dataset) {
     ::LanceSchema* raw = nullptr;
     if (lance_dataset_schema_clone(dataset.c_handle(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return LanceSchema(raw);
 }
@@ -10739,14 +10674,14 @@ inline CompactionOptions CompactionOptions::from_dataset(
     const Dataset& dataset) {
     auto* options =
         lance_compaction_options_v2_from_dataset(dataset.c_handle());
-    if (!options) check_error();
+    if (!options) detail::throw_error();
     return CompactionOptions(options);
 }
 
 inline RewriteResult CompactionTask::execute(const Dataset& dataset) const {
     auto* result =
         lance_compaction_task_execute(dataset.c_handle(), handle_.get());
-    if (!result) check_error();
+    if (!result) detail::throw_error();
     return RewriteResult(result);
 }
 
@@ -10755,7 +10690,7 @@ inline std::optional<IndexSegmentResult> OptimizeIndexTask::execute(
     LanceIndexSegmentResult* result = nullptr;
     if (lance_optimize_index_task_execute(
             dataset.c_handle(), handle_.get(), &result) != 0)
-        check_error();
+        detail::throw_error();
     if (!result) return std::nullopt;
     return IndexSegmentResult(result);
 }
@@ -10773,7 +10708,7 @@ inline std::optional<IndexSegmentResult> OptimizeIndexMerge::execute(
             raw.empty() ? nullptr : raw.data(),
             raw.size(),
             &result) != 0)
-        check_error();
+        detail::throw_error();
     if (!result) return std::nullopt;
     return IndexSegmentResult(result);
 }
@@ -10784,9 +10719,9 @@ struct BatchCommitResult {
     Dataset dataset;
     Transaction transaction;
 
-    BatchCommitResult(Dataset&& dataset, Transaction&& transaction)
-        : dataset(std::move(dataset)),
-          transaction(std::move(transaction)) {}
+    BatchCommitResult(Dataset&& dataset_value, Transaction&& transaction_value)
+        : dataset(std::move(dataset_value)),
+          transaction(std::move(transaction_value)) {}
 
     BatchCommitResult(BatchCommitResult&&) noexcept = default;
     BatchCommitResult& operator=(BatchCommitResult&&) noexcept = default;
@@ -10823,7 +10758,7 @@ inline BatchCommitResult Dataset::commit_batch(
             session ? session->c_handle() : nullptr,
             &dataset,
             &merged) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!dataset || !merged) {
         if (dataset) lance_dataset_close(dataset);
@@ -10860,7 +10795,7 @@ inline BatchCommitResult Dataset::commit_batch_with_accessor(
             session ? session->c_handle() : nullptr,
             &dataset,
             &merged) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!dataset || !merged) {
         if (dataset) lance_dataset_close(dataset);
@@ -10900,7 +10835,7 @@ inline BatchCommitResult Dataset::commit_batch_with_commit_lock(
             commit_lock ? commit_lock->c_handle() : nullptr,
             &dataset,
             &merged) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!dataset || !merged) {
         if (dataset) lance_dataset_close(dataset);
@@ -10995,7 +10930,7 @@ public:
 
     bool has_centroids() const {
         bool value = lance_ivf_model_has_centroids(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
@@ -11005,19 +10940,19 @@ public:
         ArrowArray array = {};
         ArrowSchema schema = {};
         if (lance_ivf_model_export_centroids(handle_.get(), &array, &schema) != 0)
-            check_error();
+            detail::throw_error();
         return IndexModel(array, schema);
     }
 
     uint64_t num_partitions() const {
         uint64_t value = lance_ivf_model_num_partitions(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
     uint64_t dimension() const {
         uint64_t value = lance_ivf_model_dimension(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
@@ -11025,7 +10960,7 @@ public:
     uint64_t partition_size(uint64_t partition_id) const {
         uint64_t value =
             lance_ivf_model_partition_size(handle_.get(), partition_id);
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return value;
     }
 
@@ -11179,7 +11114,7 @@ public:
     static IndexSegmentMetadata parse(const uint8_t* bytes, size_t len) {
         LanceIndexSegmentMetadata* metadata = nullptr;
         if (lance_index_segment_metadata_parse(bytes, len, &metadata) != 0)
-            check_error();
+            detail::throw_error();
         if (!metadata) {
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_index_segment_metadata_parse returned success with null metadata");
@@ -11195,52 +11130,52 @@ public:
     std::array<uint8_t, 16> uuid() const {
         std::array<uint8_t, 16> out = {};
         if (lance_index_segment_metadata_uuid(handle_.get(), out.data()) != 0)
-            check_error();
+            detail::throw_error();
         return out;
     }
 
     std::string name() const {
         const char* value = lance_index_segment_metadata_name(handle_.get());
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return std::string(value);
     }
 
     uint64_t dataset_version() const {
         uint64_t version =
             lance_index_segment_metadata_dataset_version(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return version;
     }
 
     int32_t index_version() const {
         int32_t version =
             lance_index_segment_metadata_index_version(handle_.get());
-        if (version < 0) check_error();
+        if (version < 0) detail::throw_error();
         return version;
     }
 
     int32_t index_type() const {
         int32_t type = lance_index_segment_metadata_index_type(handle_.get());
-        if (type < 0) check_error();
+        if (type < 0) detail::throw_error();
         return type;
     }
 
     std::string index_details_type_url() const {
         const char* value =
             lance_index_segment_metadata_index_details_type_url(handle_.get());
-        if (!value) check_error();
+        if (!value) detail::throw_error();
         return std::string(value);
     }
 
     std::vector<int32_t> field_ids() const {
         size_t count = lance_index_segment_metadata_field_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         std::vector<int32_t> out(count);
         size_t written = 0;
         if (lance_index_segment_metadata_field_ids(
                 handle_.get(), out.data(), out.size(), &written) != 0)
-            check_error();
+            detail::throw_error();
         out.resize(written);
         return out;
     }
@@ -11248,13 +11183,13 @@ public:
     std::vector<uint32_t> fragment_ids() const {
         size_t count =
             lance_index_segment_metadata_fragment_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         std::vector<uint32_t> out(count);
         size_t written = 0;
         if (lance_index_segment_metadata_fragment_ids(
                 handle_.get(), out.data(), out.size(), &written) != 0)
-            check_error();
+            detail::throw_error();
         out.resize(written);
         return out;
     }
@@ -11263,7 +11198,7 @@ public:
     IndexSegmentMetadata clone() const {
         LanceIndexSegmentMetadata* raw =
             lance_index_segment_metadata_clone(handle_.get());
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return IndexSegmentMetadata(raw);
     }
 
@@ -11281,7 +11216,7 @@ public:
             raw = lance_index_segment_metadata_clone_with_fragment_ids(
                 handle_.get(), false, nullptr, 0);
         }
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return IndexSegmentMetadata(raw);
     }
 
@@ -11300,7 +11235,7 @@ public:
         size_t len = 0;
         if (lance_index_segment_metadata_encode(handle_.get(), &guard.bytes,
                                                 &len) != 0)
-            check_error();
+            detail::throw_error();
         if (!guard.bytes || len == 0) {
             throw Error(
                 LANCE_ERR_INTERNAL,
@@ -11312,7 +11247,7 @@ public:
     std::vector<int32_t> covering_field_ids() const {
         size_t count =
             lance_index_segment_metadata_covering_field_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         std::vector<int32_t> out;
         out.reserve(count);
@@ -11320,7 +11255,7 @@ public:
             int32_t field_id = 0;
             if (lance_index_segment_metadata_covering_field_id_at(
                     handle_.get(), i, &field_id) != 0)
-                check_error();
+                detail::throw_error();
             out.push_back(field_id);
         }
         return out;
@@ -11333,25 +11268,25 @@ public:
         const uint8_t* bytes =
             lance_index_segment_metadata_index_details_value(handle_.get(),
                                                               &len);
-        if (!bytes) check_error();
+        if (!bytes) detail::throw_error();
         if (len == 0) return {};
         return std::vector<uint8_t>(bytes, bytes + len);
     }
 
     std::vector<IndexSegmentFile> files() const {
         size_t count = lance_index_segment_metadata_file_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
 
         std::vector<IndexSegmentFile> out;
         out.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             const char* path =
                 lance_index_segment_metadata_file_path_at(handle_.get(), i);
-            if (!path) check_error();
+            if (!path) detail::throw_error();
             uint64_t size = 0;
             if (lance_index_segment_metadata_file_size_at(
                     handle_.get(), i, &size) != 0)
-                check_error();
+                detail::throw_error();
             out.push_back(IndexSegmentFile{path, size});
         }
         return out;
@@ -11361,7 +11296,7 @@ public:
         LanceOptionalTimestamp timestamp{};
         if (lance_index_segment_metadata_created_at(handle_.get(),
                                                     &timestamp) != 0)
-            check_error();
+            detail::throw_error();
         if (!timestamp.is_set) return std::nullopt;
         return IndexTimestamp{timestamp.unix_seconds, timestamp.nanos};
     }
@@ -11371,7 +11306,7 @@ public:
         uint32_t base_id = 0;
         if (lance_index_segment_metadata_base_id(handle_.get(), &is_set,
                                                  &base_id) != 0)
-            check_error();
+            detail::throw_error();
         if (!is_set) return std::nullopt;
         return base_id;
     }
@@ -11381,13 +11316,13 @@ public:
 
 inline IndexSegmentMetadata IndexSegmentResult::segment() const {
     auto* metadata = lance_index_segment_result_segment(handle_.get());
-    if (!metadata) check_error();
+    if (!metadata) detail::throw_error();
     return IndexSegmentMetadata(metadata);
 }
 
 inline IndexSegmentMetadata OptimizeIndexTask::reference() const {
     auto* metadata = lance_optimize_index_task_reference(handle_.get());
-    if (!metadata) check_error();
+    if (!metadata) detail::throw_error();
     return IndexSegmentMetadata(metadata);
 }
 
@@ -11395,7 +11330,7 @@ inline IndexSegmentMetadata OptimizeIndexTask::old_segment(
     size_t index) const {
     auto* metadata =
         lance_optimize_index_task_old_segment_at(handle_.get(), index);
-    if (!metadata) check_error();
+    if (!metadata) detail::throw_error();
     return IndexSegmentMetadata(metadata);
 }
 
@@ -11403,7 +11338,7 @@ inline IndexSegmentMetadata OptimizeIndexMerge::old_segment(
     size_t index) const {
     auto* metadata =
         lance_optimize_index_merge_old_segment_at(handle_.get(), index);
-    if (!metadata) check_error();
+    if (!metadata) detail::throw_error();
     return IndexSegmentMetadata(metadata);
 }
 
@@ -11431,14 +11366,14 @@ inline Operation Operation::make_create_index(
 
     LanceOperation* operation = lance_operation_create_index_new(
         new_raw.data(), new_raw.size(), removed_raw.data(), removed_raw.size());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
 inline std::vector<IndexSegmentMetadata> Operation::create_index_new() const {
     uint64_t count = 0;
     if (lance_operation_create_index_new_count(handle_.get(), &count) != 0)
-        check_error();
+        detail::throw_error();
 
     std::vector<IndexSegmentMetadata> out;
     out.reserve(static_cast<size_t>(count));
@@ -11446,7 +11381,7 @@ inline std::vector<IndexSegmentMetadata> Operation::create_index_new() const {
         LanceIndexSegmentMetadata* metadata = nullptr;
         if (lance_operation_create_index_new_at(
                 handle_.get(), static_cast<size_t>(i), &metadata) != 0)
-            check_error();
+            detail::throw_error();
         if (!metadata) {
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_operation_create_index_new_at returned success "
@@ -11460,7 +11395,7 @@ inline std::vector<IndexSegmentMetadata> Operation::create_index_new() const {
 inline std::vector<IndexSegmentMetadata> Operation::create_index_removed() const {
     uint64_t count = 0;
     if (lance_operation_create_index_removed_count(handle_.get(), &count) != 0)
-        check_error();
+        detail::throw_error();
 
     std::vector<IndexSegmentMetadata> out;
     out.reserve(static_cast<size_t>(count));
@@ -11468,7 +11403,7 @@ inline std::vector<IndexSegmentMetadata> Operation::create_index_removed() const
         LanceIndexSegmentMetadata* metadata = nullptr;
         if (lance_operation_create_index_removed_at(
                 handle_.get(), static_cast<size_t>(i), &metadata) != 0)
-            check_error();
+            detail::throw_error();
         if (!metadata) {
             throw Error(LANCE_ERR_INTERNAL,
                         "lance_operation_create_index_removed_at returned "
@@ -11509,7 +11444,7 @@ public:
         size_t len = 0;
         if (lance_index_segment_builder_execute_uncommitted(
                 handle_.get(), &guard.bytes, &len) != 0)
-            check_error();
+            detail::throw_error();
         if (!guard.bytes || len == 0) {
             throw Error(
                 LANCE_ERR_INTERNAL,
@@ -11536,7 +11471,7 @@ public:
                                            void* callback_ctx) {
         if (lance_index_segment_builder_set_progress_callback(handle_.get(), callback,
                                                               callback_ctx) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -11554,7 +11489,7 @@ inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder(
     auto* builder = lance_index_segment_builder_new_scalar(
         handle_.get(), column.c_str(), index_name_c,
         static_cast<int32_t>(index_type), params_json_c, options);
-    if (!builder) check_error();
+    if (!builder) detail::throw_error();
     return IndexSegmentBuilder(builder);
 }
 
@@ -11576,7 +11511,7 @@ inline IndexSegmentBuilder Dataset::new_scalar_index_segment_builder_with_option
         handle_.get(), column.c_str(), index_name_c,
         static_cast<int32_t>(index_type), params_json_c, &scalar_options,
         build_options);
-    if (!builder) check_error();
+    if (!builder) detail::throw_error();
     return IndexSegmentBuilder(builder);
 }
 
@@ -11599,7 +11534,7 @@ inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder(
     };
     auto* builder = lance_index_segment_builder_new_vector(
         handle_.get(), column.c_str(), index_name_c, &segment_params, options);
-    if (!builder) check_error();
+    if (!builder) detail::throw_error();
     return IndexSegmentBuilder(builder);
 }
 
@@ -11612,7 +11547,7 @@ inline void Dataset::create_vector_index_with_options(
     const char* name_c = name.empty() ? nullptr : name.c_str();
     if (lance_dataset_create_vector_index_with_options(
             handle_.get(), column.c_str(), name_c, storage.get(), replace) != 0) {
-        check_error();
+        detail::throw_error();
     }
 }
 
@@ -11628,7 +11563,7 @@ inline void Dataset::create_vector_index_with_options_and_progress(
     if (lance_dataset_create_vector_index_with_options_and_progress(
             handle_.get(), column.c_str(), name_c, storage.get(), callback,
             callback_ctx, replace) != 0) {
-        check_error();
+        detail::throw_error();
     }
 }
 
@@ -11655,7 +11590,7 @@ inline IndexSegmentBuilder Dataset::new_vector_index_segment_builder_with_option
         (fragment_ids || index_uuid) ? &scope : nullptr;
     auto* builder = lance_index_segment_builder_new_vector_with_options(
         handle_.get(), column.c_str(), index_name_c, storage.get(), scope_ptr);
-    if (!builder) check_error();
+    if (!builder) detail::throw_error();
     return IndexSegmentBuilder(builder);
 }
 
@@ -11671,7 +11606,7 @@ inline IndexModel Dataset::train_ivf_model(
             handle_.get(), column.c_str(), num_partitions,
             static_cast<int32_t>(metric), ids,
             fragment_ids.size(), &array, &schema) != 0)
-        check_error();
+        detail::throw_error();
     return IndexModel(array, schema);
 }
 
@@ -11689,7 +11624,7 @@ inline IndexModel Dataset::train_pq_model(
             handle_.get(), column.c_str(), num_sub_vectors, num_bits,
             static_cast<int32_t>(metric), ids, fragment_ids.size(),
             ivf_centroids.array(), ivf_centroids.schema(), &array, &schema) != 0)
-        check_error();
+        detail::throw_error();
     return IndexModel(array, schema);
 }
 
@@ -11715,7 +11650,7 @@ inline IndexModel Dataset::train_ivf_model_with_options(
             handle_.get(), column.c_str(), num_partitions,
             static_cast<int32_t>(metric), ids, fragment_ids.size(), &trainer,
             &array, &schema) != 0)
-        check_error();
+        detail::throw_error();
     return IndexModel(array, schema);
 }
 
@@ -11744,32 +11679,26 @@ inline IndexModel Dataset::train_pq_model_with_options(
             static_cast<int32_t>(metric), ids, fragment_ids.size(),
             ivf_centroids.array(), ivf_centroids.schema(), &trainer, &array,
             &schema) != 0)
-        check_error();
+        detail::throw_error();
     return IndexModel(array, schema);
 }
 
 inline std::string Dataset::describe_indices_json() const {
     const char* json = lance_dataset_describe_indices_json(handle_.get());
-    if (!json) check_error();
-    std::unique_ptr<const char, void (*)(const char*)> guard(json,
-                                                             lance_free_string);
-    return std::string(json);
+    return detail::take_string(json);
 }
 
 inline std::string Dataset::index_statistics_json(
     const std::string& index_name) {
     const char* json = lance_dataset_index_statistics_json(
         handle_.get(), index_name.c_str());
-    if (!json) check_error();
-    std::unique_ptr<const char, void (*)(const char*)> guard(json,
-                                                             lance_free_string);
-    return std::string(json);
+    return detail::take_string(json);
 }
 
 inline IvfModel Dataset::get_ivf_model(const std::string& index_name) const {
     auto* model =
         lance_dataset_get_ivf_model(handle_.get(), index_name.c_str());
-    if (!model) check_error();
+    if (!model) detail::throw_error();
     return IvfModel(model);
 }
 
@@ -11786,7 +11715,7 @@ inline ArrowStream Dataset::read_index_partition(
     if (lance_dataset_read_index_partition(
             handle_.get(), index_name.c_str(), partition_id, with_vector,
             &stream) != 0)
-        check_error();
+        detail::throw_error();
     if (!stream.release) {
         throw Error(LANCE_ERR_INTERNAL,
                     "lance_dataset_read_index_partition returned an empty stream");
@@ -11812,19 +11741,6 @@ struct ProjectionColumn {
 class Scanner {
     Handle<LanceScanner, lance_scanner_close> handle_;
 
-    static std::string take_owned_string(const char* raw) {
-        if (!raw) {
-            if (lance_last_error_code() == LANCE_OK) {
-                throw Error(LANCE_ERR_INTERNAL,
-                            "scanner plan API returned NULL without an error");
-            }
-            check_error();
-        }
-        std::unique_ptr<const char, void (*)(const char*)> guard(
-            raw, lance_free_string);
-        return std::string(raw);
-    }
-
 public:
     friend class Fragment;
 
@@ -11833,63 +11749,63 @@ public:
     /// Set the row limit.
     Scanner& limit(int64_t n) {
         if (lance_scanner_set_limit(handle_.get(), n) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set the row offset.
     Scanner& offset(int64_t n) {
         if (lance_scanner_set_offset(handle_.get(), n) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set the batch size.
     Scanner& batch_size(int64_t n) {
         if (lance_scanner_set_batch_size(handle_.get(), n) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set the target output batch size in bytes.
     Scanner& batch_size_bytes(uint64_t bytes) {
         if (lance_scanner_set_batch_size_bytes(handle_.get(), bytes) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set the scanner I/O buffer size in bytes, in the range [1, INT64_MAX].
     Scanner& io_buffer_size(uint64_t bytes) {
         if (lance_scanner_set_io_buffer_size(handle_.get(), bytes) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set the number of batches decoded concurrently.
     Scanner& batch_readahead(size_t batches) {
         if (lance_scanner_set_batch_readahead(handle_.get(), batches) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set fragment readahead for unordered scans.
     Scanner& fragment_readahead(size_t fragments) {
         if (lance_scanner_set_fragment_readahead(handle_.get(), fragments) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Set the target number of physical execution partitions.
     Scanner& target_parallelism(size_t partitions) {
         if (lance_scanner_set_target_parallelism(handle_.get(), partitions) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Configure whether batches are returned in storage order.
     Scanner& scan_in_order(bool ordered = true) {
         if (lance_scanner_set_scan_in_order(handle_.get(), ordered) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -11897,28 +11813,28 @@ public:
     /// False also disables explicit scalar segment search, retaining its fragment domain.
     Scanner& use_scalar_index(bool enable = true) {
         if (lance_scanner_set_use_scalar_index(handle_.get(), enable) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Configure whether row-based output batches are strict.
     Scanner& strict_batch_size(bool strict_batch_size = true) {
         if (lance_scanner_set_strict_batch_size(handle_.get(), strict_batch_size) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Configure whether file statistics may optimize the scan.
     Scanner& use_stats(bool use_stats = true) {
         if (lance_scanner_set_use_stats(handle_.get(), use_stats) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Clear the projection and scan all dataset columns (native unset).
     Scanner& project(std::nullopt_t) {
         if (lance_scanner_set_projection(handle_.get(), nullptr, 0) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -11938,14 +11854,14 @@ public:
         const LanceProjectionColumn* data =
             native.empty() ? &explicit_empty : native.data();
         if (lance_scanner_set_projection(handle_.get(), data, native.size()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Stop adding `_score` / `_distance` to explicit search projections.
     Scanner& disable_scoring_autoprojection() {
         if (lance_scanner_disable_scoring_autoprojection(handle_.get()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -11955,7 +11871,7 @@ public:
     /// nearest_multivector(); that scan fails on start.
     Scanner& order_by(std::nullopt_t) {
         if (lance_scanner_set_order_by(handle_.get(), nullptr, 0) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -11973,7 +11889,7 @@ public:
         const LanceColumnOrdering* data =
             native.empty() ? &explicit_empty : native.data();
         if (lance_scanner_set_order_by(handle_.get(), data, native.size()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -11981,7 +11897,7 @@ public:
     /// columns, bytes for every other binary column).
     Scanner& blob_handling(LanceBlobHandling handling) {
         if (lance_scanner_set_blob_handling(handle_.get(), handling) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12000,21 +11916,21 @@ public:
             column_ptrs.empty() ? nullptr : column_ptrs.data();
         if (lance_scanner_set_materialization_style(
                 handle_.get(), style, columns, column_ptrs.size()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Include or omit the `_rowaddr` metadata column.
     Scanner& with_row_address(bool enable = true) {
         if (lance_scanner_with_row_address(handle_.get(), enable) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12023,7 +11939,7 @@ public:
     /// Incompatible with scalar_index_segment. See lance.h.
     Scanner& include_deleted_rows(bool include_deleted_rows = true) {
         if (lance_scanner_set_include_deleted_rows(handle_.get(), include_deleted_rows) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12034,7 +11950,7 @@ public:
     /// use_scalar_index(false) selects the scoped fallback without searching the segment.
     Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12042,13 +11958,13 @@ public:
     /// Applies only to scalar_index_segment scans; fragment_ids remains required. Disabled by default.
     Scanner& scalar_index_auto_selection(bool enabled = true) {
         if (lance_scanner_set_scalar_index_auto_selection(handle_.get(), enabled) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     Scanner& clear_scalar_index_segment() {
         if (lance_scanner_set_scalar_index_segment(handle_.get(), nullptr) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12056,7 +11972,7 @@ public:
     /// queries, they limit candidates before Top-K regardless of prefilter().
     Scanner& fragment_ids(const uint64_t* ids, size_t len) {
         if (lance_scanner_set_fragment_ids(handle_.get(), ids, len) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12069,7 +11985,7 @@ public:
     /// (applied before ranking). `len == 0` allows no rows.
     Scanner& row_addr_allowlist(const uint64_t* row_ids, size_t len) {
         if (lance_scanner_set_row_addr_allowlist(handle_.get(), row_ids, len) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12081,7 +11997,7 @@ public:
     /// Exclude rows whose `_rowid` is in `row_ids` (applied before ranking).
     Scanner& row_addr_blocklist(const uint64_t* row_ids, size_t len) {
         if (lance_scanner_set_row_addr_blocklist(handle_.get(), row_ids, len) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12094,7 +12010,7 @@ public:
     /// Wins over any SQL filter passed to the Scanner constructor.
     Scanner& substrait_filter(const uint8_t* bytes, size_t len) {
         if (lance_scanner_set_substrait_filter(handle_.get(), bytes, len) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12108,7 +12024,7 @@ public:
     /// previous aggregate. Count and analyze-count replace it with COUNT(*).
     Scanner& substrait_aggregate(const uint8_t* bytes, size_t len) {
         if (lance_scanner_set_substrait_aggregate(handle_.get(), bytes, len) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12120,7 +12036,7 @@ public:
     /// Add an SQL filter that is combined with the selected primary filter using AND.
     Scanner& additional_sql_filter(const std::string& filter) {
         if (lance_scanner_additional_sql_filter(handle_.get(), filter.c_str()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12143,7 +12059,7 @@ public:
     /// `lance_scanner_poll_next` call returns.
     Scanner& statistics_callback(LanceScanStatisticsCallback callback, void* callback_ctx) {
         if (lance_scanner_set_statistics_callback(handle_.get(), callback, callback_ctx) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12152,7 +12068,7 @@ public:
     /// (total bytes = `len * 16`). Pass len=0 (and any pointer) to clear.
     Scanner& index_segments(const uint8_t* uuids, size_t len) {
         if (lance_scanner_set_index_segments(handle_.get(), uuids, len) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12167,19 +12083,20 @@ public:
     /// `out` is caller-owned; release it exactly once on success.
     void schema(ArrowSchema* out) const {
         if (lance_scanner_schema(handle_.get(), out) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Explain the configured native plan without executing it.
     std::string explain_plan(bool verbose = false) const {
-        return take_owned_string(
+        return detail::take_string(
             lance_scanner_explain_plan(handle_.get(), verbose));
     }
 
     /// Execute and format the configured native plan with runtime metrics.
     /// Does not consume or advance an existing stream.
     std::string analyze_plan() const {
-        return take_owned_string(lance_scanner_analyze_plan(handle_.get()));
+        return detail::take_string(
+            lance_scanner_analyze_plan(handle_.get()));
     }
 
     /// Execute the native COUNT(*) plan for this scanner. Native aggregate
@@ -12187,13 +12104,13 @@ public:
     /// on failure.
     uint64_t count_rows() const {
         uint64_t count = lance_scanner_count_rows(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         return count;
     }
 
     /// Execute and format the native COUNT(*) plan, not the ordinary plan.
     std::string analyze_count_plan() const {
-        return take_owned_string(
+        return detail::take_string(
             lance_scanner_analyze_count_plan(handle_.get()));
     }
 
@@ -12201,7 +12118,7 @@ public:
     /// `out` is caller-owned; call its non-null `release` callback exactly once.
     void to_arrow_stream(ArrowArrayStream* out) {
         if (lance_scanner_to_arrow_stream(handle_.get(), out) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     /// Start an async scan with a non-null callback. On success, the callback's
@@ -12220,7 +12137,7 @@ public:
     Scanner& nearest(const std::string& column, const float* q, size_t dim, uint32_t k) {
         if (lance_scanner_nearest(handle_.get(), column.c_str(),
                                    q, dim, LANCE_DTYPE_FLOAT32, k) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12229,7 +12146,7 @@ public:
                      LanceDataType dtype, uint32_t k) {
         if (lance_scanner_nearest(handle_.get(), column.c_str(),
                                    q, dim, dtype, k) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12243,7 +12160,7 @@ public:
         if (lance_scanner_set_distance_range(handle_.get(),
                                             lower_bound ? &*lower_bound : nullptr,
                                             upper_bound ? &*upper_bound : nullptr) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12253,7 +12170,7 @@ public:
                            LanceDataType element_type, uint32_t k) {
         if (lance_scanner_nearest_batch(handle_.get(), column.c_str(), query_data,
                                        dimension, num_queries, element_type, k) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12269,54 +12186,54 @@ public:
                                 LanceDataType element_type, uint32_t k) {
         if (lance_scanner_nearest_multivector(handle_.get(), column.c_str(), query_data,
                                             dimension, num_vectors, element_type, k) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
     /// Replace both minimum and maximum partition-search bounds.
     Scanner& nprobes(uint32_t nprobes) {
-        if (lance_scanner_set_nprobes(handle_.get(), nprobes) != 0) check_error();
+        if (lance_scanner_set_nprobes(handle_.get(), nprobes) != 0) detail::throw_error();
         return *this;
     }
     /// Replace only the minimum partition-search bound.
     Scanner& minimum_nprobes(uint32_t minimum_nprobes) {
-        if (lance_scanner_set_minimum_nprobes(handle_.get(), minimum_nprobes) != 0) check_error();
+        if (lance_scanner_set_minimum_nprobes(handle_.get(), minimum_nprobes) != 0) detail::throw_error();
         return *this;
     }
     /// Replace only the maximum partition-search bound.
     Scanner& maximum_nprobes(uint32_t maximum_nprobes) {
-        if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) check_error();
+        if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) detail::throw_error();
         return *this;
     }
     /// Set native continuous IVF search effort. Any explicit value, including
     /// 0.5, ignores fixed nprobes while explicit minimum/maximum remain.
     Scanner& search_effort(double effort) {
-        if (lance_scanner_set_search_effort(handle_.get(), effort) != 0) check_error();
+        if (lance_scanner_set_search_effort(handle_.get(), effort) != 0) detail::throw_error();
         return *this;
     }
     Scanner& approx_mode(LanceApproxMode approx_mode) {
-        if (lance_scanner_set_approx_mode(handle_.get(), approx_mode) != 0) check_error();
+        if (lance_scanner_set_approx_mode(handle_.get(), approx_mode) != 0) detail::throw_error();
         return *this;
     }
     Scanner& query_parallelism(int32_t parallelism) {
         if (lance_scanner_set_query_parallelism(handle_.get(), parallelism) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
     Scanner& refine_factor(uint32_t f) {
-        if (lance_scanner_set_refine_factor(handle_.get(), f) != 0) check_error();
+        if (lance_scanner_set_refine_factor(handle_.get(), f) != 0) detail::throw_error();
         return *this;
     }
     Scanner& ef(uint32_t e) {
-        if (lance_scanner_set_ef(handle_.get(), e) != 0) check_error();
+        if (lance_scanner_set_ef(handle_.get(), e) != 0) detail::throw_error();
         return *this;
     }
     Scanner& metric(LanceMetricType m) {
-        if (lance_scanner_set_metric(handle_.get(), m) != 0) check_error();
+        if (lance_scanner_set_metric(handle_.get(), m) != 0) detail::throw_error();
         return *this;
     }
     Scanner& use_index(bool enable) {
-        if (lance_scanner_set_use_index(handle_.get(), enable) != 0) check_error();
+        if (lance_scanner_set_use_index(handle_.get(), enable) != 0) detail::throw_error();
         return *this;
     }
     /// Use native indexed-only fast search for vector, scalar-filtered,
@@ -12324,7 +12241,7 @@ public:
     /// data. Ordinary scans and non-indexable expressions follow native
     /// planning. Disabled by default. See lance.h.
     Scanner& fast_search(bool enable = true) {
-        if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) check_error();
+        if (lance_scanner_set_fast_search(handle_.get(), enable) != 0) detail::throw_error();
         return *this;
     }
     /// Apply scanner filters before vector/MinHash ranking when enabled, or
@@ -12332,7 +12249,7 @@ public:
     /// return fewer than the configured limit. This does not change the fragment
     /// search domain.
     Scanner& prefilter(bool enable) {
-        if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) check_error();
+        if (lance_scanner_set_prefilter(handle_.get(), enable) != 0) detail::throw_error();
         return *this;
     }
 
@@ -12349,7 +12266,7 @@ public:
             columns.empty() ? nullptr : col_ptrs.data();
         if (lance_scanner_full_text_search(handle_.get(), query.c_str(),
                                             cols_c, max_fuzzy_distance) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12357,7 +12274,7 @@ public:
     /// the query and its source handles may be destroyed after success.
     Scanner& full_text_search(const FtsQuery& query) {
         if (lance_scanner_set_fts_query(handle_.get(), query.c_handle()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12367,7 +12284,7 @@ public:
     Scanner& minhash_search(const std::string& column, const std::string& text) {
         if (lance_scanner_set_minhash_query(handle_.get(), column.c_str(),
                                             text.c_str()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12375,7 +12292,7 @@ public:
     /// shared ownership, so the context object may be destroyed after success.
     Scanner& fts_query_context(const FtsQueryContext& context) {
         if (lance_scanner_set_fts_query_context(handle_.get(), context.c_handle()) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12383,7 +12300,7 @@ public:
     Scanner& fts_index_segments(const uint8_t* segment_uuids, size_t segment_count) {
         if (lance_scanner_set_fts_index_segments(
                 handle_.get(), segment_uuids, segment_count) != 0)
-            check_error();
+            detail::throw_error();
         return *this;
     }
 
@@ -12400,7 +12317,7 @@ public:
 
 inline Scanner Fragment::scan() const {
     auto* scanner = lance_fragment_scan(handle_.get());
-    if (!scanner) check_error();
+    if (!scanner) detail::throw_error();
     return Scanner(scanner);
 }
 
@@ -12419,7 +12336,7 @@ inline void Fragment::take(
         columns.empty() ? empty_projection : column_ptrs.data();
     if (lance_fragment_take(
             handle_.get(), indices, num_indices, columns_ptr, out) != 0) {
-        check_error();
+        detail::throw_error();
     }
 }
 
@@ -12429,7 +12346,7 @@ inline void Fragment::take(
     ArrowArrayStream* out) const {
     if (lance_fragment_take(
             handle_.get(), indices, num_indices, nullptr, out) != 0) {
-        check_error();
+        detail::throw_error();
     }
 }
 
@@ -12460,7 +12377,7 @@ inline Fragment Fragment::create(
     if (lance_fragment_create(
             dataset_uri.c_str(), fragment_id, &c_options, owned_stream,
             &out) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!out) {
         throw Error(
@@ -12495,7 +12412,7 @@ inline std::vector<Fragment> Fragment::create_many(
     if (lance_fragment_create_many(
             dataset_uri.c_str(), &c_options, owned_stream, &raw, &count) !=
         0) {
-        check_error();
+        detail::throw_error();
     }
     if (count > 0 && !raw) {
         throw Error(LANCE_ERR_INTERNAL,
@@ -12536,7 +12453,7 @@ inline Fragment Fragment::create_from_file(
             fragment_id,
             physical_rows ? &rows : nullptr,
             &out) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!out) {
         throw Error(
@@ -12562,7 +12479,7 @@ inline Scanner Dataset::scan(const std::vector<std::string>& columns,
         handle_.get(),
         col_ptrs.data(),
         filter ? filter->c_str() : nullptr);
-    if (!s) check_error();
+    if (!s) detail::throw_error();
     return Scanner(s);
 }
 
@@ -12570,19 +12487,19 @@ inline Scanner Dataset::scan(std::nullopt_t,
                              const std::optional<std::string>& filter) const {
     auto* s = lance_scanner_new(handle_.get(), nullptr,
                                filter ? filter->c_str() : nullptr);
-    if (!s) check_error();
+    if (!s) detail::throw_error();
     return Scanner(s);
 }
 
 inline SqlQueryBuilder Dataset::sql(const std::string& sql) const {
     auto* builder = lance_dataset_sql_builder_new(c_handle(), sql.c_str());
-    if (!builder) check_error();
+    if (!builder) detail::throw_error();
     return SqlQueryBuilder(builder);
 }
 
 inline DatasetDeltaBuilder Dataset::delta() const {
     auto* builder = lance_dataset_delta_builder_new(c_handle());
-    if (!builder) check_error();
+    if (!builder) detail::throw_error();
     return DatasetDeltaBuilder(builder);
 }
 
@@ -12600,7 +12517,7 @@ public:
     static Batch from_arrow(ArrowArray* array, const ArrowSchema* schema) {
         LanceBatch* raw = nullptr;
         if (lance_batch_from_arrow(array, schema, &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return Batch(raw);
     }
@@ -12608,7 +12525,7 @@ public:
     /// Export the complete record-batch schema and top-level struct array.
     void to_arrow(ArrowArray* out_array, ArrowSchema* out_schema) const {
         if (lance_batch_to_arrow(handle_.get(), out_array, out_schema) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     const LanceBatch* c_handle() const { return handle_.get(); }
@@ -12636,7 +12553,7 @@ public:
     void write_batch(const Batch& batch) {
         if (lance_fragment_overlay_writer_write_batch(
                 handle_.get(), batch.c_handle()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -12646,7 +12563,7 @@ public:
         auto* raw = handle_.release();
         LanceDataOverlayGroup* group = nullptr;
         if (lance_fragment_overlay_writer_finish(raw, &group) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!group) return std::nullopt;
         return DataOverlayGroup(group);
@@ -12668,7 +12585,7 @@ inline FragmentOverlayWriter Fragment::write_overlay(
     LanceFragmentOverlayWriter* raw = nullptr;
     if (lance_fragment_overlay_writer_new(
             handle_.get(), schema.c_handle(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!raw) {
         throw Error(LANCE_ERR_INTERNAL,
@@ -12825,13 +12742,6 @@ struct FileStoreInfo {
 
 namespace file_detail {
 
-inline std::string take_string(const char* value) {
-    if (!value) check_error();
-    std::string output(value);
-    lance_free_string(value);
-    return output;
-}
-
 inline FileBufferDescriptor buffer_descriptor(
     const LanceBufferDescriptor& descriptor) {
     return FileBufferDescriptor{descriptor.position, descriptor.size};
@@ -12844,7 +12754,7 @@ inline FileEncodingDescriptor encoding_descriptor(
     output.buffer_location = descriptor.buffer_location;
     output.buffer_length = descriptor.buffer_length;
     if (descriptor.direct_bytes_len != 0) {
-        if (!descriptor.direct_bytes) check_error();
+        if (!descriptor.direct_bytes) detail::throw_error();
         output.direct_bytes.assign(
             descriptor.direct_bytes,
             descriptor.direct_bytes + descriptor.direct_bytes_len);
@@ -12919,7 +12829,7 @@ public:
     FileMetadataInfo info() const {
         LanceFileMetadataInfo raw{};
         if (lance_file_metadata_get_info(handle_.get(), &raw) != 0)
-            check_error();
+            detail::throw_error();
         return FileMetadataInfo{
             static_cast<FileFormatVersion>(raw.format_version),
             raw.major_version,
@@ -12939,7 +12849,7 @@ public:
     ArrowSchemaOwner schema() const {
         ArrowSchema raw{};
         if (lance_file_metadata_get_schema(handle_.get(), &raw) != 0)
-            check_error();
+            detail::throw_error();
         return ArrowSchemaOwner(raw);
     }
 
@@ -12948,7 +12858,7 @@ public:
         std::size_t count = 0;
         if (lance_file_metadata_get_global_buffers(
                 handle_.get(), &descriptors, &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<FileBufferDescriptor> output;
         output.reserve(count);
@@ -12964,7 +12874,7 @@ public:
         std::size_t count = 0;
         if (lance_file_metadata_get_columns(
                 handle_.get(), &columns, &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<FileColumnMetadata> output;
         output.reserve(count);
@@ -13021,7 +12931,7 @@ public:
         std::size_t count = 0;
         if (lance_file_statistics_get_columns(
                 handle_.get(), &columns, &count) != 0) {
-            check_error();
+            detail::throw_error();
         }
         std::vector<FileColumnStatistics> output;
         output.reserve(count);
@@ -13042,10 +12952,10 @@ public:
 
     std::vector<uint8_t> bytes() const {
         std::size_t length = lance_byte_buffer_len(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         if (length == 0) return {};
         const uint8_t* data = lance_byte_buffer_data(handle_.get());
-        if (!data) check_error();
+        if (!data) detail::throw_error();
         return std::vector<uint8_t>(data, data + length);
     }
 };
@@ -13058,13 +12968,13 @@ public:
 
     std::vector<std::string> paths() const {
         uint64_t count = lance_path_list_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<std::string> output;
         output.reserve(static_cast<std::size_t>(count));
         for (uint64_t index = 0; index < count; index++) {
             const char* path = lance_path_list_at(
                 handle_.get(), static_cast<std::size_t>(index));
-            if (!path) check_error();
+            if (!path) detail::throw_error();
             output.emplace_back(path);
         }
         return output;
@@ -13080,13 +12990,13 @@ public:
     std::vector<std::string> common_prefixes() const {
         uint64_t count =
             lance_delimited_list_common_prefix_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<std::string> output;
         output.reserve(static_cast<std::size_t>(count));
         for (uint64_t index = 0; index < count; index++) {
             const char* path = lance_delimited_list_common_prefix_at(
                 handle_.get(), static_cast<std::size_t>(index));
-            if (!path) check_error();
+            if (!path) detail::throw_error();
             output.emplace_back(path);
         }
         return output;
@@ -13094,13 +13004,13 @@ public:
 
     std::vector<std::string> objects() const {
         uint64_t count = lance_delimited_list_object_count(handle_.get());
-        if (lance_last_error_code() != LANCE_OK) check_error();
+        if (lance_last_error_code() != LANCE_OK) detail::throw_error();
         std::vector<std::string> output;
         output.reserve(static_cast<std::size_t>(count));
         for (uint64_t index = 0; index < count; index++) {
             const char* path = lance_delimited_list_object_at(
                 handle_.get(), static_cast<std::size_t>(index));
-            if (!path) check_error();
+            if (!path) detail::throw_error();
             output.emplace_back(path);
         }
         return output;
@@ -13134,7 +13044,7 @@ public:
             storage_options ? storage_options->c_handle() : nullptr,
             session ? session->c_handle() : nullptr,
             config_ptr);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         handle_ = Handle<LanceFileSession, lance_file_session_close>(raw);
     }
 
@@ -13149,7 +13059,7 @@ public:
     explicit operator bool() const noexcept { return bool(handle_); }
 
     std::string base_path() const {
-        return file_detail::take_string(
+        return detail::take_string(
             lance_file_session_base_path(handle_.get()));
     }
 
@@ -13166,7 +13076,7 @@ public:
         uint32_t blob_id) const {
         auto* raw = lance_file_session_open_packed_blob_writer(
             handle_.get(), data_file_path.c_str(), blob_id);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return PackedBlobWriter(raw);
     }
 
@@ -13175,7 +13085,7 @@ public:
         uint32_t blob_id) const {
         auto* raw = lance_file_session_open_dedicated_blob_writer(
             handle_.get(), data_file_path.c_str(), blob_id);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return DedicatedBlobWriter(raw);
     }
 
@@ -13183,7 +13093,7 @@ public:
         int32_t exists = 0;
         if (lance_file_session_contains(
                 handle_.get(), relative_path.c_str(), &exists) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return exists != 0;
     }
@@ -13192,7 +13102,7 @@ public:
         auto* raw = lance_file_session_list(
             handle_.get(),
             relative_path ? relative_path->c_str() : nullptr);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return PathList(raw);
     }
 
@@ -13201,7 +13111,7 @@ public:
         auto* raw = lance_file_session_list_with_delimiter(
             handle_.get(),
             relative_path ? relative_path->c_str() : nullptr);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return DelimitedList(raw);
     }
 
@@ -13211,14 +13121,14 @@ public:
         uint64_t length) const {
         auto* raw = lance_file_session_read_range(
             handle_.get(), relative_path.c_str(), offset, length);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return ByteBuffer(raw);
     }
 
     void delete_file(const std::string& relative_path) const {
         if (lance_file_session_delete_file(
                 handle_.get(), relative_path.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -13229,7 +13139,7 @@ public:
                 handle_.get(),
                 local_path.c_str(),
                 relative_remote_path.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -13240,28 +13150,28 @@ public:
                 handle_.get(),
                 relative_remote_path.c_str(),
                 local_path.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
     LanceScanStats scheduler_stats() const {
         LanceScanStats stats{};
         if (lance_file_session_get_scheduler_stats(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 
     LanceObjectStoreRegistryStats registry_stats() const {
         LanceObjectStoreRegistryStats stats{};
         if (lance_file_session_get_registry_stats(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 
     FileStoreInfo store_info() const {
         LanceObjectStoreInfo info{};
         if (lance_file_session_get_store_info(handle_.get(), &info) != 0)
-            check_error();
+            detail::throw_error();
         return FileStoreInfo{
             info.block_size,
             info.max_iop_size,
@@ -13275,7 +13185,7 @@ public:
     LanceObjectStoreIoStats store_io_stats() const {
         LanceObjectStoreIoStats stats{};
         if (lance_file_session_get_store_io_stats(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 };
@@ -13298,21 +13208,21 @@ public:
     uint64_t num_rows() const {
         uint64_t rows = 0;
         if (lance_file_reader_num_rows(handle_.get(), &rows) != 0)
-            check_error();
+            detail::throw_error();
         return rows;
     }
 
     FileMetadata metadata() const {
         LanceFileMetadata* metadata = nullptr;
         if (lance_file_reader_get_metadata(handle_.get(), &metadata) != 0)
-            check_error();
+            detail::throw_error();
         return FileMetadata(metadata);
     }
 
     FileStatistics statistics() const {
         LanceFileStatistics* statistics = nullptr;
         if (lance_file_reader_get_statistics(handle_.get(), &statistics) != 0)
-            check_error();
+            detail::throw_error();
         return FileStatistics(statistics);
     }
 
@@ -13320,7 +13230,7 @@ public:
         LanceByteBuffer* buffer = nullptr;
         if (lance_file_reader_read_global_buffer(
                 handle_.get(), index, &buffer) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ByteBuffer(buffer);
     }
@@ -13333,7 +13243,7 @@ public:
         ArrowArrayStream stream{};
         if (lance_file_reader_read_all(
                 handle_.get(), batch_size, batch_readahead, &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -13353,7 +13263,7 @@ public:
                 batch_size,
                 batch_readahead,
                 &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -13372,7 +13282,7 @@ public:
                 batch_size,
                 batch_readahead,
                 &stream) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return ArrowStream(stream);
     }
@@ -13380,7 +13290,7 @@ public:
     LanceScanStats io_stats() const {
         LanceScanStats stats{};
         if (lance_file_reader_get_io_stats(handle_.get(), &stats) != 0)
-            check_error();
+            detail::throw_error();
         return stats;
     }
 };
@@ -13402,7 +13312,7 @@ public:
 
     void write_batch(const Batch& batch) {
         if (lance_file_writer_write_batch(handle_.get(), batch.c_handle()) != 0)
-            check_error();
+            detail::throw_error();
     }
 
     void add_schema_metadata(
@@ -13410,7 +13320,7 @@ public:
         const std::string& value) {
         if (lance_file_writer_add_schema_metadata(
                 handle_.get(), key.c_str(), value.c_str()) != 0) {
-            check_error();
+            detail::throw_error();
         }
     }
 
@@ -13421,7 +13331,7 @@ public:
                 bytes.empty() ? nullptr : bytes.data(),
                 bytes.size(),
                 &index) != 0) {
-            check_error();
+            detail::throw_error();
         }
         return index;
     }
@@ -13429,12 +13339,12 @@ public:
     FileWriteSummary finish() {
         LanceFileWriteSummary summary{};
         if (lance_file_writer_finish(handle_.get(), &summary) != 0)
-            check_error();
+            detail::throw_error();
         return FileWriteSummary{summary.num_rows, summary.size_bytes};
     }
 
     void abort() {
-        if (lance_file_writer_abort(handle_.get()) != 0) check_error();
+        if (lance_file_writer_abort(handle_.get()) != 0) detail::throw_error();
     }
 };
 
@@ -13445,7 +13355,7 @@ inline FileReader FileSession::open_reader(
     auto raw_options = file_detail::reader_options(options, columns);
     auto* raw = lance_file_session_open_reader(
         handle_.get(), relative_path.c_str(), &raw_options);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return FileReader(raw);
 }
 
@@ -13456,7 +13366,7 @@ inline FileWriter FileSession::open_writer(
     auto raw_options = file_detail::writer_options(options);
     auto* raw = lance_file_session_open_writer(
         handle_.get(), relative_path.c_str(), schema, &raw_options);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return FileWriter(raw);
 }
 
@@ -13494,7 +13404,7 @@ inline void write_fragments(
 
     const char* const* opts_ptr = storage_opts.empty() ? nullptr : kv.data();
     if (lance_write_fragments(uri.c_str(), schema, stream, opts_ptr) != 0) {
-        check_error();
+        detail::throw_error();
     }
 }
 
@@ -13505,7 +13415,8 @@ namespace namespace_detail {
 inline std::string json_escape(std::string_view value) {
     std::string out;
     out.reserve(value.size() + 2);
-    for (unsigned char c : value) {
+    for (char ch : value) {
+        const auto c = static_cast<unsigned char>(ch);
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -13591,14 +13502,14 @@ public:
     std::string native_message;
 
     NamespaceError(
-        LanceErrorCode code,
-        std::string message,
-        uint32_t native_code,
-        std::string native_message)
-        : Error(code, std::move(message)),
+        LanceErrorCode code_value,
+        std::string message_value,
+        uint32_t native_code_value,
+        std::string native_message_value)
+        : Error(code_value, std::move(message_value)),
           has_native_code(true),
-          native_code(native_code),
-          native_message(std::move(native_message)) {}
+          native_code(native_code_value),
+          native_message(std::move(native_message_value)) {}
 };
 
 /// Owning copy of one native namespace call result. The C result is released
@@ -13826,7 +13737,7 @@ public:
         auto* spec_ptr = context_provider ? &spec : nullptr;
         auto* raw = lance_namespace_directory_new(
             json.c_str(), session ? session->c_handle() : nullptr, spec_ptr);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Namespace(raw);
     }
 
@@ -13837,7 +13748,7 @@ public:
         auto spec = make_context_spec(context_provider);
         auto* spec_ptr = context_provider ? &spec : nullptr;
         auto* raw = lance_namespace_rest_new(json.c_str(), spec_ptr);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Namespace(raw);
     }
 
@@ -13854,7 +13765,7 @@ public:
             json.c_str(),
             session ? session->c_handle() : nullptr,
             spec_ptr);
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Namespace(raw);
     }
 
@@ -13882,7 +13793,7 @@ public:
         auto* raw = lance_namespace_custom_new(&c_spec);
         // The C constructor consumes the context on every invocation.
         guard.release();
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Namespace(raw);
     }
 
@@ -13902,28 +13813,22 @@ public:
         auto* raw = lance_namespace_custom_dispatch_new(&c_spec);
         // The C constructor consumes the context on every invocation.
         guard.release();
-        if (!raw) check_error();
+        if (!raw) detail::throw_error();
         return Namespace(raw);
     }
 
     std::string id() const {
         const char* raw = lance_namespace_id(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     std::string ops_metrics_json() const {
         const char* raw = lance_namespace_retrieve_ops_metrics(handle_.get());
-        if (!raw) check_error();
-        std::string out(raw);
-        lance_free_string(raw);
-        return out;
+        return detail::take_string(raw);
     }
 
     void reset_ops_metrics() {
-        if (lance_namespace_reset_ops_metrics(handle_.get()) != 0) check_error();
+        if (lance_namespace_reset_ops_metrics(handle_.get()) != 0) detail::throw_error();
     }
 
     NamespaceResult call(
@@ -13957,9 +13862,8 @@ public:
         guard.result = nullptr;
         if (rc != 0) {
             LanceErrorCode code = lance_last_error_code();
-            const char* message = lance_last_error_message();
-            std::string owned(message ? message : "Unknown error");
-            if (message) lance_free_string(message);
+            detail::OwnedString message(lance_last_error_message());
+            std::string owned(message ? message.get() : "Unknown error");
             if (has_native) {
                 throw NamespaceError(
                     code, std::move(owned), native_code, std::move(native_message));
@@ -14022,7 +13926,7 @@ public:
         LanceRestAdapter* raw = nullptr;
         if (lance_rest_adapter_start(
                 backend.c_handle(), host.c_str(), port, &raw) != 0) {
-            check_error();
+            detail::throw_error();
         }
         if (!raw) {
             throw Error(
@@ -14056,7 +13960,7 @@ inline Dataset Dataset::open_namespace(
         storage_json.c_str(),
         version,
         session ? session->c_handle() : nullptr);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Dataset(raw);
 }
 
@@ -14089,7 +13993,7 @@ inline Dataset Dataset::write_namespace(
         session ? session->c_handle() : nullptr,
         branch ? branch->c_str() : nullptr,
         &out);
-    if (rc != 0) check_error();
+    if (rc != 0) detail::throw_error();
     if (!out) {
         throw Error(
             LANCE_ERR_INTERNAL,
@@ -14120,7 +14024,7 @@ inline Dataset Dataset::commit_namespace_uri(
         opts_ptr,
         session ? session->c_handle() : nullptr,
         &out);
-    if (rc != 0) check_error();
+    if (rc != 0) detail::throw_error();
     if (!out) {
         throw Error(
             LANCE_ERR_INTERNAL,
@@ -14140,7 +14044,7 @@ struct Table {
 
 inline LanceSchema LanceSchema::from_arrow(const ArrowSchema* schema) {
     ::LanceSchema* raw = nullptr;
-    if (lance_schema_from_arrow(schema, &raw) != 0) check_error();
+    if (lance_schema_from_arrow(schema, &raw) != 0) detail::throw_error();
     return LanceSchema(raw);
 }
 
@@ -14150,7 +14054,7 @@ inline Batch ShardingSpec::evaluate(
     if (lance_mem_wal_evaluate_sharding_spec(
             const_cast<::LanceDataset*>(dataset.c_handle()),
             batch.c_handle(), handle_.get(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Batch(raw);
 }
@@ -14160,7 +14064,7 @@ inline Batch ShardingSpec::evaluate(
     ::LanceBatch* raw = nullptr;
     if (lance_mem_wal_evaluate_sharding_spec_with_schema(
             batch.c_handle(), handle_.get(), schema.c_handle(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Batch(raw);
 }
@@ -14189,7 +14093,7 @@ inline void Dataset::initialize_mem_wal(const MemWalInitOptions& options) {
             options.maintained_indexes.has_value() ? 1 : 0,
             maintained.empty() ? nullptr : maintained.data(), maintained.size(),
             config_ptr) != 0) {
-        check_error();
+        detail::throw_error();
     }
 }
 
@@ -14197,7 +14101,7 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
     ::LanceMemWalIndexDetails* raw = nullptr;
     if (lance_mem_wal_index_details(
             const_cast<::LanceDataset*>(handle_.get()), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!raw) return std::nullopt;
     Handle<::LanceMemWalIndexDetails, lance_mem_wal_index_details_free> details(raw);
@@ -14210,7 +14114,7 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
         const char* name = nullptr;
         if (lance_mem_wal_index_details_maintained_index_at(
                 details.get(), i, &name) != 0) {
-            check_error();
+            detail::throw_error();
         }
         maintained.emplace_back(name);
     }
@@ -14223,7 +14127,7 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
         ::LanceMemWalShardingSpec* spec = nullptr;
         if (lance_mem_wal_index_details_sharding_spec_at(
                 details.get(), i, &spec) != 0) {
-            check_error();
+            detail::throw_error();
         }
         specs.emplace_back(spec);
     }
@@ -14236,7 +14140,7 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
         const char* value = nullptr;
         if (lance_mem_wal_index_details_writer_config_default_at(
                 details.get(), i, &key, &value) != 0) {
-            check_error();
+            detail::throw_error();
         }
         defaults.emplace(key, value);
     }
@@ -14246,7 +14150,7 @@ inline std::optional<MemWalIndexDetails> Dataset::mem_wal_index_details() const 
     const int32_t maintain_all =
         lance_mem_wal_index_details_maintain_all_indexes(details.get());
     const char* dir_id = lance_mem_wal_index_details_dir_id(details.get());
-    if (!dir_id) check_error();
+    if (!dir_id) detail::throw_error();
     return MemWalIndexDetails(num_shards, maintain_all != 0,
                               std::move(maintained), std::move(specs),
                               std::move(defaults), std::string(dir_id));
@@ -14261,7 +14165,7 @@ inline ShardWriter Dataset::mem_wal_writer(
     if (lance_shard_writer_open(
             const_cast<::LanceDataset*>(handle_.get()), shard_id.c_str(),
             &raw_config, &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return ShardWriter(raw);
 }
@@ -14281,7 +14185,7 @@ inline LsmScanner ShardWriter::lsm_scanner(
     if (lance_shard_writer_lsm_scanner(
             handle_.get(), raw.empty() ? nullptr : raw.data(), raw.size(),
             &scanner) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return LsmScanner(scanner);
 }
@@ -14295,14 +14199,14 @@ inline LsmScanner LsmScanner::from_snapshots(
     if (lance_lsm_scanner_from_snapshots(
             const_cast<::LanceDataset*>(dataset.c_handle()),
             raw.empty() ? nullptr : raw.data(), raw.size(), &scanner) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return LsmScanner(scanner);
 }
 
 inline Batch LsmScanner::to_batch() const {
     ::LanceBatch* raw = nullptr;
-    if (lance_lsm_scanner_to_batch(handle_.get(), &raw) != 0) check_error();
+    if (lance_lsm_scanner_to_batch(handle_.get(), &raw) != 0) detail::throw_error();
     return Batch(raw);
 }
 
@@ -14316,7 +14220,7 @@ inline Table LsmScanner::to_table() const {
     Table table;
     ArrowSchema raw{};
     if (lance_lsm_scanner_schema(handle_.get(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     table.schema = ArrowSchemaOwner(raw);
     table.batches = to_batches();
@@ -14326,7 +14230,7 @@ inline Table LsmScanner::to_table() const {
 inline ArrowSchemaOwner ExecutionPlan::schema() const {
     ArrowSchema raw{};
     if (lance_mem_wal_plan_schema(handle_.get(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return ArrowSchemaOwner(raw);
 }
@@ -14334,14 +14238,14 @@ inline ArrowSchemaOwner ExecutionPlan::schema() const {
 inline ArrowSchemaOwner ExecutionPlan::dataset_schema() const {
     ArrowSchema raw{};
     if (lance_mem_wal_plan_dataset_schema(handle_.get(), &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return ArrowSchemaOwner(raw);
 }
 
 inline Batch ExecutionPlan::to_batch() const {
     ::LanceBatch* raw = nullptr;
-    if (lance_mem_wal_plan_to_batch(handle_.get(), &raw) != 0) check_error();
+    if (lance_mem_wal_plan_to_batch(handle_.get(), &raw) != 0) detail::throw_error();
     return Batch(raw);
 }
 
@@ -14376,7 +14280,7 @@ inline LsmPointLookupPlanner::LsmPointLookupPlanner(
             pk_columns.has_value() ? 1 : 0,
             columns.empty() ? nullptr : columns.data(), columns.size(),
             &planner) != 0) {
-        check_error();
+        detail::throw_error();
     }
     handle_ = Handle<::LanceLsmPointLookupPlanner,
                      lance_lsm_point_lookup_planner_free>(planner);
@@ -14396,7 +14300,7 @@ inline ExecutionPlan LsmPointLookupPlanner::plan_lookup(
             columns.has_value() ? 1 : 0,
             raw_columns.empty() ? nullptr : raw_columns.data(),
             raw_columns.size(), &plan) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return ExecutionPlan(plan);
 }
@@ -14422,7 +14326,7 @@ inline LsmVectorSearchPlanner::LsmVectorSearchPlanner(
             columns.empty() ? nullptr : columns.data(), columns.size(),
             static_cast<::LanceMemWalDistanceType>(distance_type),
             filter ? filter->c_str() : nullptr, &planner) != 0) {
-        check_error();
+        detail::throw_error();
     }
     handle_ = Handle<::LanceLsmVectorSearchPlanner,
                      lance_lsm_vector_search_planner_free>(planner);
@@ -14444,7 +14348,7 @@ inline ExecutionPlan LsmVectorSearchPlanner::plan_search(
             raw_columns.empty() ? nullptr : raw_columns.data(),
             raw_columns.size(), refine_base_table ? 1 : 0, overfetch_factor,
             &plan) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return ExecutionPlan(plan);
 }
@@ -14468,14 +14372,14 @@ inline RewriteGroup::RewriteGroup(
     auto* raw = lance_rewrite_group_new(
         old_raw.empty() ? nullptr : old_raw.data(), old_raw.size(),
         new_raw.empty() ? nullptr : new_raw.data(), new_raw.size());
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     handle_ = Handle<LanceRewriteGroup, lance_rewrite_group_close>(raw);
 }
 
 inline size_t RewriteGroup::old_fragment_count() const {
     uint64_t count = 0;
     if (lance_rewrite_group_old_fragment_count(handle_.get(), &count) != 0)
-        check_error();
+        detail::throw_error();
     return static_cast<size_t>(count);
 }
 
@@ -14483,7 +14387,7 @@ inline Fragment RewriteGroup::old_fragment_at(size_t index) const {
     LanceFragment* fragment = nullptr;
     if (lance_rewrite_group_old_fragment_at(
             handle_.get(), index, &fragment) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Fragment(fragment);
 }
@@ -14501,7 +14405,7 @@ inline std::vector<Fragment> RewriteGroup::old_fragments() const {
 inline size_t RewriteGroup::new_fragment_count() const {
     uint64_t count = 0;
     if (lance_rewrite_group_new_fragment_count(handle_.get(), &count) != 0)
-        check_error();
+        detail::throw_error();
     return static_cast<size_t>(count);
 }
 
@@ -14509,7 +14413,7 @@ inline Fragment RewriteGroup::new_fragment_at(size_t index) const {
     LanceFragment* fragment = nullptr;
     if (lance_rewrite_group_new_fragment_at(
             handle_.get(), index, &fragment) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Fragment(fragment);
 }
@@ -14548,7 +14452,7 @@ inline RewrittenIndex::RewrittenIndex(
         details_value.empty() ? nullptr : details_value.data(),
         details_value.size(), index_version, index_files.has_value(),
         raw_files.empty() ? nullptr : raw_files.data(), raw_files.size());
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     handle_ = Handle<LanceRewrittenIndex, lance_rewritten_index_close>(raw);
 }
 
@@ -14556,7 +14460,7 @@ inline Fragment Operation::updated_fragment_at(size_t index) const {
     LanceFragment* fragment = nullptr;
     if (lance_operation_update_updated_fragment_at(
             handle_.get(), index, &fragment) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Fragment(fragment);
 }
@@ -14565,7 +14469,7 @@ inline Fragment Operation::new_fragment_at(size_t index) const {
     LanceFragment* fragment = nullptr;
     if (lance_operation_update_new_fragment_at(
             handle_.get(), index, &fragment) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return Fragment(fragment);
 }
@@ -14574,7 +14478,7 @@ inline CompactedSsTable Operation::compacted_sstable_at(size_t index) const {
     ::LanceCompactedSsTable raw{};
     if (lance_operation_update_compacted_sstable_at(
             handle_.get(), index, &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     CompactedSsTable value;
     std::memcpy(value.shard_id.data(), raw.shard_id, value.shard_id.size());
@@ -14587,7 +14491,7 @@ inline CompactedSsTable Operation::update_mem_wal_state_compacted_sstable_at(
     ::LanceCompactedSsTable raw{};
     if (lance_operation_update_mem_wal_state_compacted_sstable_at(
             handle_.get(), index, &raw) != 0) {
-        check_error();
+        detail::throw_error();
     }
     CompactedSsTable value;
     std::memcpy(value.shard_id.data(), raw.shard_id, value.shard_id.size());
@@ -14601,7 +14505,7 @@ inline std::optional<KeyExistenceFilter> Operation::inserted_rows_filter()
     LanceKeyExistenceFilter* filter = nullptr;
     if (lance_operation_update_inserted_rows_filter(
             handle_.get(), &present, &filter) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!present) {
         if (filter) {
@@ -14626,7 +14530,7 @@ Operation::updated_fragment_offsets() const {
     LanceUpdatedFragmentOffsets* offsets = nullptr;
     if (lance_operation_update_updated_fragment_offsets(
             handle_.get(), &present, &offsets) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!present) {
         if (offsets) {
@@ -14650,7 +14554,7 @@ inline std::optional<std::string> Operation::update_mem_wal_dir_id() const {
     const char* dir_id = nullptr;
     if (lance_operation_update_mem_wal_dir_id(handle_.get(), &present,
                                                &dir_id) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!present) {
         if (dir_id) {
@@ -14672,7 +14576,7 @@ inline std::string Operation::update_mem_wal_state_dir_id() const {
     const char* dir_id = nullptr;
     if (lance_operation_update_mem_wal_state_dir_id(handle_.get(), &dir_id) !=
         0) {
-        check_error();
+        detail::throw_error();
     }
     if (!dir_id) {
         throw Error(LANCE_ERR_INTERNAL,
@@ -14685,7 +14589,7 @@ inline std::string Operation::update_mem_wal_state_dir_id() const {
 inline RewriteGroup Operation::rewrite_group_at(size_t index) const {
     LanceRewriteGroup* group = nullptr;
     if (lance_operation_rewrite_group_at(handle_.get(), index, &group) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return RewriteGroup(group);
 }
@@ -14694,7 +14598,7 @@ inline RewrittenIndex Operation::rewritten_index_at(size_t index) const {
     LanceRewrittenIndex* rewritten = nullptr;
     if (lance_operation_rewrite_rewritten_index_at(
             handle_.get(), index, &rewritten) != 0) {
-        check_error();
+        detail::throw_error();
     }
     return RewrittenIndex(rewritten);
 }
@@ -14705,7 +14609,7 @@ inline std::optional<IndexSegmentMetadata> Operation::frag_reuse_index()
     LanceIndexSegmentMetadata* metadata = nullptr;
     if (lance_operation_rewrite_frag_reuse_index(
             handle_.get(), &present, &metadata) != 0) {
-        check_error();
+        detail::throw_error();
     }
     if (!present) {
         if (metadata) {
@@ -14786,7 +14690,7 @@ inline Operation Operation::make_update(const UpdateOperationSpec& spec) {
                    ? lance_operation_update_new_with_mem_wal_dir_id(
                          &options, spec.mem_wal_dir_id->c_str())
                    : lance_operation_update_new(&options);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Operation(raw);
 }
 
@@ -14806,7 +14710,7 @@ inline Operation Operation::make_rewrite(
         raw_groups.empty() ? nullptr : raw_groups.data(), raw_groups.size(),
         raw_indices.empty() ? nullptr : raw_indices.data(), raw_indices.size(),
         frag_reuse_index ? frag_reuse_index->c_handle() : nullptr);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Operation(raw);
 }
 
@@ -14819,7 +14723,7 @@ inline Operation Operation::make_update_mem_wal_state(
     }
     auto* operation = lance_operation_update_mem_wal_state_new(
         raw.empty() ? nullptr : raw.data(), raw.size());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
@@ -14833,20 +14737,20 @@ inline Operation Operation::make_update_mem_wal_state_with_dir_id(
     }
     auto* operation = lance_operation_update_mem_wal_state_new_with_dir_id(
         raw.empty() ? nullptr : raw.data(), raw.size(), dir_id.c_str());
-    if (!operation) check_error();
+    if (!operation) detail::throw_error();
     return Operation(operation);
 }
 
 inline Fragment RewriteResult::original_fragment_at(size_t index) const {
     auto* raw =
         lance_rewrite_result_original_fragment_at(handle_.get(), index);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Fragment(raw);
 }
 
 inline Fragment RewriteResult::new_fragment_at(size_t index) const {
     auto* raw = lance_rewrite_result_new_fragment_at(handle_.get(), index);
-    if (!raw) check_error();
+    if (!raw) detail::throw_error();
     return Fragment(raw);
 }
 

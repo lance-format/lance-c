@@ -438,6 +438,10 @@ try {
 }
 ```
 
+`lance::check_error()` exposes the same poll to code that calls the C API
+directly: it returns normally when `lance_last_error_code()` is `LANCE_OK` and
+throws `lance::Error` otherwise.
+
 A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in [error.h](../include/lance/error.h) for the complete boundary.
 
 ## Header inclusion

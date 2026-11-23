@@ -37,13 +37,9 @@ c_flags=(
 
 cpp_flags=(
     -std=c++20
-    -Wall -Wextra -Wpedantic -Wconversion
+    -Wall -Wextra -Wpedantic
+    -Wshadow -Wconversion -Wsign-conversion
     -Werror
-    # #273 fixes the remaining lance.hpp diagnostics. Report -Wshadow and
-    # -Wsign-conversion meanwhile, but keep them non-fatal; once #273 is
-    # merged, drop the two -Wno-error= overrides so the full set is fatal.
-    -Wshadow -Wno-error=shadow
-    -Wsign-conversion -Wno-error=sign-conversion
 )
 
 failures=0
