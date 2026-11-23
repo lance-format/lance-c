@@ -48,7 +48,8 @@ failures=0
 checks=0
 
 # run_check <compiler> <standard> <source> <flag>...
-# Compiles <source> with <compiler> and the given flags.
+# Compiles <source> with <compiler> and the given flags. Compiler output
+# streams through, so non-fatal warnings stay visible on success.
 run_check() {
     local compiler=$1
     local standard=$2
@@ -56,18 +57,21 @@ run_check() {
     shift 3
     local -a flags=("$@")
     local -a command=("$compiler" "${flags[@]}" -fsyntax-only "$source")
-    local output
+    local relative=${source#"$repo_root/"}
+    local status=0
 
     checks=$((checks + 1))
-    if output=$("${command[@]}" 2>&1); then
-        printf 'ok:   %s %s\n' "$standard" "${source#"$repo_root/"}"
-    else
-        printf 'FAIL: %s %s\n' "$standard" "${source#"$repo_root/"}"
-        printf '      command:'
-        printf ' %q' "${command[@]}"
-        printf '\n%s\n' "$output"
-        failures=$((failures + 1))
+    printf 'check: %s %s\n' "$standard" "$relative"
+    "${command[@]}" || status=$?
+    if [ "$status" -eq 0 ]; then
+        return
     fi
+
+    printf 'FAIL: %s %s (exit %d)\n' "$standard" "$relative" "$status"
+    printf '      reproduce:'
+    printf ' %q' "${command[@]}"
+    printf '\n'
+    failures=$((failures + 1))
 }
 
 check_c_header_sources() {
