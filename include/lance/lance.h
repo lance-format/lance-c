@@ -815,7 +815,14 @@ LanceDataset* lance_dataset_open_with_base_store_params(
  * closing either input handle afterwards does not invalidate this dataset,
  * its scanners, or later commits performed through it.
  *
- * @param out_dataset receives the dataset handle on success; must not be NULL
+ * @param uri               Dataset path (file://, s3://, memory://, etc.)
+ * @param storage_accessor  Dynamic storage-options accessor, or NULL
+ * @param version           Version to open; 0 opens the latest version
+ * @param session           Shared session, or NULL for the default session
+ * @param commit_lock       Foreign commit lock, or NULL for the URI-derived
+ *                          native handler
+ * @param out_dataset       Receives the dataset handle on success; must not
+ *                          be NULL
  * @return 0 on success, -1 on error
  */
 int32_t lance_dataset_open_with_commit_lock(
@@ -3573,7 +3580,8 @@ int32_t lance_dataset_add_columns_stream(
 
 /**
  * Export the dataset schema via Arrow C Data Interface.
- * @param out  Pointer to caller-allocated ArrowSchema struct
+ * @param dataset  Open dataset. Must not be NULL.
+ * @param out      Pointer to caller-allocated ArrowSchema struct
  * @return 0 on success, -1 on error
  */
 int32_t lance_dataset_schema(
@@ -4424,6 +4432,7 @@ int32_t lance_fragment_update_columns_result_matched_offsets(
  * during `release` cleanup is contained and logged; cleanup remains
  * best-effort.
  *
+ * @param dataset      Open dataset. Must not be NULL.
  * @param indices      Array of 0-based row offsets
  * @param num_indices  Length of indices array
  * @param columns      NULL-terminated column names, or NULL for all
@@ -5206,7 +5215,9 @@ int32_t lance_scanner_set_io_buffer_size(
 /**
  * Set the maximum number of batches decoded concurrently.
  *
+ * @param scanner          Scanner handle. Must not be NULL.
  * @param batch_readahead  Number of in-flight batch decode tasks. Must be greater than zero.
+ * @return 0 on success, -1 on error
  */
 int32_t lance_scanner_set_batch_readahead(
     LanceScanner* scanner,
@@ -5515,8 +5526,9 @@ int32_t lance_scanner_set_materialization_style(
  * selection selects zero fragments. To select every fragment in the scanner's
  * dataset snapshot, supply all of its native fragment IDs explicitly.
  * Must be called before iteration.
- * @param ids  Array of fragment IDs
- * @param len  Number of fragment IDs
+ * @param scanner Scanner handle. Must not be NULL.
+ * @param ids     Array of fragment IDs
+ * @param len     Number of fragment IDs
  * @return 0 on success, -1 on error
  */
 int32_t lance_scanner_set_fragment_ids(
@@ -5537,6 +5549,7 @@ int32_t lance_scanner_set_fragment_ids(
  * combined with lance_scanner_set_scalar_index_segment().
  * Calling it again replaces the previous allowlist. Must be called before
  * iteration; the ids are copied.
+ * @param scanner  Scanner handle. Must not be NULL.
  * @param row_ids  Array of `_rowid` values, in any order (may be NULL when len is 0)
  * @param len      Number of ids; 0 allows no rows
  * @return 0 on success, -1 on error
@@ -5551,6 +5564,7 @@ int32_t lance_scanner_set_row_addr_allowlist(
  * Exclude rows whose `_rowid` is in `row_ids` from the scan or search.
  * Same `_rowid` space, ordering, and restrictions as
  * lance_scanner_set_row_addr_allowlist().
+ * @param scanner  Scanner handle. Must not be NULL.
  * @param row_ids  Array of `_rowid` values, in any order (may be NULL when len is 0)
  * @param len      Number of ids; 0 blocks no rows
  * @return 0 on success, -1 on error
@@ -5574,8 +5588,9 @@ int32_t lance_scanner_set_row_addr_blocklist(
  * replaces the previously-set Substrait filter. The bytes are copied; the
  * caller may free them after this call returns.
  *
- * @param bytes  Serialized Substrait `ExtendedExpression` bytes (must not be NULL)
- * @param len    Length of the byte buffer (must be > 0)
+ * @param scanner Scanner handle. Must not be NULL.
+ * @param bytes   Serialized Substrait `ExtendedExpression` bytes (must not be NULL)
+ * @param len     Length of the byte buffer (must be > 0)
  * @return 0 on success, -1 on error
  */
 int32_t lance_scanner_set_substrait_filter(
@@ -5609,8 +5624,9 @@ int32_t lance_scanner_set_substrait_filter(
  * aggregate with native `COUNT(*)`; schema, explain, analyze, and ordinary scan
  * streams use it.
  *
- * @param bytes  Serialized Substrait `Plan` bytes (NULL only when len is zero)
- * @param len    Length of the byte buffer
+ * @param scanner Scanner handle. Must not be NULL.
+ * @param bytes   Serialized Substrait `Plan` bytes (NULL only when len is zero)
+ * @param len     Length of the byte buffer
  * @return 0 on success, -1 on error
  */
 int32_t lance_scanner_set_substrait_aggregate(
@@ -5627,6 +5643,7 @@ int32_t lance_scanner_set_substrait_aggregate(
  *
  * Must be called before the scan starts. The filter string is copied.
  *
+ * @param scanner Scanner handle. Must not be NULL.
  * @param filter  Non-NULL, non-empty SQL filter expression
  * @return 0 on success, -1 on error
  */
@@ -5868,7 +5885,8 @@ int32_t lance_scanner_to_arrow_stream(
 
 /**
  * Read the next batch (blocking).
- * @param out  Set to a LanceBatch* on success, NULL on end/error
+ * @param scanner  Scanner handle. Must not be NULL.
+ * @param out      Set to a LanceBatch* on success, NULL on end/error
  * @return 0 = batch available, 1 = end of stream, -1 = error
  */
 int32_t lance_scanner_next(
@@ -6025,7 +6043,7 @@ void lance_batch_free(LanceBatch* batch);
  * into a dataset on a remote data lake via CommitBuilder.
  *
  * The data is written but NOT committed — no dataset manifest is created or
- * updated. The written .lance files under <uri>/data/ contain full metadata
+ * updated. The written .lance files under `<uri>/data/` contain full metadata
  * in their footers (schema with field IDs, row counts, format version).
  *
  * @param uri          Directory URI for fragment files (file://, s3://, etc.)
@@ -6201,6 +6219,11 @@ int32_t lance_dataset_create_vector_index_with_options_and_progress(
 
 /**
  * Create a scalar index on a column.
+ * @param dataset Open dataset (mutated; the same handle remains valid).
+ * @param column Column name to index.
+ * @param index_name Optional index name; NULL selects the native default.
+ * @param index_type Scalar index type, for example LANCE_SCALAR_BTREE or
+ *                   LANCE_SCALAR_INVERTED.
  * @param params_json Optional JSON params forwarded unchanged to the native
  *                    Lance scalar-index plugin, or NULL for plugin defaults.
  *                    An empty string is invalid JSON and is rejected with
@@ -6210,6 +6233,7 @@ int32_t lance_dataset_create_vector_index_with_options_and_progress(
  *                    uses `number_of_items`/`probability`. MinHash LSH uses
  *                    `num_hashes`, `num_bands`, `shingle_size`, and
  *                    `tokenizer`. RTree uses `page_size`.
+ * @param replace If true, replace any existing index of the same name.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_dataset_create_scalar_index(
@@ -6386,6 +6410,8 @@ typedef struct LanceVectorIndexSegmentScope {
  * current snapshot. The dataset handle is not consumed and need not outlive
  * the returned builder.
  *
+ * @param dataset    Open dataset whose current snapshot the builder binds to.
+ * @param column     Column name to index.
  * @param index_name Optional index name; NULL selects the Lance default.
  * @param index_type LanceScalarIndexType discriminant, passed as int32_t so
  *                   out-of-range values can be rejected safely.
@@ -7116,6 +7142,8 @@ uint64_t lance_dataset_index_segment_count(
  * Fill `out_uuids` with the UUIDs of the segments that make up a logical index.
  * Each UUID is written as 16 raw bytes (RFC 4122 layout).
  *
+ * @param dataset    Open dataset. Must not be NULL.
+ * @param index_name Logical index name. Must not be NULL or empty.
  * @param out_uuids  Caller-allocated buffer for the UUIDs (byte length >= capacity * 16).
  * @param capacity   Number of UUIDs the buffer can hold.
  * @param out_count  Optional (may be NULL). On success, receives the number of
@@ -7137,14 +7165,13 @@ int32_t lance_dataset_index_segments(
 
 /**
  * Set the k-NN query on the scanner.
+ * @param scanner       Scanner handle. Must not be NULL.
  * @param column        Vector column (FixedSizeList<element_type>).
  * @param query_data    Pointer to a single query vector of length `query_len`.
  * @param query_len     Number of elements in the query (= column dim).
  * @param element_type  Element type of the query (must match column).
  * @param k             Number of nearest neighbors to return.
  * @return 0 on success, -1 on error.
- *
- * Defined in a follow-up commit; declaration only here.
  */
 int32_t lance_scanner_nearest(
     LanceScanner* scanner,
@@ -7339,6 +7366,7 @@ int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
  * out across workers, each handling a slice of segments. The coordinator gets
  * the segment list via `lance_dataset_index_segments()`.
  *
+ * @param scanner       Scanner handle. Must not be NULL.
  * @param segment_uuids Pointer to `len` 16-byte UUIDs concatenated end-to-end
  *                      (total byte length = `len * 16`). Each UUID identifies
  *                      one physical segment of a logical index.
@@ -7682,6 +7710,9 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_query(
  * excluded from both the scorer corpus and query results. In STRICT mode any
  * unindexed fragment makes this call fail.
  *
+ * @param dataset Open dataset whose current snapshot the context pins.
+ * @param column FTS-indexed column name.
+ * @param query Query terms.
  * @param match_operator Fixed-width LanceFtsMatchOperator discriminant.
  * @param max_fuzzy_distance Reserved for prepared fuzzy matching and currently
  *                           must be 0. The parameter is retained so enabling
@@ -7707,6 +7738,9 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(
  * Dataset identity, coverage, sharing, and segment-scoped execution follow the
  * same contract as lance_dataset_prepare_fts_match_query().
  *
+ * @param dataset Open dataset whose current snapshot the context pins.
+ * @param column FTS-indexed column name.
+ * @param query Phrase terms.
  * @param slop Maximum non-negative number of intervening token positions
  *             permitted between adjacent phrase terms.
  * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
@@ -7732,6 +7766,7 @@ void lance_fts_query_context_close(LanceFtsQueryContext* context);
  * Mutually exclusive with lance_scanner_nearest: calling either after the
  * other returns LANCE_ERR_INVALID_ARGUMENT.
  *
+ * @param scanner            Scanner handle. Must not be NULL.
  * @param query              Query string (terms).
  * @param columns            NULL-terminated array of columns, or NULL for all
  *                           FTS-indexed columns.
@@ -10912,7 +10947,16 @@ int32_t lance_transaction_commit_with_commit_lock(
  * On success the actual merged transaction and an independently owned dataset
  * are written to the output slots. Both slots are unchanged on error.
  *
- * @param transactions Array of `transaction_count` non-NULL handles.
+ * @param uri                    Dataset URI. Must not be NULL or empty.
+ * @param transactions           Array of `transaction_count` non-NULL handles.
+ * @param transaction_count      Number of handles in `transactions`.
+ * @param options                Commit options, or NULL for native defaults.
+ * @param storage_opts           NULL-terminated key/value storage options, or
+ *                               NULL for native defaults.
+ * @param session                Shared session, or NULL for the default session.
+ * @param out_dataset            Receives the committed dataset; must not be NULL.
+ * @param out_merged_transaction Receives the merged transaction; must not be
+ *                               NULL.
  * @return 0 on success, -1 on error.
  */
 int32_t lance_transaction_commit_batch(

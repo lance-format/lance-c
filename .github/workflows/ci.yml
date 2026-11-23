@@ -356,6 +356,17 @@ jobs:
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
+  api-docs:
+    name: API docs (Doxygen)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Doxygen
+        run: bash .github/scripts/install-doxygen.sh
+      - name: Render and validate the public API reference
+        run: bash .github/scripts/check-doxygen.sh
+
   msrv:
     name: MSRV (1.95.0)
     runs-on: ubuntu-24.04
