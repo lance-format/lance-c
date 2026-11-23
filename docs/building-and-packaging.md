@@ -59,9 +59,10 @@ Every package installs both the static archive and the shared library, and the t
 
 | | Static (`LanceC_LINK=static`, default) | Shared (`LanceC_LINK=shared`) |
 | --- | --- | --- |
-| Link input | `liblance_c.a` / `lance_c.lib` | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll` |
-| Defined symbols | the global symbols of the archive members the linker pulls in, including embedded native libraries | only the `lance_*` C ABI |
-| Runtime requirement | no lance-c shared library; the platform system libraries still apply | the loader must be able to find the shared library |
+| Link input | `liblance_c.a` / `lance_c.lib` | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll.lib` |
+| Runtime file | none; the executable carries the pulled archive members | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll` |
+| Public symbols | the global symbols of the archive members the linker pulls in, including embedded native libraries | only the `lance_*` exports; internal definitions are not exported |
+| Loader requirement | the platform system libraries still apply | the loader must find the runtime file |
 
 The release static archive is deliberately unstripped: it keeps the symbol table static linking requires and carries the compiled Rust graph together with the native C libraries it embeds, currently AWS-LC and zstd/LZ4. A statically linked consumer defines the global symbols of the archive members it pulls in. Overlap is about symbol names, not about both sides using the same kind of library: most AWS-LC symbols carry a versioned prefix (`aws_lc_0_39_0_*`), so linking another OpenSSL/BoringSSL-family library is not by itself a name conflict, while zstd and LZ4 keep their usual `ZSTD_*` and `LZ4_*` names that another copy also defines. When the host links a library exporting the same names, the link can resolve references against either copy depending on link order and the pulled archive members, or fail with duplicate-definition errors.
 
