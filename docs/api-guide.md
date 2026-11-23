@@ -1459,3 +1459,39 @@ This variable controls the runtime's core worker threads only. Tokio's blocking
 pool cap is `max_blocking_threads + worker_threads` (512 plus the worker count
 by default), and the async callback dispatcher uses its own thread. So
 `TOKIO_WORKER_THREADS` does not bound every thread the library may create.
+
+## Process lifetime and embedding
+
+The process-global state described above lasts for the whole process: the
+shared runtime and the diagnostic globals installed by `lance_init_logging`
+are created lazily and are never taken down. The callback dispatcher is
+attempted on the first callback dispatch and, if its thread starts, normally
+remains for the process lifetime. The C API exposes no shutdown, reset, or
+reinitialization call for any of them.
+
+- The runtime is built on first use and reused by every later call. Its core
+  worker threads stay alive until process exit, including while the library is
+  idle. Blocking-pool threads are separate: Tokio retires them after an idle
+  keep-alive (10 seconds by default), and they can be recreated later.
+- The async callback dispatcher is started on demand: the binding attempts to
+  start its thread on the first callback dispatch. If the thread starts, it
+  normally remains for the process lifetime. If startup fails or a completion
+  cannot be queued, that completion is delivered on the thread attempting to
+  dispatch it, which is not necessarily the thread that made the original API
+  call.
+- `lance_init_logging` installs its globals once. There is no API to remove or
+  reload them, and later calls are no-ops, so the configuration from the first
+  successful call lasts until process exit.
+
+Hosts that manage process lifetime themselves should account for this state:
+
+- **`fork()`**: `lance-c` provides no post-fork reset or reinitialization API
+  and registers no `pthread_atfork` handler of its own. Behavior of inherited
+  runtime, dispatcher, or logging state in a forked child is not part of the
+  documented contract. A host that forks after its first runtime-backed call or
+  after `lance_init_logging` has no binding API that restores a clean state in
+  the child.
+- **`dlopen`/`dlclose`**: because there is no shutdown call, an unload path has
+  no supported way to stop the runtime or dispatcher or to uninstall the
+  logging globals before the library is unloaded. Unloading the library after
+  it has used the runtime is not a documented support path.
