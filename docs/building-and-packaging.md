@@ -55,17 +55,19 @@ Follow the [quickstart](../README.md#quickstart) to verify the archive and open 
 
 ## Choosing static or shared linkage
 
-Every package installs both the static archive and the shared library, and the two differ in how they expose the native libraries compiled into them.
+Every package installs both the static archive and the shared library, and the two differ in what they define and what they need at load time.
 
 | | Static (`LanceC_LINK=static`, default) | Shared (`LanceC_LINK=shared`) |
 | --- | --- | --- |
-| Library | `liblance_c.a` / `lance_c.lib` | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll` |
-| Defined symbols | every symbol in the archive members the linker pulls in, including bundled native libraries | only the public `lance_*` C ABI |
-| Deployment | one self-contained executable | ship the shared library beside the executable |
+| Link input | `liblance_c.a` / `lance_c.lib` | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll` |
+| Defined symbols | the global symbols of the archive members the linker pulls in, including embedded native libraries | only the `lance_*` C ABI |
+| Runtime requirement | no lance-c shared library; the platform system libraries still apply | the loader must be able to find the shared library |
 
-The release static archive is deliberately unstripped: it keeps the symbol table static linking requires and carries the compiled Rust graph together with the native C libraries it embeds, currently AWS-LC and zstd/LZ4. A statically linked consumer therefore defines those libraries' symbols itself. If the same process also links its own copy of an overlapping native library, the linker resolves each symbol against whichever definition it sees, so link order and the set of pulled archive members decide which copy satisfies a reference.
+The release static archive is deliberately unstripped: it keeps the symbol table static linking requires and carries the compiled Rust graph together with the native C libraries it embeds, currently AWS-LC and zstd/LZ4. A statically linked consumer defines the global symbols of the archive members it pulls in. Overlap is about symbol names, not about both sides using the same kind of library: most AWS-LC symbols carry a versioned prefix (`aws_lc_0_39_0_*`), so linking another OpenSSL/BoringSSL-family library is not by itself a name conflict, while zstd and LZ4 keep their usual `ZSTD_*` and `LZ4_*` names that another copy also defines. When the host links a library exporting the same names, the link can resolve references against either copy depending on link order and the pulled archive members, or fail with duplicate-definition errors.
 
-Use shared linkage when the host already links native libraries that overlap the ones lance-c bundles, such as another OpenSSL/BoringSSL-family library, zstd or LZ4, or when several components in one process link lance-c. The shared library hides its embedded copies: its dynamic export table contains only the `lance_*` C ABI, so those symbols never enter the host's symbol space. Use static linkage when the host ships as one self-contained executable and does not link overlapping native libraries.
+Use shared linkage when the host itself links zstd, LZ4 or another library that exports the same symbol names, or when several components in one process link lance-c. The shared library exports only the `lance_*` C ABI; its embedded native symbols are hidden from those public exports and do not appear in its dynamic symbol table. Make the installed shared library available to the loader through the system library path, an `$ORIGIN`-based RUNPATH, `LD_LIBRARY_PATH`, or the local equivalent. Copying it next to an ELF executable does not make it loadable unless the loader also searches that directory.
+
+Use static linkage when the host does not link libraries exporting those names and should not depend on the lance-c shared library. A static consumer is still subject to the platform system libraries recorded in the package metadata, such as `-lpthread -ldl -lm` on Linux.
 
 With CMake, set `LanceC_LINK` before `find_package`:
 

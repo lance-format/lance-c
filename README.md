@@ -48,7 +48,7 @@ find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
-CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to use the shared library, which keeps its bundled native libraries private to the process; prefer it when the host already links its own copies of overlapping compression or crypto libraries. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules).
+CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules).
 
 With pkg-config, point `PKG_CONFIG_PATH` at the archive's `lib/pkgconfig`:
 
