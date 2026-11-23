@@ -5,6 +5,17 @@
  * @file lance.h
  * @brief C API for the Lance columnar data format.
  *
+ * This umbrella header keeps the complete 0.2 public C ABI. Callers that use
+ * only the dataset read path may include the focused domain headers instead:
+ *
+ *   - <lance/dataset.h>  open, close, snapshots, metadata, version history
+ *   - <lance/scanner.h>  scanner configuration, planning and iteration
+ *   - <lance/batch.h>    LanceBatch <-> Arrow C Data Interface
+ *
+ * Domain headers include <lance/arrow_abi.h> and <lance/fwd.h>. Include
+ * <lance/error.h> for the thread-local error accessors and <lance/version.h>
+ * for the version macros or lance_c_version().
+ *
  * All data crosses this boundary via the Arrow C Data Interface
  * (ArrowSchema, ArrowArray, ArrowArrayStream).
  * For Arrow structures written to caller-provided output storage, the caller
@@ -25,151 +36,17 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* ─── Binding version ─── */
-
-/* Version of the lance-c binding, synchronized with Cargo.toml. These macros
- * describe this C API release, not the Lance core dataset/file writer version
- * or a Git pin. */
-#define LANCE_C_VERSION_MAJOR 0
-#define LANCE_C_VERSION_MINOR 2
-#define LANCE_C_VERSION_PATCH 1
-/* Pre-release suffix without the leading '-'; empty for a stable release. */
-#define LANCE_C_VERSION_PRE "beta.3"
-/* Full Cargo package version, including any pre-release or build suffix. */
-#define LANCE_C_VERSION_STRING "0.2.1-beta.3"
-#define LANCE_C_VERSION_ENCODE(major, minor, patch) \
-    (((major) * 1000000) + ((minor) * 1000) + (patch))
-/* Numeric form for #if comparisons. The pre-release suffix is not encoded, so
- * a pre-release compares equal to its base release; use LANCE_C_VERSION_PRE or
- * LANCE_C_VERSION_STRING when the exact release identity matters. Major,
- * minor, and patch must each be less than 1000. */
-#define LANCE_C_VERSION \
-    LANCE_C_VERSION_ENCODE(LANCE_C_VERSION_MAJOR, LANCE_C_VERSION_MINOR, LANCE_C_VERSION_PATCH)
+#include "lance/version.h"
+#include "lance/arrow_abi.h"
+#include "lance/error.h"
+#include "lance/fwd.h"
+#include "lance/dataset.h"
+#include "lance/scanner.h"
+#include "lance/batch.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**
- * Return the version of the loaded lance-c library as a NUL-terminated string,
- * including any pre-release suffix (for example "0.2.0-beta.1").
- *
- * The returned string is owned by the library and remains valid for the
- * process lifetime; do not free it. Compare it with LANCE_C_VERSION_STRING
- * from the headers used at compile time to detect a header/library mismatch.
- *
- * This reports the lance-c binding release, not the Lance core writer version
- * or a Git revision.
- */
-const char* lance_c_version(void);
-
-/* Opaque native dynamic storage-options handles. The accessor is declared
-   early because dataset open and write options attach it. */
-typedef struct LanceStorageOptionsAccessor LanceStorageOptionsAccessor;
-
-/* ─── Arrow C Data and Stream Interface declarations ─── */
-/* These match the canonical Arrow C ABI. Including arrow/c/abi.h first
-   defines the matching ARROW_C_* guard, so the declarations below are
-   skipped. */
-
-#ifndef ARROW_C_DATA_INTERFACE
-#define ARROW_C_DATA_INTERFACE
-
-#define ARROW_FLAG_DICTIONARY_ORDERED 1
-#define ARROW_FLAG_NULLABLE 2
-#define ARROW_FLAG_MAP_KEYS_SORTED 4
-
-struct ArrowSchema {
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-
-struct ArrowArray {
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-#endif /* ARROW_C_DATA_INTERFACE */
-
-#ifndef ARROW_C_STREAM_INTERFACE
-#define ARROW_C_STREAM_INTERFACE
-
-struct ArrowArrayStream {
-    int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
-    int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
-    const char* (*get_last_error)(struct ArrowArrayStream*);
-    void (*release)(struct ArrowArrayStream*);
-    void* private_data;
-};
-
-#endif /* ARROW_C_STREAM_INTERFACE */
-
-/* ─── Error handling ─── */
-
-typedef enum {
-    LANCE_OK = 0,
-    LANCE_ERR_INVALID_ARGUMENT = 1,
-    LANCE_ERR_IO = 2,
-    LANCE_ERR_NOT_FOUND = 3,
-    LANCE_ERR_DATASET_ALREADY_EXISTS = 4,
-    LANCE_ERR_INDEX = 5,
-    LANCE_ERR_INTERNAL = 6,
-    LANCE_ERR_NOT_SUPPORTED = 7,
-    LANCE_ERR_COMMIT_CONFLICT = 8,
-    /* An unexpected panic was caught at the FFI boundary. */
-    LANCE_ERR_PANIC = 9,
-} LanceErrorCode;
-
-/**
- * Panic handling (issue lance-format/lance-c#61).
- *
- * A panic raised inside Lance/Arrow code is caught at the FFI boundary and
- * reported as LANCE_ERR_PANIC through the usual thread-local error channel
- * (lance_last_error_code / lance_last_error_message) instead of unwinding
- * into the host. After a panic:
- *
- *  - A LanceScanner handle is poisoned: every later call on it fails with
- *    LANCE_ERR_PANIC ("scanner is poisoned by an earlier panic"). Close it
- *    and build a fresh scanner; do not retry the poisoned handle.
- *  - A LanceDataset handle remains usable: commits are atomic manifest
- *    swaps, and a mutation that panics before commit rolls back in memory,
- *    leaving the last committed snapshot intact.
- *
- * Honest limits: a double panic, a panic in a destructor while unwinding, a
- * stack overflow, or an allocation failure still aborts the process. A
- * panic caught inside a close/free call (lance_*_close, lance_batch_free,
- * lance_free_string, lance_scanner_async_stream_free, or the release callback
- * of an exported ArrowArrayStream) is logged and the remainder of the value
- * may leak — close is best-effort by design. Post-panic process state is
- * best-effort: hosts should fail the in-flight query rather than retry a
- * poisoned handle.
- *
- * Callbacks passed INTO the library (LanceCallback, LanceWaker, and
- * LanceScanStatisticsCallback, LanceTrackedFilesProgressCallback and
- * LanceTrackedFilesProgressRelease) are the reverse direction and are NOT
- * covered by this contract: their ABI is non-unwinding, so a callback that
- * throws or unwinds can abort the host process before the library can contain
- * it. Callbacks must return normally.
- *
- * This contract requires Rust's `panic = "unwind"` strategy. The crate
- * rejects `panic = "abort"` builds at compile time because catch_unwind
- * cannot provide this API contract in such a build.
- */
 
 /* ─── Index types (Phase 2) ─── */
 
@@ -367,16 +244,6 @@ typedef struct LanceScalarIndexOptions {
     bool has_train;
     bool train;
 } LanceScalarIndexOptions;
-
-/** Return the error code from the last failed operation on this thread. */
-LanceErrorCode lance_last_error_code(void);
-
-/** Return the error message. Caller must free with lance_free_string(). */
-const char* lance_last_error_message(void);
-
-/** Free a string returned by lance_last_error_message(). */
-void lance_free_string(const char* s);
-
 /* ─── Diagnostic logging ─── */
 
 /**
@@ -411,63 +278,6 @@ void lance_free_string(const char* s);
  * @return 0 on success, -1 on an invalid or non-UTF-8 filter.
  */
 int32_t lance_init_logging(const char* filter);
-
-/* ─── Opaque handles ─── */
-
-typedef struct LanceDataset  LanceDataset;
-typedef struct LanceScanner  LanceScanner;
-typedef struct LanceBatch    LanceBatch;
-typedef struct LanceSession  LanceSession;
-typedef struct LanceVersions LanceVersions;
-typedef struct LanceVersion  LanceVersion;
-typedef struct LanceVersionRefs LanceVersionRefs;
-typedef struct LanceRef      LanceRef;
-typedef struct LanceTag      LanceTag;
-typedef struct LanceTags     LanceTags;
-typedef struct LanceDataStatistics LanceDataStatistics;
-typedef struct LanceCleanupExplanation LanceCleanupExplanation;
-typedef struct LanceDatasetConfig LanceDatasetConfig;
-typedef struct LanceDatasetDeltaBuilder LanceDatasetDeltaBuilder;
-typedef struct LanceDatasetDelta LanceDatasetDelta;
-typedef struct LanceSqlQueryBuilder LanceSqlQueryBuilder;
-typedef struct LanceSqlQuery LanceSqlQuery;
-typedef struct LanceCompactionOptionsV2 LanceCompactionOptionsV2;
-typedef struct LanceCompactionPlan LanceCompactionPlan;
-typedef struct LanceCompactionTask LanceCompactionTask;
-typedef struct LanceRewriteResult LanceRewriteResult;
-typedef struct LanceOptimizeIndicesOptions LanceOptimizeIndicesOptions;
-typedef struct LanceOptimizeIndicesPlan LanceOptimizeIndicesPlan;
-typedef struct LanceOptimizeIndexTask LanceOptimizeIndexTask;
-typedef struct LanceOptimizeIndexMerge LanceOptimizeIndexMerge;
-typedef struct LanceIndexSegmentResult LanceIndexSegmentResult;
-typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
-typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
-typedef struct LanceFtsQueryContext LanceFtsQueryContext;
-typedef struct LanceFtsQuery LanceFtsQuery;
-typedef struct LanceFtsTokenList LanceFtsTokenList;
-typedef struct LanceBlobFile LanceBlobFile;
-typedef struct LanceBlobDescriptorArrayBuilder LanceBlobDescriptorArrayBuilder;
-typedef struct LanceDataFile LanceDataFile;
-/** Owned native `DataReplacementGroup` snapshot. */
-typedef struct LanceDataReplacementGroup LanceDataReplacementGroup;
-typedef struct LanceFragment LanceFragment;
-typedef struct LanceTransaction LanceTransaction;
-typedef struct LanceOperation LanceOperation;
-typedef struct LanceDataOverlayFile LanceDataOverlayFile;
-typedef struct LanceDataOverlayGroup LanceDataOverlayGroup;
-typedef struct LanceFragmentOverlayWriter LanceFragmentOverlayWriter;
-typedef struct LanceFragmentUpdateColumnsResult LanceFragmentUpdateColumnsResult;
-typedef struct LanceUpdatedFragmentOffsets LanceUpdatedFragmentOffsets;
-typedef struct LanceKeyExistenceFilter LanceKeyExistenceFilter;
-typedef struct LanceRewriteGroup LanceRewriteGroup;
-typedef struct LanceRewrittenIndex LanceRewrittenIndex;
-typedef struct LanceCompactedSsTable LanceCompactedSsTable;
-typedef struct LanceIvfModel LanceIvfModel;
-typedef struct LanceSchema LanceSchema;
-typedef struct LanceNamespace LanceNamespace;
-typedef struct LanceRestAdapter LanceRestAdapter;
-typedef struct LanceCommitLock LanceCommitLock;
-
 /* ─── Thread safety ─── */
 
 /**
@@ -510,7 +320,6 @@ typedef struct LanceCommitLock LanceCommitLock;
  * Callbacks that native code may run on another thread or concurrently must be
  * thread-safe as stated at their declaration.
  */
-
 /* ─── Shared session ─── */
 
 /*
@@ -665,245 +474,6 @@ int32_t lance_session_get_approx_num_items(
     const LanceSession* session,
     uint64_t* out_num_items
 );
-
-/* ─── Dataset lifecycle ─── */
-
-/*
- * A dataset handle may be shared across threads. Snapshot-based reads may
- * overlap each other and may overlap in-place mutations. In-place mutations
- * take the handle's internal write lock for the complete native call, including
- * synchronous callbacks, so they serialize; a reader that already holds a
- * snapshot keeps its old view. Snapshot-style operations such as restore and
- * checkout_* work from a snapshot and return a new handle; they do not mutate
- * the source handle and are not serialized by its lock. Restore still follows
- * native commit-conflict rules. lance_dataset_close is exclusive.
- */
-
-/**
- * Open a Lance dataset.
- *
- * Pass `version` = 0 to open the latest, or a specific version id (e.g. one
- * returned by `lance_dataset_versions`) to check out that version:
- *
- *     LanceDataset* ds = lance_dataset_open("data.lance", NULL, 42);
- *
- * @param uri           Dataset path (file://, s3://, memory://, etc.)
- * @param storage_opts  NULL-terminated key-value pairs ["k1","v1",NULL], or NULL
- * @param version       Version to open (0 = latest)
- * @return Dataset handle, or NULL on error
- */
-LanceDataset* lance_dataset_open(
-    const char* uri,
-    const char* const* storage_opts,
-    uint64_t version
-);
-
-/**
- * Open a Lance dataset using a shared session.
- *
- * The dataset retains the shared session state and remains valid if the caller
- * subsequently closes `session`.
- *
- * @param uri           Dataset path (file://, s3://, memory://, etc.)
- * @param storage_opts  NULL-terminated key-value pairs ["k1","v1",NULL], or NULL
- * @param version       Version to open (0 = latest)
- * @param session       Shared session; must not be NULL
- * @return Dataset handle, or NULL on error
- */
-LanceDataset* lance_dataset_open_with_session(
-    const char* uri,
-    const char* const* storage_opts,
-    uint64_t version,
-    const LanceSession* session
-);
-
-/**
- * Additive options for lance_dataset_open_with_options.
- *
- * Zero-initialize to open the latest version with native storage defaults.
- * `storage_options_accessor` may be NULL for native defaults or point to a
- * native dynamic accessor. The native dataset retains the accessor (and its
- * provider/cache) after this call, so closing the C accessor does not
- * invalidate later dataset I/O. Static options belong in the accessor's
- * initial options. `version == 0` opens the latest version.
- */
-typedef struct LanceDatasetOpenOptions {
-    uint64_t version;
-    const LanceStorageOptionsAccessor* storage_options_accessor;
-} LanceDatasetOpenOptions;
-
-/**
- * Open a dataset with additive options and an optional shared session.
- *
- * `options` may be NULL, which is equivalent to a zero-initialized struct.
- * `session` may be NULL for the default session. A non-NULL session is
- * retained through shared ownership, exactly like
- * lance_dataset_open_with_session.
- *
- * The returned dataset retains the native accessor and its provider. Later
- * dataset I/O uses the native provider refresh, error and cache policy; the
- * binding adds no second credential cache. Passing NULL for the accessor
- * preserves the existing native default behavior.
- *
- * @return Dataset handle, or NULL on error.
- */
-LanceDataset* lance_dataset_open_with_options(
-    const char* uri,
-    const LanceDatasetOpenOptions* options,
-    const LanceSession* session
-);
-
-/* Defined with the native write-options declarations below; forward-declared
- * here so the source-store open entry point can take it by pointer. */
-typedef struct LanceBaseStoreParamsList LanceBaseStoreParamsList;
-
-/**
- * Open a dataset with additive options, an optional shared session, and
- * per-base store parameters for its shared bases.
- *
- * `options` and `session` have the same meaning and ownership behavior as
- * lance_dataset_open_with_options: NULL options means latest version and native
- * storage defaults, and NULL session means the default session. A non-NULL
- * accessor is retained natively and closing the C accessor does not invalidate
- * the dataset.
- *
- * `base_store_params` binds native `ObjectStoreParams` to exact
- * `BasePath.path` keys from the dataset manifest:
- *
- * - NULL selects native `None` (no per-base bindings).
- * - A non-NULL list with `count == 0` selects native `Some(empty)`, which adds
- *   no bindings.
- * - Entries match the exact stored base path, not a base id or name and with no
- *   URI normalization. Duplicate keys use the last entry.
- *
- * An exact binding takes precedence over the dataset-level storage options.
- * Without one, native base store resolution falls back to the dataset-level
- * accessor/options scoped to that base. These bindings are runtime-only:
- * Lance does not persist accessors, credentials, or other store parameters in
- * the dataset, so reopening the dataset later must supply them again when the
- * base needs them. This call adds no second parser, credential cache, or store
- * manager.
- *
- * Malformed lists are rejected before the native dataset is opened. A NULL
- * `items` with a non-zero `count`, a NULL or non-UTF-8 base path, an
- * out-of-range block size, or invalid S3 refresh nanoseconds returns NULL with
- * LANCE_ERR_INVALID_ARGUMENT.
- *
- * @param uri               Dataset path (file://, s3://, memory://, etc.)
- * @param options           Additive open options, or NULL
- * @param session           Shared session, or NULL for the default session
- * @param base_store_params Per-base bindings, or NULL for native None
- * @return Dataset handle, or NULL on error
- */
-LanceDataset* lance_dataset_open_with_base_store_params(
-    const char* uri,
-    const LanceDatasetOpenOptions* options,
-    const LanceSession* session,
-    const LanceBaseStoreParamsList* base_store_params
-);
-
-/**
- * Open a Lance dataset through a foreign commit lock and an optional dynamic
- * storage-options accessor.
- *
- * A non-NULL `storage_accessor` forwards its native accessor owner; NULL, or
- * an accessor constructed without an inner owner, selects native omission.
- * `commit_lock` may be NULL to keep the URI-derived native handler. `session`
- * may be NULL. `version == 0` opens the latest version.
- *
- * The returned dataset retains the native handler and accessor owners, so
- * closing either input handle afterwards does not invalidate this dataset,
- * its scanners, or later commits performed through it.
- *
- * @param uri               Dataset path (file://, s3://, memory://, etc.)
- * @param storage_accessor  Dynamic storage-options accessor, or NULL
- * @param version           Version to open; 0 opens the latest version
- * @param session           Shared session, or NULL for the default session
- * @param commit_lock       Foreign commit lock, or NULL for the URI-derived
- *                          native handler
- * @param out_dataset       Receives the dataset handle on success; must not
- *                          be NULL
- * @return 0 on success, -1 on error
- */
-int32_t lance_dataset_open_with_commit_lock(
-    const char* uri,
-    const LanceStorageOptionsAccessor* storage_accessor,
-    uint64_t version,
-    const LanceSession* session,
-    const LanceCommitLock* commit_lock,
-    LanceDataset** out_dataset
-);
-
-/** Close and free a dataset handle. Safe to call with NULL. */
-void lance_dataset_close(LanceDataset* dataset);
-
-/**
- * Clone a dataset handle as an independent in-memory snapshot.
- *
- * The returned handle shares the source's native Dataset snapshot and its
- * Arc-backed state (session, object-store registry, caches, commit handler),
- * but has its own lock. Cloning performs no storage I/O. Mutating either
- * handle does not change the other handle's version, schema, or rows, and
- * does not hold the other handle's lock. Close the returned handle with
- * `lance_dataset_close`; source and clone may be closed in either order.
- *
- * This duplicates an in-memory handle; it is not Lance's on-disk shallow or
- * deep clone operation.
- *
- * @param dataset Source handle; must not be NULL
- * @return New independent handle, or NULL on error
- */
-LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
-
-/* ─── Dataset metadata (sync, in-memory) ─── */
-
-/**
- * Return the version number of this dataset snapshot.
- * @return version on success, or 0 on error (check lance_last_error_code())
- */
-uint64_t lance_dataset_version(const LanceDataset* dataset);
-
-/**
- * Return the fully qualified URI of this dataset snapshot.
- *
- * This copies native `Dataset::uri()`, the URI resolved when the dataset was
- * opened. A namespace-opened dataset reports the `describe_table` location,
- * not its table ID. The returned string stays valid after the dataset handle
- * is closed.
- *
- * Caller must free the returned string with `lance_free_string()`.
- * Returns NULL on error, including a NULL dataset handle.
- */
-const char* lance_dataset_uri(const LanceDataset* dataset);
-
-/**
- * Return the number of rows. Returns 0 on error; an empty dataset also returns
- * 0, so check lance_last_error_code().
- */
-uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
-
-/**
- * Return the number of rows matching an optional SQL filter.
- *
- * `filter == NULL` maps to native `Dataset::count_rows(None)` and uses the
- * metadata fast path. A non-NULL `filter`, including `""`, maps to
- * `Dataset::count_rows(Some(filter))` and therefore follows native SQL filter
- * parsing and error semantics.
- *
- * Returns 0 on error; an empty match also returns 0, so check
- * lance_last_error_code().
- */
-uint64_t lance_dataset_count_rows_filtered(
-    const LanceDataset* dataset,
-    const char* filter
-);
-
-/**
- * Return the latest version ID (I/O), or 0 on error (check
- * lance_last_error_code()).
- */
-uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
-
 /* ─── Dataset maintenance ─── */
 
 /**
@@ -1220,7 +790,6 @@ int32_t lance_dataset_num_small_files(
     size_t max_rows_per_group,
     uint64_t* out_count
 );
-
 /* ─── Dataset table and schema metadata ─── */
 
 /** How a metadata update applies to the existing map. */
@@ -1421,123 +990,6 @@ const char* lance_dataset_field_path(
     const LanceDataset* dataset,
     int32_t field_id
 );
-
-/* ─── Version history ─── */
-
-/**
- * Snapshot the current dataset version, including its native metadata summary.
- * Caller frees the returned handle with lance_version_close(). The snapshot is
- * copied and remains valid after the dataset is closed.
- * @return handle on success, or NULL on error
- */
-LanceVersion* lance_dataset_current_version(const LanceDataset* dataset);
-
-/**
- * Version id from a current-version or history snapshot.
- * Returns 0 on error (check lance_last_error_code()).
- */
-uint64_t lance_version_id(const LanceVersion* version);
-
-/**
- * Commit timestamp as Unix epoch nanoseconds. Returns 0 on error (check
- * lance_last_error_code()).
- *
- * The i64 nanosecond representation covers 1677-09-21 through 2262-04-11 UTC.
- * A timestamp outside that range makes this accessor return 0 with
- * LANCE_ERR_INVALID_ARGUMENT. Snapshot creation and millisecond reads retain
- * the native timestamp range.
- */
-int64_t lance_version_timestamp_ns(const LanceVersion* version);
-
-/**
- * Number of version metadata entries. Native version metadata is the manifest
- * summary map; it is empty only when the native map is empty. Returns 0 on
- * error, so check lance_last_error_code().
- */
-uint64_t lance_version_metadata_count(const LanceVersion* version);
-
-/**
- * Metadata key at `index`, borrowed until the version handle is closed.
- * Returns NULL on error (NULL handle or out-of-range index).
- */
-const char* lance_version_metadata_key_at(
-    const LanceVersion* version,
-    size_t index
-);
-
-/**
- * Metadata value at `index`, borrowed until the version handle is closed.
- * Returns NULL on error (NULL handle or out-of-range index).
- */
-const char* lance_version_metadata_value_at(
-    const LanceVersion* version,
-    size_t index
-);
-
-/** Close and free a current-version snapshot. Safe to call with NULL. */
-void lance_version_close(LanceVersion* version);
-
-/**
- * Snapshot the dataset's version history. Caller frees the returned handle
- * with lance_versions_close(). The copied snapshot remains valid after the
- * dataset is closed. Entries are ordered by version id.
- * @return handle on success, or NULL on error
- */
-LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
-
-/**
- * Number of versions in the snapshot, or 0 on error (check
- * lance_last_error_code()).
- */
-uint64_t lance_versions_count(const LanceVersions* versions);
-
-/**
- * Borrowed version details at `index` (0 <= index < count), or NULL on error.
- * The pointer remains valid until lance_versions_close().
- */
-const LanceVersion* lance_versions_at(const LanceVersions* versions, size_t index);
-
-/**
- * Monotonic version id at `index` (0 <= index < count).
- * Returns 0 on error (NULL handle or out-of-range index) — check
- * lance_last_error_code().
- */
-uint64_t lance_versions_id_at(const LanceVersions* versions, size_t index);
-
-/**
- * Version timestamp at `index`, as Unix epoch milliseconds.
- * Returns 0 on error (NULL handle or out-of-range index) — check
- * lance_last_error_code().
- */
-int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t index);
-
-/** Close and free a versions handle. Safe to call with NULL. */
-void lance_versions_close(LanceVersions* versions);
-
-/**
- * Snapshot the lightweight attached-version references. Unlike full version
- * details, this only enumerates the attached manifest locations. Caller frees
- * with lance_version_refs_close(). The snapshot remains valid after the dataset
- * is closed. Entries are ordered by version id.
- * @return handle on success, or NULL on error
- */
-LanceVersionRefs* lance_dataset_version_refs(const LanceDataset* dataset);
-
-/** Number of lightweight version refs, or 0 on error. */
-uint64_t lance_version_refs_count(const LanceVersionRefs* refs);
-
-/**
- * Version id at `index`, or 0 on error (NULL handle or out-of-range index).
- * Check lance_last_error_code() to distinguish an error.
- */
-uint64_t lance_version_refs_id_at(
-    const LanceVersionRefs* refs,
-    size_t index
-);
-
-/** Close and free a lightweight version-ref snapshot. Safe to call with NULL. */
-void lance_version_refs_close(LanceVersionRefs* refs);
-
 /* ─── Native references and checkout ─── */
 
 /** Construct Ref::VersionNumber(version). Caller frees with lance_ref_close(). */
@@ -1702,7 +1154,6 @@ int32_t lance_dataset_shallow_clone(
     const LanceStorageOptionsAccessor* target_storage_options,
     LanceDataset** out
 );
-
 /* ─── Branches ─── */
 
 /**
@@ -1825,7 +1276,6 @@ int32_t lance_dataset_branch_replace_metadata(
     const char* branch_name,
     const char* const* metadata
 );
-
 /* ─── Tags ─── */
 
 /**
@@ -1961,7 +1411,6 @@ const char* lance_tag_metadata_value_at(const LanceTag* tag, size_t index);
 
 /** Close and free one tag handle. Safe to call with NULL. */
 void lance_tag_close(LanceTag* tag);
-
 /* ─── Data statistics ─── */
 
 /**
@@ -2003,7 +1452,6 @@ uint64_t lance_data_statistics_bytes_on_disk_at(const LanceDataStatistics* stats
 
 /** Close and free a data statistics handle. Safe to call with NULL. */
 void lance_data_statistics_close(LanceDataStatistics* stats);
-
 /* ─── Dataset config ─── */
 
 /**
@@ -2104,7 +1552,6 @@ const char* lance_dataset_update_config_json(
     size_t count,
     LanceMetadataUpdateMode mode
 );
-
 /* ─── Dataset base paths ─── */
 
 /**
@@ -2201,7 +1648,6 @@ int32_t lance_dataset_add_bases(
     size_t base_count,
     const LanceTransactionProperties* transaction_properties
 );
-
 /* ─── Dataset file enumeration ─── */
 
 /**
@@ -2370,7 +1816,6 @@ int32_t lance_dataset_update(
     size_t num_updates,
     uint64_t* out_num_updated
 );
-
 /* ─── lance_dataset_merge_insert ──────────────────────────────────────────── */
 
 /**
@@ -2477,7 +1922,6 @@ int32_t lance_dataset_merge_insert(
     const LanceMergeInsertParams* params,
     LanceMergeInsertResult* out_result
 );
-
 /* ─── lance_dataset_merge ─────────────────────────────────────────────────── */
 
 /**
@@ -2518,7 +1962,6 @@ int32_t lance_dataset_merge(
     const char* right_on,
     struct ArrowArrayStream* source
 );
-
 /* ─── BatchUDF callbacks ─────────────────────────────────────────────────── */
 
 /**
@@ -2754,7 +2197,6 @@ int32_t lance_dataset_add_columns_batch_udf_v2(
     const char* const* read_columns,
     const uint32_t* batch_size
 );
-
 /* ─── Commit lock ─────────────────────────────────────────────────────────── */
 
 /**
@@ -2852,7 +2294,6 @@ LanceCommitLock* lance_commit_lock_new(
  * Retained datasets and leases keep their native context owner.
  */
 void lance_commit_lock_close(LanceCommitLock* lock);
-
 /* ─── lance_dataset_compact_files ─────────────────────────────────────────── */
 
 /**
@@ -2919,7 +2360,6 @@ int32_t lance_dataset_compact_files(
     const LanceCompactionOptions* options,
     LanceCompactionMetrics* out_metrics
 );
-
 /* ─── Native maintenance lifecycle ────────────────────────────────────────── */
 
 /** Migrate this dataset's manifest paths to v2 naming. Native rename behavior. */
@@ -2927,7 +2367,6 @@ int32_t lance_dataset_migrate_manifest_paths_v2(LanceDataset* dataset);
 
 /** Delete all rows through native Dataset::truncate_table. */
 int32_t lance_dataset_truncate_table(LanceDataset* dataset);
-
 /* ─── Native compaction options V2 ────────────────────────────────────────── */
 
 /** Controls how data is rewritten during compaction. */
@@ -3148,7 +2587,6 @@ int32_t lance_dataset_commit_compaction(
     const LanceCompactionOptionsV2* options,
     LanceCompactionMetrics* out_metrics
 );
-
 /* ─── Native index optimization ───────────────────────────────────────────── */
 
 /** Create options from native OptimizeOptions::default(). */
@@ -3364,7 +2802,6 @@ int32_t lance_dataset_commit_optimize_indices(
     size_t result_count,
     const LanceOptimizeIndicesOptions* options
 );
-
 /* ─── lance_dataset_drop_columns ──────────────────────────────────────────── */
 
 /**
@@ -3395,7 +2832,6 @@ int32_t lance_dataset_drop_columns(
     const char* const* columns,
     size_t num_columns
 );
-
 /* ─── lance_dataset_alter_columns ─────────────────────────────────────────── */
 
 /**
@@ -3470,7 +2906,6 @@ int32_t lance_dataset_alter_columns(
     const LanceColumnAlteration* alterations,
     size_t num_alterations
 );
-
 /* ─── lance_dataset_add_columns ───────────────────────────────────────────── */
 
 /**
@@ -3607,7 +3042,6 @@ int32_t lance_dataset_schema_clone(
     const LanceDataset* dataset,
     LanceSchema** out_schema
 );
-
 /* ─── Native schema values ─── */
 
 /**
@@ -3697,7 +3131,6 @@ int32_t lance_schema_field_id(
     const char* column,
     int32_t* out_field_id
 );
-
 /* ─── Fragment enumeration ─── */
 
 /**
@@ -3712,7 +3145,6 @@ uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
  * @return 0 on success, -1 on error
  */
 int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
-
 /* ─── Fragment handles ─── */
 
 /**
@@ -4108,7 +3540,6 @@ int32_t lance_fragment_delete(
     const char* predicate,
     LanceFragment** out_fragment
 );
-
 /* ─── Fragment mutation and staging ─── */
 
 /**
@@ -4418,7 +3849,6 @@ int32_t lance_fragment_update_columns_result_matched_offsets(
     uint32_t* out_offsets,
     size_t count
 );
-
 /* ─── Random access ─── */
 
 /**
@@ -4479,7 +3909,6 @@ int32_t lance_dataset_take_rows(
     const char* const* columns,
     struct ArrowArrayStream* out
 );
-
 /* ─── Blob v2 random access ─── */
 
 /*
@@ -4787,7 +4216,6 @@ int32_t lance_blob_file_is_closed(
  * @param blob  Blob handle, or NULL.
  */
 void lance_blob_file_close(LanceBlobFile* blob);
-
 /* ─── Blob v2 fields and prepared descriptor arrays ─── */
 
 /**
@@ -5020,7 +4448,6 @@ int32_t lance_blob_descriptor_array_builder_finish(
 void lance_blob_descriptor_array_builder_close(
     LanceBlobDescriptorArrayBuilder* builder
 );
-
 /* ─── Planned whole-blob and blob-range reads ─── */
 
 /**
@@ -5154,884 +4581,6 @@ int32_t lance_dataset_read_blob_ranges(
     const LanceBlobReadOptions* options,
     struct ArrowArrayStream* out
 );
-
-/* ─── Scanner builder ─── */
-
-/*
- * A scanner is a stateful builder and iterator; no internal lock makes its
- * configuration or iteration calls concurrent. All lance_scanner_* calls on
- * one handle must be serialized by the caller, including planning,
- * introspection, iteration, poll, and async entry points.
- * Each exported ArrowArrayStream is independent and may outlive the scanner,
- * but callbacks on one stream must be serialized. lance_scanner_close is
- * exclusive and waits for in-flight poll wakers.
- */
-
-/**
- * Create a scanner for the dataset.
- * @param dataset  Open dataset (not consumed)
- * @param columns  NULL-terminated column names, or NULL for all
- * @param filter   SQL filter expression, or NULL
- * @return Scanner handle, or NULL on error
- */
-LanceScanner* lance_scanner_new(
-    const LanceDataset* dataset,
-    const char* const* columns,
-    const char* filter
-);
-
-int32_t lance_scanner_set_limit(LanceScanner* scanner, int64_t limit);
-int32_t lance_scanner_set_offset(LanceScanner* scanner, int64_t offset);
-int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
-
-/**
- * Set the target output batch size in bytes.
- *
- * When set, this takes precedence over the row-based batch size. The value
- * must be greater than zero and must be set before scanning starts. The call
- * is rejected without changing scanner state if strict batch sizing is enabled.
- */
-int32_t lance_scanner_set_batch_size_bytes(
-    LanceScanner* scanner,
-    uint64_t batch_size_bytes
-);
-
-/**
- * Set the scanner I/O buffer size in bytes.
- *
- * The value must be between 1 and INT64_MAX, inclusive, and must be set before
- * scanning starts. This bounds buffered I/O received from storage, but is not
- * a hard limit on all memory used by the scanner.
- *
- * @param scanner               Scanner handle. Must not be NULL.
- * @param io_buffer_size_bytes  I/O buffer size in bytes, in the range [1, INT64_MAX].
- * @return 0 on success, -1 on error.
- */
-int32_t lance_scanner_set_io_buffer_size(
-    LanceScanner* scanner,
-    uint64_t io_buffer_size_bytes
-);
-
-/**
- * Set the maximum number of batches decoded concurrently.
- *
- * @param scanner          Scanner handle. Must not be NULL.
- * @param batch_readahead  Number of in-flight batch decode tasks. Must be greater than zero.
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_batch_readahead(
-    LanceScanner* scanner,
-    size_t batch_readahead
-);
-
-/**
- * Set fragment readahead for unordered scans.
- *
- * This setting is only used when scan-in-order is disabled. The value must be
- * greater than zero.
- */
-int32_t lance_scanner_set_fragment_readahead(
-    LanceScanner* scanner,
-    size_t fragment_readahead
-);
-
-/**
- * Set the target number of physical execution partitions.
- *
- * This controls the partition count used by the physical optimizer and can be
- * used to bound scan CPU parallelism. The value must be greater than zero and
- * must be set before scanning starts.
- */
-int32_t lance_scanner_set_target_parallelism(
-    LanceScanner* scanner,
-    size_t target_parallelism
-);
-
-/**
- * Configure whether batches are returned in storage order (default: true).
- *
- * Disabling ordering can improve throughput by returning batches as soon as
- * they are ready.
- */
-int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_order);
-
-/**
- * Configure whether scalar indices may be used to optimize filters.
- *
- * Scalar indices are enabled by default. Disable this to force filter
- * evaluation without scalar indices, including an explicitly selected scalar
- * segment (which falls back to a scan of its explicit fragment_ids).
- * This setting is independent of
- * `lance_scanner_set_use_index`, which controls vector ANN index usage.
- * Must be set before scanning starts.
- */
-int32_t lance_scanner_set_use_scalar_index(
-    LanceScanner* scanner,
-    bool use_scalar_index
-);
-
-/**
- * Configure whether row-based output batches are strict.
- *
- * When enabled, every batch except the last has exactly the configured row
- * batch size. This may require copying and cannot be combined with a byte-based
- * batch-size limit. The call is rejected without changing scanner state if a
- * byte limit is already set. Must be set before scanning starts.
- */
-int32_t lance_scanner_set_strict_batch_size(
-    LanceScanner* scanner,
-    bool strict_batch_size
-);
-
-/**
- * Configure whether file statistics may optimize the scan (default: true).
- * Intended primarily for debugging and benchmarking. Must be set before
- * scanning starts.
- */
-int32_t lance_scanner_set_use_stats(LanceScanner* scanner, bool use_stats);
-
-/** Sort direction for one scanner ordering key. */
-typedef enum {
-    LANCE_ORDER_ASCENDING = 0,
-    LANCE_ORDER_DESCENDING = 1,
-} LanceOrderDirection;
-
-/** Placement of NULL values for one scanner ordering key. */
-typedef enum {
-    LANCE_ORDER_NULLS_LAST = 0,
-    LANCE_ORDER_NULLS_FIRST = 1,
-} LanceNullOrder;
-
-/**
- * One native scanner ordering key.
- *
- * `direction` is a LanceOrderDirection value and `null_order` is a
- * LanceNullOrder value. Both are int32_t at the ABI boundary so out-of-range
- * values can be rejected safely. `column_name` is copied during the call.
- */
-typedef struct LanceColumnOrdering {
-    const char* column_name;
-    int32_t direction;
-    int32_t null_order;
-} LanceColumnOrdering;
-
-/**
- * One ordered scanner projection entry.
- *
- * `output_name` is the output field name and may be an alias. `expression` is
- * a Lance SQL expression evaluated against the dataset schema. Both strings
- * are copied during `lance_scanner_set_projection()`.
- */
-typedef struct LanceProjectionColumn {
-    const char* output_name;
-    const char* expression;
-} LanceProjectionColumn;
-
-/**
- * Replace the scanner projection with ordered output-name / SQL-expression
- * pairs, mirroring Lance `Scanner::project_with_transform()`.
- *
- * Each output name may be an alias. Each expression may reference stored
- * columns, metadata columns, nested field paths, and query-generated scoring
- * columns according to the selected Lance version. Output order follows the
- * input array. Lance parses and validates expressions, duplicate output names,
- * and schema-dependent expression resolution during this call. Planning-only
- * errors, such as an unsupported projection with no physical output column, are
- * reported when the scan starts.
- *
- * Passing `columns == NULL` with `len == 0` clears the projection and restores
- * the native unset projection, which selects all dataset columns. Passing a
- * non-NULL pointer with `len == 0` sets an explicit empty projection. A NULL
- * pointer with `len > 0` is invalid.
- *
- * The array and every string are copied before this call returns. A NULL
- * output name or expression, non-UTF-8 input, or a projection rejected by
- * Lance leaves the previous projection unchanged. This does not alter the
- * column-list projection accepted by `lance_scanner_new()`; that path keeps
- * Lance's escaped field-path behavior.
- *
- * Must be called before the scan starts.
- *
- * @param scanner  Scanner handle. Must not be NULL.
- * @param columns  Projection entries, or NULL to clear.
- * @param len      Number of projection entries.
- * @return 0 on success, -1 on error.
- */
-int32_t lance_scanner_set_projection(
-    LanceScanner* scanner,
-    const LanceProjectionColumn* columns,
-    size_t len
-);
-
-/**
- * Disable automatic `_score` / `_distance` projection for this scanner.
- *
- * With the published default, an explicit projection still receives `_score`
- * for full-text search or `_distance` for vector and MinHash search. After this
- * call succeeds, those columns are included only when explicitly requested by
- * the projection, matching Lance `Scanner::disable_scoring_autoprojection()`.
- *
- * The change is one-way for the lifetime of the scanner. Must be called before
- * the scan starts.
- *
- * @param scanner  Scanner handle. Must not be NULL.
- * @return 0 on success, -1 on error.
- */
-int32_t lance_scanner_disable_scoring_autoprojection(LanceScanner* scanner);
-
-/**
- * Replace the scanner's native result ordering.
- *
- * Entries are applied in array order, matching Lance's ColumnOrdering list.
- * With limit/offset, Lance sorts all rows before applying the window. For
- * nearest or full-text search, Lance first selects its query result set and
- * then sorts that set.
- *
- * Passing `orderings == NULL` with `len == 0` clears the ordering (the native
- * `None` option). Passing a non-NULL pointer with `len == 0` is an explicit
- * empty ordering list (the native `Some(empty)` option); Lance treats it as
- * clearing the ordering. Both forms are accepted. `orderings == NULL` with
- * `len > 0` is invalid.
- *
- * The array, every column name, and all scalar fields are copied before this
- * call returns. A NULL column name, an invalid direction, or an invalid
- * null_order is rejected without changing the previous ordering. Column names
- * are validated by Lance when the scan is materialized, so a missing column is
- * reported by starting the scan. Must be called before the scan starts.
- *
- * The ordering cannot be combined with `lance_scanner_nearest_multivector`:
- * that API's result window is always restored to distance order, so accepting
- * an ordering would silently ignore it. Materializing such a scan fails with
- * LANCE_ERR_INVALID_ARGUMENT.
- *
- * @param scanner    Scanner handle. Must not be NULL.
- * @param orderings  Ordering keys, or NULL to clear.
- * @param len        Number of ordering keys.
- * @return 0 on success, -1 on error.
- */
-int32_t lance_scanner_set_order_by(
-    LanceScanner* scanner,
-    const LanceColumnOrdering* orderings,
-    size_t len
-);
-
-int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
-
-/** Include or omit the `_rowaddr` metadata column. Must be set before scanning. */
-int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
-
-/**
- * Configure whether deleted rows still present in storage are returned.
- * Requires with_row_id=true; deleted rows have a NULL `_rowid`.
- * For filtered scans, also set use_scalar_index=false: indices built after a
- * deletion may omit tombstoned rows. Incompatible with scalar_index_segment,
- * even when scalar indices are disabled.
- * Fragments removed from the current snapshot are not scanned.
- * Must be set before scanning starts.
- */
-int32_t lance_scanner_set_include_deleted_rows(
-    LanceScanner* scanner,
-    bool include_deleted_rows
-);
-
-/** How blob columns are materialized by a scan. Validated as an integer. */
-typedef enum {
-    /**
-     * Default: blob columns are returned as descriptor structs and every
-     * other binary column is returned as bytes. The descriptor layout
-     * depends on the storage format of the column: Blob v2 columns yield
-     * (kind, position, size, blob_id, blob_uri), while legacy blob columns
-     * (large_binary tagged `lance-encoding: blob`) yield (position, size).
-     */
-    LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS = 0,
-    /** Every blob column is materialized as bytes (LargeBinary). */
-    LANCE_BLOB_HANDLING_ALL_BINARY = 1,
-    /**
-     * Requests descriptors for every binary column. On lance v11.0.0 only
-     * columns carrying blob metadata are affected; other binary columns keep
-     * their bytes, so this behaves like
-     * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS.
-     */
-    LANCE_BLOB_HANDLING_ALL_DESCRIPTIONS = 2,
-} LanceBlobHandling;
-
-/**
- * Choose how blob columns are materialized by this scan. Default:
- * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS. ALL_BINARY pulls the full payload
- * into the batches, so keep descriptors for large values. Columns without
- * blob metadata keep their bytes under every mode.
- *
- * Must be set before scanning starts; values outside the enum are rejected.
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
-
-/**
- * Materialization style for ordinary scanner payload columns.
- *
- * This follows Lance's native materialization policy. It affects columns that
- * are not required for filtering. Vector search and full-text search always use
- * their native late-materialization paths.
- */
-typedef enum {
-    /** Native heuristic based on storage type and column width (default). */
-    LANCE_MATERIALIZATION_STYLE_HEURISTIC = 0,
-    /** Fetch projected payload columns for matching rows only where possible. */
-    LANCE_MATERIALIZATION_STYLE_ALL_LATE = 1,
-    /** Fetch every projected payload column eagerly where possible. */
-    LANCE_MATERIALIZATION_STYLE_ALL_EARLY = 2,
-    /**
-     * Fetch every projected payload column eagerly except the named columns.
-     * Names use Lance's schema projection paths, including nested paths.
-     */
-    LANCE_MATERIALIZATION_STYLE_ALL_EARLY_EXCEPT = 3,
-} LanceMaterializationStyle;
-
-/**
- * Configure native materialization for ordinary scanner payload columns.
- *
- * For ALL_EARLY_EXCEPT, `early_except_columns` contains
- * `early_except_column_count` column paths to exclude from early materialization.
- * Passing a NULL array with count 0 is an explicit empty exception list, so all
- * columns are early. Lance resolves the names against the dataset schema at call
- * time, including nested paths. Resolution and validation follow Lance's native
- * schema projection. The strings and array are copied; the caller may release
- * them when this function returns.
- *
- * For HEURISTIC, ALL_LATE, and ALL_EARLY, the column count must be 0. Other style
- * values are rejected. A rejected call leaves the previous style unchanged.
- * The style must be configured before the scan starts.
- *
- * @param scanner                   Scanner handle. Must not be NULL.
- * @param style                     One of `LanceMaterializationStyle`.
- * @param early_except_columns      Column paths for ALL_EARLY_EXCEPT; may be NULL
- *                                  when `early_except_column_count` is 0.
- * @param early_except_column_count Number of column path pointers.
- * @return 0 on success, -1 on error (check `lance_last_error_*`).
- */
-int32_t lance_scanner_set_materialization_style(
-    LanceScanner* scanner,
-    LanceMaterializationStyle style,
-    const char* const* early_except_columns,
-    size_t early_except_column_count
-);
-
-/**
- * Restrict the scan/search domain to the given fragment IDs. For nearest-neighbor
- * queries, this limits the candidates searched before Top-K regardless of the
- * prefilter setting; it is not a predicate applied to ranked results.
- *
- * Calling this replaces any initial metadata selection from
- * `lance_fragment_scan()`, including staged deletion metadata. A zero-length
- * selection selects zero fragments. To select every fragment in the scanner's
- * dataset snapshot, supply all of its native fragment IDs explicitly.
- * Must be called before iteration.
- * @param scanner Scanner handle. Must not be NULL.
- * @param ids     Array of fragment IDs
- * @param len     Number of fragment IDs
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_fragment_ids(
-    LanceScanner* scanner,
-    const uint64_t* ids,
-    size_t len
-);
-
-/**
- * Restrict the scan or search to rows whose `_rowid` is in `row_ids`.
- *
- * The ids are in the dataset's `_rowid` space: the stable row id when stable
- * row ids are enabled, otherwise the row address. The allowlist is applied
- * before ranking: a nearest or full-text search (including one using a
- * prepared FTS query context) computes its top-k over the allowed rows only,
- * and a plain scan reads only those rows. It is combined with any filter
- * expression (AND) and with a blocklist (allowed AND NOT blocked). It cannot be
- * combined with lance_scanner_set_scalar_index_segment().
- * Calling it again replaces the previous allowlist. Must be called before
- * iteration; the ids are copied.
- * @param scanner  Scanner handle. Must not be NULL.
- * @param row_ids  Array of `_rowid` values, in any order (may be NULL when len is 0)
- * @param len      Number of ids; 0 allows no rows
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_row_addr_allowlist(
-    LanceScanner* scanner,
-    const uint64_t* row_ids,
-    size_t len
-);
-
-/**
- * Exclude rows whose `_rowid` is in `row_ids` from the scan or search.
- * Same `_rowid` space, ordering, and restrictions as
- * lance_scanner_set_row_addr_allowlist().
- * @param scanner  Scanner handle. Must not be NULL.
- * @param row_ids  Array of `_rowid` values, in any order (may be NULL when len is 0)
- * @param len      Number of ids; 0 blocks no rows
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_row_addr_blocklist(
-    LanceScanner* scanner,
-    const uint64_t* row_ids,
-    size_t len
-);
-
-/**
- * Set a Substrait filter on the scanner.
- *
- * `bytes` must point to a serialized Substrait `ExtendedExpression` message
- * containing exactly one expression of boolean type. This is the preferred
- * filter API for query engines that already speak Substrait — it avoids the
- * round-trip through SQL string formatting and parsing.
- *
- * If both this and the SQL filter passed to `lance_scanner_new` are set, the
- * Substrait filter wins. Calling this with the same scanner more than once
- * replaces the previously-set Substrait filter. The bytes are copied; the
- * caller may free them after this call returns.
- *
- * @param scanner Scanner handle. Must not be NULL.
- * @param bytes   Serialized Substrait `ExtendedExpression` bytes (must not be NULL)
- * @param len     Length of the byte buffer (must be > 0)
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_substrait_filter(
-    LanceScanner* scanner,
-    const uint8_t* bytes,
-    size_t len
-);
-
-/**
- * Set a Substrait aggregate on the scanner.
- *
- * `bytes` must point to a serialized Substrait `Plan` whose first relation is
- * an `AggregateRel`, either directly or through a `RelRoot`. This is a Plan,
- * not the `ExtendedExpression` accepted by
- * lance_scanner_set_substrait_filter(). Field references use positions in the
- * dataset schema, not projection positions. Group columns and measures follow
- * the native planner; `RelRoot.names` supplies output aliases in group-then-
- * measure order.
- *
- * The plan is validated immediately against the dataset schema using a
- * temporary native scanner. A failed replacement retains the previous
- * aggregate. Malformed protobuf bytes report the native I/O error; valid
- * non-aggregate plans and invalid field references report the native invalid-
- * argument errors. Empty bytes are passed to native plan validation.
- *
- * The bytes are copied. NULL is accepted only when `len` is zero. The setter
- * must be called before the scan starts. Planning observes the configured
- * projection, filter, fragments, masks, FTS, vector search, batch size, and
- * native limit/offset/ordering. Native aggregate validation rejects explicit
- * limit, offset, or non-empty ordering. Count and analyze-count replace this
- * aggregate with native `COUNT(*)`; schema, explain, analyze, and ordinary scan
- * streams use it.
- *
- * @param scanner Scanner handle. Must not be NULL.
- * @param bytes   Serialized Substrait `Plan` bytes (NULL only when len is zero)
- * @param len     Length of the byte buffer
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_substrait_aggregate(
-    LanceScanner* scanner,
-    const uint8_t* bytes,
-    size_t len
-);
-
-/**
- * Add an SQL filter that is combined with the selected primary filter using
- * AND. The primary filter is the Substrait filter when set, otherwise it is
- * the SQL filter passed to `lance_scanner_new`. Multiple additional SQL
- * filters are also combined using AND.
- *
- * Must be called before the scan starts. The filter string is copied.
- *
- * @param scanner Scanner handle. Must not be NULL.
- * @param filter  Non-NULL, non-empty SQL filter expression
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_additional_sql_filter(
-    LanceScanner* scanner,
-    const char* filter
-);
-
-/** Type of a dynamically named scan metric. */
-typedef enum {
-    LANCE_SCAN_METRIC_COUNT = 0,
-    LANCE_SCAN_METRIC_TIME_NANOSECONDS = 1,
-} LanceScanMetricKind;
-
-/**
- * Borrowed view of one dynamically named scan metric.
- *
- * `name` is not NUL-terminated. `name` and this structure are valid only for
- * the duration of the LanceScanStatisticsCallback invocation. Metric order is
- * unspecified.
- */
-typedef struct {
-    const char* name;
-    size_t name_len;
-    LanceScanMetricKind kind;
-    uint64_t value;
-} LanceScanMetric;
-
-/**
- * Borrowed view of the execution statistics for one fully consumed scan.
- *
- * The fixed fields are stable summary metrics. `metrics` contains additional
- * implementation-specific counters and timings. Those names are not a stable
- * API and are intended for diagnostics and profiles. Dynamic metrics are
- * best-effort and may be omitted if they cannot be materialized. `metrics` is
- * NULL when `metrics_len` is zero.
- */
-typedef struct {
-    uint64_t iops;
-    uint64_t requests;
-    uint64_t bytes_read;
-    uint64_t indices_loaded;
-    uint64_t index_partitions_loaded;
-    uint64_t index_comparisons;
-    const LanceScanMetric* metrics;
-    size_t metrics_len;
-} LanceScanStatistics;
-
-/**
- * Receives scan statistics after a stream is fully consumed to EOF.
- *
- * `statistics` is non-NULL. It and all nested pointers are borrowed and valid
- * only for the duration of this call. The callback may run on the thread that
- * observes EOF and must therefore be thread-safe. It must return normally
- * without throwing an exception or unwinding, and must not call any
- * `lance_scanner_*` function with the originating scanner.
- *
- * From callback entry until the enclosing operation that observes EOF has
- * returned to its caller, the callback must not directly or indirectly cause
- * `get_schema`, `get_next`, `get_last_error`, or `release` to be called on any
- * ArrowArrayStream derived from the originating scanner, nor cause such a
- * stream to be moved, destroyed, or otherwise accessed. This includes signaling
- * or scheduling another thread to act based only on callback completion: the
- * callback returns before the enclosing stream operation does. Such interaction
- * is reentrant and has undefined behavior. Normal access may resume only after
- * the enclosing ArrowArrayStream `get_next`, `lance_scanner_next`, or
- * `lance_scanner_poll_next` call returns to its caller.
- *
- * Scan statistics are diagnostic and best-effort. The callback must handle its
- * own errors and must not use them to abort or throw across this FFI boundary.
- */
-typedef void (*LanceScanStatisticsCallback)(
-    void* callback_ctx,
-    const LanceScanStatistics* statistics
-);
-
-/**
- * Register the execution-statistics callback for this scanner.
- *
- * Must be called before starting the scan; registering after the scan starts
- * returns an error. `callback` must not be NULL. `callback_ctx` may be NULL. A
- * non-NULL `callback_ctx` must remain valid, and `callback` must remain valid,
- * until all of the following are true: the scanner is closed, every in-flight
- * `lance_scanner_scan_async` call has delivered its completion callback, and
- * every ArrowArrayStream derived from the scanner has been released. The
- * registration remains installed after a callback returns and applies to
- * streams created later from the same scanner. For `lance_scanner_next` and
- * `lance_scanner_poll_next`, the scanner owns the stream. Exported and
- * asynchronous ArrowArrayStreams own their registrations independently of the
- * scanner and may invoke the callback after the scanner is closed. Concurrent
- * streams may invoke the callback concurrently.
- *
- * The callback is invoked exactly once for each derived stream that is fully
- * consumed to EOF. It is not guaranteed to run for a stream if execution fails,
- * the scan is cancelled, or the scanner / ArrowArrayStream is released before
- * EOF. Before scanning starts, a new registration replaces the previous one;
- * after a successful replacement, the previous callback and context are no
- * longer retained and may be retired.
- *
- * From callback entry until the enclosing EOF-observing operation returns, the
- * callback must not directly or indirectly cause interaction with any
- * ArrowArrayStream derived from this scanner; see LanceScanStatisticsCallback
- * for the complete reentrancy restriction.
- *
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_set_statistics_callback(
-    LanceScanner* scanner,
-    LanceScanStatisticsCallback callback,
-    void* callback_ctx
-);
-
-/**
- * Close and free a scanner handle. Safe to call with NULL; a non-NULL handle
- * must be closed exactly once.
- *
- * This is the retirement boundary for poll wakers registered by
- * lance_scanner_poll_next(): it cancels callbacks that have not entered and
- * waits for any callback already in progress to return before freeing the
- * scanner. Do not call this function from one of the scanner's own waker
- * callbacks, because close must wait for that callback to return.
- */
-void lance_scanner_close(LanceScanner* scanner);
-
-/* ─── Scanner planning, introspection and count ─── */
-
-/**
- * Export the configured scanner output schema.
- *
- * Schemas come from the native plan for the actual configured execution path,
- * including projections, scoring columns, multi-vector and prepared FTS
- * transformations, and scalar-segment setup. A binding-private multi-vector
- * distance column is removed before export.
- *
- * This is planning-only: it does not start iteration or advance any stream
- * already owned by or exported from this scanner. Configuration setters remain
- * usable afterward. Read-only index metadata and scalar-segment candidate work
- * required to construct the configured plan may still perform I/O.
- *
- * `out` must be non-NULL and point to an empty ArrowSchema whose `release`
- * callback is NULL. On success the caller must invoke `out->release(out)`
- * exactly once.
- *
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_schema(
-    const LanceScanner* scanner,
-    struct ArrowSchema* out
-);
-
-/**
- * Explain the configured scanner plan without executing it.
- *
- * `verbose` selects native DataFusion tree formatting. The plan includes the
- * same transformations used by a stream from this configuration.
- *
- * This does not start iteration or advance any stream already owned by or
- * exported from this scanner, and the scanner remains configurable afterward.
- * Read-only index metadata and scalar-segment candidate work required to
- * construct the configured plan may still perform I/O.
- *
- * The returned string is owned by the caller and must be freed with
- * lance_free_string(). Returns NULL on error.
- */
-const char* lance_scanner_explain_plan(
-    const LanceScanner* scanner,
-    bool verbose
-);
-
-/**
- * Execute the configured scanner plan and return its native runtime analysis.
- *
- * This executes the same plan a stream from this configuration would use,
- * including scalar-segment, multi-vector, and prepared FTS transformations.
- * It does not consume or advance any existing stream. The scanner remains
- * configurable afterward.
- *
- * The returned string is owned by the caller and must be freed with
- * lance_free_string(). Returns NULL on error.
- */
-const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
-
-/**
- * Count rows matched by the configured scanner.
- *
- * This applies the native `COUNT(*)` aggregate to the configured scanner plan
- * and executes that count plan. It does not count batches from a stream.
- * Native aggregate planning rejects any configured limit, offset, or ordering.
- * MinHash search requires a limit, so it cannot be combined with this count
- * operation; use a limited MinHash scan and count the returned rows instead.
- * Count execution uses the native count operation's execution options; the
- * registered scan-statistics callback is not invoked for this separate count
- * operation.
- *
- * This does not start normal scanner iteration or advance an existing stream,
- * and the scanner remains configurable afterward.
- *
- * Returns 0 on error; an empty match also returns 0, so check
- * lance_last_error_code().
- */
-uint64_t lance_scanner_count_rows(const LanceScanner* scanner);
-
-/**
- * Execute and format the configured native `COUNT(*)` plan.
- *
- * This analyzes the plan used by `lance_scanner_count_rows`, not the ordinary
- * scan plan. It obeys the same aggregate planning constraints and does not
- * invoke the registered scan-statistics callback. The scanner remains
- * configurable afterward.
- *
- * The returned string is owned by the caller and must be freed with
- * lance_free_string(). Returns NULL on error.
- */
-const char* lance_scanner_analyze_count_plan(const LanceScanner* scanner);
-
-/* ─── Sync scan: ArrowArrayStream ─── */
-
-/**
- * Materialize the scan as an ArrowArrayStream (blocking).
- * The scanner remains valid, and each call creates an independent stream.
- * `out` points to caller-owned storage. On success, the caller must eventually
- * invoke `out->release(out)` exactly once when `release` is non-NULL; that
- * releases the stream contents but not the caller-owned outer structure. Do
- * not pass this caller-allocated stream to lance_scanner_async_stream_free().
- *
- * Reading the exported stream may surface a mid-iteration panic as one
- * error through the Arrow C stream contract (nonzero get_next plus
- * get_last_error), followed by end-of-stream; the scanner handle is
- * poisoned afterwards.
- *
- * @return 0 on success, -1 on error
- */
-int32_t lance_scanner_to_arrow_stream(
-    LanceScanner* scanner,
-    struct ArrowArrayStream* out
-);
-
-/* ─── Sync scan: batch iteration ─── */
-
-/**
- * Read the next batch (blocking).
- * @param scanner  Scanner handle. Must not be NULL.
- * @param out      Set to a LanceBatch* on success, NULL on end/error
- * @return 0 = batch available, 1 = end of stream, -1 = error
- */
-int32_t lance_scanner_next(
-    LanceScanner* scanner,
-    LanceBatch** out
-);
-
-/* ─── Async scan: callback-based ─── */
-
-/**
- * Callback type for async operations.
- *
- * The callback normally runs on the dedicated dispatcher thread. During a
- * rare dispatcher startup or delivery failure, completion falls back to the
- * thread that detects the failure (for example the calling or producing
- * thread), so the callback must be thread-safe. On failure the error code and
- * message are installed on the actual callback thread immediately before the
- * callback runs, so lance_last_error_* called from inside the callback
- * observes this completion's failure.
- *
- * Callbacks must return normally: the callback ABI is non-unwinding, so a
- * callback that throws or unwinds can abort the host process before the
- * dispatcher can contain it.
- * A callback passed to lance_scanner_scan_async() must not be NULL.
- *
- * @param ctx     Opaque pointer passed back from the caller
- * @param status  0 = success, -1 = error
- * @param result  Operation-specific result (e.g., ArrowArrayStream*)
- */
-typedef void (*LanceCallback)(void* ctx, int32_t status, void* result);
-
-/**
- * Start an async scan. The callback normally fires on a dedicated dispatcher
- * thread when the ArrowArrayStream is ready. During a rare dispatcher
- * infrastructure failure it may instead run on the calling or producing
- * thread, so it must be thread-safe.
- *
- * For a non-NULL callback, exactly one completion is delivered, including for
- * validation, setup, task, and dispatcher failures. The fallback path may
- * invoke it before lance_scanner_scan_async() returns. `callback` and a
- * non-NULL `callback_ctx` must remain valid until that invocation returns.
- *
- * `callback` must not be NULL; `callback_ctx` may be NULL. On success, result
- * is a library-allocated ArrowArrayStream owned by the caller. The caller must
- * eventually pass it exactly once to lance_scanner_async_stream_free(), even
- * if it has already invoked the stream's release callback directly. Do not
- * free the returned outer structure with free(), delete, or a platform
- * allocator.
- *
- * On failure the callback receives status -1 with result NULL, and the
- * error code/message are installed in the actual callback thread's
- * thread-local storage immediately before the callback runs (per completion).
- * A panic in the scan task also yields status -1 with LANCE_ERR_PANIC and
- * poisons the scanner handle.
- */
-void lance_scanner_scan_async(
-    const LanceScanner* scanner,
-    LanceCallback callback,
-    void* callback_ctx
-);
-
-/**
- * Release and free an ArrowArrayStream returned by a successful
- * lance_scanner_scan_async() callback.
- *
- * If `stream->release` is non-NULL, this function invokes it before freeing
- * the library-allocated outer structure. It is therefore valid both before
- * and after a consumer has directly released the stream contents. `stream`
- * may be NULL. A non-NULL pointer must be passed exactly once and must be the
- * pointer delivered by lance_scanner_scan_async(); using this function for a
- * caller-allocated ArrowArrayStream is invalid.
- */
-void lance_scanner_async_stream_free(struct ArrowArrayStream* stream);
-
-/* ─── Poll-based scan (for cooperative async runtimes) ─── */
-
-typedef enum {
-    LANCE_POLL_READY    =  0,
-    LANCE_POLL_PENDING  =  1,
-    LANCE_POLL_FINISHED =  2,
-    LANCE_POLL_ERROR    = -1,
-} LancePollStatus;
-
-/**
- * Waker callback: called from a Tokio thread when data is ready. A waker
- * passed to lance_scanner_poll_next() must not be NULL. For one poll call
- * that returns LANCE_POLL_PENDING, all internal RawWaker clones share a
- * one-shot gate, so the callback fires at most once.
- *
- * The callback and `ctx` must be thread-safe and must remain valid until the
- * callback returns or lance_scanner_close() returns. Close cancels a pending
- * callback and waits for an active callback before returning, so the caller
- * may destroy `ctx` afterwards. The callback must return normally and must
- * not call lance_scanner_close() or otherwise re-enter its originating
- * scanner.
- */
-typedef void (*LanceWaker)(void* ctx);
-
-/**
- * Poll for the next batch without blocking.
- * `waker` must not be NULL; `waker_ctx` may be NULL. `out` is set to a
- * LanceBatch only for LANCE_POLL_READY and is set to NULL for
- * LANCE_POLL_PENDING, LANCE_POLL_FINISHED, and LANCE_POLL_ERROR.
- */
-LancePollStatus lance_scanner_poll_next(
-    LanceScanner* scanner,
-    LanceWaker waker,
-    void* waker_ctx,
-    LanceBatch** out
-);
-
-/* ─── Batch (Arrow C Data Interface) ─── */
-
-/**
- * Export a batch as Arrow C Data Interface structs.
- * @return 0 on success, -1 on error
- */
-int32_t lance_batch_to_arrow(
-    const LanceBatch* batch,
-    struct ArrowArray* out_array,
-    struct ArrowSchema* out_schema
-);
-
-/**
- * Import one Arrow record batch.
- *
- * A non-NULL `array` is consumed on every return, including validation and
- * conversion failures. The source slot is left in its canonical released
- * state. `schema` is borrowed and is never released or modified. `out` is
- * written only on success and is unchanged on failure.
- *
- * The complete schema is retained, including schema metadata, field metadata,
- * and extension metadata. A zero-column batch retains its row count.
- *
- * @return 0 on success, -1 on error.
- */
-int32_t lance_batch_from_arrow(
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    LanceBatch** out
-);
-
-/** Free a batch handle. */
-void lance_batch_free(LanceBatch* batch);
-
 /* ─── Fragment writer ─── */
 
 /**
@@ -6124,7 +4673,6 @@ typedef void (*LanceIndexBuildProgressCallback)(
     const char* unit,
     uint64_t completed
 );
-
 /* ─── Index lifecycle (Phase 2) ─── */
 
 /**
@@ -6315,7 +4863,6 @@ int32_t lance_dataset_create_scalar_index_with_options_and_progress(
     void* callback_ctx,
     bool replace
 );
-
 /* ─── Uncommitted index segment build ─── */
 
 /**
@@ -7123,7 +5670,6 @@ const char* lance_dataset_index_statistics_json(
  * Returns NULL on error (see lance_last_error_code/message).
  */
 const char* lance_dataset_index_segments_json(const LanceDataset* dataset);
-
 /* ─── Distributed vector search: index segment enumeration ─── */
 
 /**
@@ -7160,7 +5706,6 @@ int32_t lance_dataset_index_segments(
     size_t capacity,
     uint64_t* out_count
 );
-
 /* ─── Vector search (Phase 2) ─── */
 
 /**
@@ -7424,7 +5969,6 @@ int32_t lance_scanner_set_scalar_index_segment(
  * The explicit fragment domain and complete filter are preserved.
  * Unsupported/unknown estimates retain the selected segment. Returns 0 or -1. */
 int32_t lance_scanner_set_scalar_index_auto_selection(LanceScanner* scanner, bool enabled);
-
 /* ─── Full-text search (Phase 2) ─── */
 
 /**
@@ -7850,7 +6394,6 @@ int32_t lance_scanner_set_fts_index_segments(
     const uint8_t* segment_uuids,
     size_t len
 );
-
 /* ─── Dataset writer ─── */
 
 /**
@@ -8113,7 +6656,6 @@ int32_t lance_dataset_write_with_options_with_commit_lock(
     const LanceCommitLock* commit_lock,
     LanceDataset** out_dataset
 );
-
 /* ─── Owned native dataset-write options ─── */
 
 /**
@@ -8405,7 +6947,6 @@ int32_t lance_dataset_write_uncommitted_stream_with_native_options(
     const LanceNativeWriteOptions* options,
     LanceTransaction** out_transaction
 );
-
 /* ─── Native fragment creation ─── */
 
 /**
@@ -8531,7 +7072,6 @@ int32_t lance_fragment_create_from_file(
     const uint64_t* physical_rows,
     LanceFragment** out_fragment
 );
-
 /* ─── Native data files ─── */
 
 /** Owned native `DataFile` metadata snapshot. */
@@ -8635,7 +7175,6 @@ int32_t lance_data_file_base_id(
     bool* out_is_set,
     uint32_t* out_base_id
 );
-
 /* ─── Native update maps ─── */
 
 /**
@@ -8834,7 +7373,6 @@ typedef struct LanceCommitOptions {
     bool skip_auto_cleanup;
     const char* data_storage_version;
 } LanceCommitOptions;
-
 /* ─── Native transactions ─── */
 
 /**
@@ -11008,7 +9546,6 @@ int32_t lance_transaction_commit_batch_with_commit_lock(
     LanceDataset** out_dataset,
     LanceTransaction** out_merged_transaction
 );
-
 /* ─── Storage options ─────────────────────────────────────────────────────── */
 
 typedef struct LanceStorageOptionsProvider LanceStorageOptionsProvider;
@@ -11138,7 +9675,6 @@ const char* lance_storage_options_snapshot_value_at(
 void lance_storage_options_snapshot_close(
     LanceStorageOptionsSnapshot* snapshot
 );
-
 /* ─── Native Lance namespaces ─────────────────────────────────────────────── */
 
 /*
@@ -11478,7 +10014,6 @@ typedef struct LanceNamespaceCustomClientDispatchSpec {
 LanceNamespace* lance_namespace_custom_dispatch_new(
     const LanceNamespaceCustomClientDispatchSpec* spec
 );
-
 /* ─── Raw Lance-file session ──────────────────────────────────────────────── */
 
 typedef struct LanceFileSession LanceFileSession;
@@ -11851,7 +10386,6 @@ int32_t lance_file_session_get_store_io_stats(
     const LanceFileSession* session,
     LanceObjectStoreIoStats* out_stats
 );
-
 /* ─── Raw Lance-file reader ───────────────────────────────────────────────── */
 
 /*
@@ -11937,7 +10471,6 @@ int32_t lance_file_reader_get_io_stats(
     LanceScanStats* out_stats
 );
 void lance_file_reader_close(LanceFileReader* reader);
-
 /* ─── Raw Lance-file metadata snapshots ──────────────────────────────────── */
 
 typedef enum {
@@ -12031,7 +10564,6 @@ int32_t lance_file_statistics_get_columns(
     size_t* out_count
 );
 void lance_file_statistics_close(LanceFileStatistics* statistics);
-
 /* ─── Raw Lance-file writer ───────────────────────────────────────────────── */
 
 /*
@@ -12095,7 +10627,6 @@ int32_t lance_file_writer_abort(LanceFileWriter* writer);
  * finalization and does not replace an explicit fallible finish.
  */
 void lance_file_writer_close(LanceFileWriter* writer);
-
 /* ─── Native diagnostics and FTS tokenization ─────────────────────────────── */
 
 /**
@@ -12187,7 +10718,6 @@ int32_t lance_dataset_io_stats_snapshot(
  */
 int32_t lance_dataset_io_stats_incremental(
     const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
-
 /* ─── Owned raw-file path and byte snapshots ──────────────────────────────── */
 
 uint64_t lance_path_list_count(const LancePathList* list);
@@ -12213,7 +10743,6 @@ void lance_delimited_list_close(LanceDelimitedList* list);
 const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
 size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
 void lance_byte_buffer_close(LanceByteBuffer* buffer);
-
 /* ─── Native dataset SQL ──────────────────────────────────────────────────── */
 
 /**
@@ -12333,7 +10862,6 @@ int32_t lance_sql_query_builder_build(
  */
 int32_t lance_sql_query_into_stream(
     LanceSqlQuery* query, struct ArrowArrayStream* out_stream);
-
 /* ─── Native dataset delta ────────────────────────────────────────────────── */
 
 /**
@@ -12502,7 +11030,6 @@ int32_t lance_dataset_delta_get_upserted_rows(
  */
 int32_t lance_dataset_delta_get_deleted_row_ids(
     const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
-
 /* ─── MemWAL / LSM public workflow ────────────────────────────────────────── */
 
 /**

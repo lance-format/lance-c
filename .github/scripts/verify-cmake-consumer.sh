@@ -149,12 +149,12 @@ verify_consumer_prefix() {
                 "$install_prefix" "$(uname -m)"
             bash "$repo_root/.github/scripts/verify-shared-exports.sh" \
                 "$install_prefix/lib/liblance_c.dylib" \
-                "$install_prefix/include/lance/lance.h" macos
+                "$install_prefix/include/lance" macos
             ;;
         Linux)
             bash "$repo_root/.github/scripts/verify-shared-exports.sh" \
                 "$install_prefix/lib/liblance_c.so" \
-                "$install_prefix/include/lance/lance.h" linux
+                "$install_prefix/include/lance" linux
             ;;
         *)
             echo "unsupported platform: $(uname -s)" >&2

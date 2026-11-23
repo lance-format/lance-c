@@ -158,7 +158,7 @@ jobs:
       - name: Create release commit
         if: steps.versions.outputs.version_changed == 'true'
         run: |
-          git add Cargo.toml Cargo.lock include/lance/lance.h
+          git add Cargo.toml Cargo.lock include/lance/version.h
           git commit -m "chore: bump version to ${{ steps.versions.outputs.crate_version }}"
 
       - name: Create tag

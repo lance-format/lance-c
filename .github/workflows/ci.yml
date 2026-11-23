@@ -102,7 +102,7 @@ jobs:
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
-        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance/lance.h linux
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance linux
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
@@ -143,7 +143,7 @@ jobs:
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
-        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance macos
       - name: Report and free cached test build headroom
         run: bash .github/scripts/free-macos-consumer-space.sh target/debug
       - name: Run tests

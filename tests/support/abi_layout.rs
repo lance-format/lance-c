@@ -3,12 +3,12 @@
 
 //! Public C ABI checks against the Rust `repr(C)` implementation.
 //!
-//! `include/lance/lance.h` is a hand-maintained public ABI. A Rust-side change
-//! can silently alter a struct layout or an enum value without touching the
-//! header. This module holds one explicit association table between public C
-//! symbols and their Rust definitions. The test compiles a C11 probe against the
-//! real header and compares its sizes, alignments, field offsets and enum
-//! values with the actual Rust layout.
+//! `include/lance/` is a hand-maintained public ABI. A Rust-side change can
+//! silently alter a struct layout or an enum value without touching the
+//! headers. This module holds one explicit association table between public C
+//! symbols and their Rust definitions. The test compiles a C11 probe against
+//! the umbrella header and compares its sizes, alignments, field offsets and
+//! enum values with the actual Rust layout.
 //!
 //! Enum values are associated by semantic name (`LANCE_ERR_PANIC` with
 //! `LanceErrorCode::Panic`), never by numeric value. The header scan only checks
@@ -1509,9 +1509,7 @@ struct HeaderInventory {
 /// Compare a C header with the Rust implementation through the explicit table.
 pub(crate) fn assert_public_abi() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let header_path = manifest_dir.join("include").join("lance").join("lance.h");
-    let header = std::fs::read_to_string(&header_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", header_path.display()));
+    let header = read_public_headers(&manifest_dir);
 
     let inventory = scan_header(&header);
     let manifest = manifest();
@@ -1523,7 +1521,7 @@ pub(crate) fn assert_public_abi() {
 
     assert!(
         rust_only.is_empty() && c_only.is_empty(),
-        "public C ABI in include/lance/lance.h does not match the Rust repr(C) implementation:\n\
+        "public C ABI in include/lance does not match the Rust repr(C) implementation:\n\
          records present in Rust but not in the compiled C header ({}):\n{}\n\
          records present in the compiled C header but not in Rust ({}):\n{}",
         rust_only.len(),
@@ -1531,6 +1529,37 @@ pub(crate) fn assert_public_abi() {
         c_only.len(),
         c_only.join("\n"),
     );
+}
+
+/// Read every public C header so the inventory covers declarations that moved
+/// into a domain header.
+fn read_public_headers(manifest_dir: &Path) -> String {
+    let include_dir = manifest_dir.join("include").join("lance");
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&include_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", include_dir.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", include_dir.display()))
+                .path()
+        })
+        .filter(|path| path.extension().is_some_and(|extension| extension == "h"))
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "no public headers found in {}",
+        include_dir.display()
+    );
+
+    let mut headers = String::new();
+    for path in &paths {
+        headers.push_str(
+            &std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display())),
+        );
+        headers.push('\n');
+    }
+    headers
 }
 
 fn validate_inventory(inventory: &HeaderInventory, manifest: &AbiManifest) {
@@ -1670,7 +1699,7 @@ fn validate_inventory(inventory: &HeaderInventory, manifest: &AbiManifest) {
 
     assert!(
         problems.is_empty(),
-        "the explicit ABI manifest does not cover include/lance/lance.h:\n{}",
+        "the explicit ABI manifest does not cover include/lance:\n{}",
         problems.join("\n"),
     );
 }

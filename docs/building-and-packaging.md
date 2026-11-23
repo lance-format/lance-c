@@ -18,7 +18,7 @@ This document provides platform-specific build instructions, binary packaging co
 
 Each release `.tar.xz` archive unpacks an install prefix containing:
 
-- `include/lance/lance.h` and `include/lance/lance.hpp`
+- `include/lance/lance.h` (umbrella), `include/lance/lance.hpp`, and the domain headers under `include/lance/`
 - Static and shared libraries under `lib/` (plus `lib/lance_c.dll.lib` on Windows)
 - `lib/cmake/LanceC/` (`LanceCConfig.cmake` and `LanceCConfigVersion.cmake`)
 - `lib/pkgconfig/lance-c.pc`
@@ -177,7 +177,7 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
    - **release_type**: `patch` / `minor` / `major`. Use `current` to keep the version in `Cargo.toml`: with `stable` after the release PR has set the baseline version, or with `preview` to cut another beta on the same base version.
    - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
    - **dry_run**: leave on for the first run to preview the computed tag and version without pushing.
-3. Re-run with **dry_run** off. When the version changes, the workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/lance.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref. With `release_type: current`, it tags the current release commit without another version commit.
+3. Re-run with **dry_run** off. When the version changes, the workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/version.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref. With `release_type: current`, it tags the current release commit without another version commit.
 4. Verify that the release page contains all expected platform archives and checksums. Download an archive and run the consumer from the same tag.
 
 > **Branch protection:** If `main` is protected, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or configure `create-release.yml` with a PAT that has `contents: write`.

@@ -3,7 +3,7 @@
 
 //! Protect the public version identity against drift from `Cargo.toml`.
 //!
-//! The header is hand-maintained, so a package version bump can otherwise
+//! The version header is hand-maintained, so a package version bump can otherwise
 //! leave compile-time macros and the runtime query disagreeing. The release
 //! workflow updates the header, and these tests fail if that step is skipped
 //! or produces a different version.
@@ -21,10 +21,10 @@ fn header_macro(header: &str, name: &str) -> String {
     });
     let value = values
         .next()
-        .unwrap_or_else(|| panic!("missing #define {name} in include/lance/lance.h"));
+        .unwrap_or_else(|| panic!("missing #define {name} in include/lance/version.h"));
     assert!(
         values.next().is_none(),
-        "duplicate #define {name} in include/lance/lance.h"
+        "duplicate #define {name} in include/lance/version.h"
     );
     value
 }
@@ -36,7 +36,7 @@ fn package_version_parts(version: &str) -> (&str, &str) {
 
 #[test]
 fn header_version_matches_cargo_package_version() {
-    let header_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include/lance/lance.h");
+    let header_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include/lance/version.h");
     let header = std::fs::read_to_string(&header_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", header_path.display()));
 

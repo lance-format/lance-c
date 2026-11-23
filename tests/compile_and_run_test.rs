@@ -2260,3 +2260,106 @@ fn test_arrow_header_include_orders() {
         "C++20 consumer with {source_name} failed to compile"
     );
 }
+
+/// Public headers callers may include directly, including the umbrella header.
+const PUBLIC_HEADERS: &[&str] = &[
+    "arrow_abi.h",
+    "batch.h",
+    "dataset.h",
+    "error.h",
+    "fwd.h",
+    "lance.h",
+    "scanner.h",
+    "version.h",
+];
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_public_headers_are_self_contained"]
+fn test_public_headers_are_self_contained() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let include_dir = manifest_dir.join("include");
+    let build_dir = tempfile::tempdir().expect("failed to create header test directory");
+
+    for header in PUBLIC_HEADERS {
+        let c_source = build_dir.path().join(format!("self_contained_{header}.c"));
+        std::fs::write(
+            &c_source,
+            format!("#include <lance/{header}>\nint main(void) {{ return 0; }}\n"),
+        )
+        .expect("failed to write C header test");
+        assert!(
+            compile_c_header_test(&c_source, &[include_dir.as_path()]),
+            "C11 consumer including <lance/{header}> first failed to compile"
+        );
+
+        let cpp_source = build_dir
+            .path()
+            .join(format!("self_contained_{header}.cpp"));
+        std::fs::write(
+            &cpp_source,
+            format!("#include <lance/{header}>\nint main() {{ return 0; }}\n"),
+        )
+        .expect("failed to write C++ header test");
+        assert!(
+            compile_cpp_header_test(&cpp_source, &[include_dir.as_path()]),
+            "C++20 consumer including <lance/{header}> first failed to compile"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_domain_header_arrow_include_orders"]
+fn test_domain_header_arrow_include_orders() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let include_dir = manifest_dir.join("include");
+    let consumer_dir = manifest_dir.join("tests").join("cpp");
+    let arrow_include_dir = consumer_dir.join("arrow_abi");
+    let data_only_include_dir = consumer_dir.join("arrow_abi_data");
+    let build_dir = tempfile::tempdir().expect("failed to create header test directory");
+
+    for header in ["dataset.h", "scanner.h", "batch.h"] {
+        let cases = [
+            (
+                "lance_before_arrow",
+                format!("#include <lance/{header}>\n#include <arrow/c/abi.h>\n"),
+                [include_dir.as_path(), arrow_include_dir.as_path()],
+            ),
+            (
+                "arrow_before_lance",
+                format!("#include <arrow/c/abi.h>\n#include <lance/{header}>\n"),
+                [include_dir.as_path(), arrow_include_dir.as_path()],
+            ),
+            (
+                "data_only_arrow_before_lance",
+                format!(
+                    "#include <arrow/c/abi.h>\n#include <lance/{header}>\n\
+                     #ifndef ARROW_C_STREAM_INTERFACE\n\
+                     #error \"<lance/{header}> must define the Arrow stream interface\"\n\
+                     #endif\n"
+                ),
+                [include_dir.as_path(), data_only_include_dir.as_path()],
+            ),
+        ];
+
+        for (case, prefix, include_dirs) in cases {
+            let c_source = build_dir.path().join(format!("{case}_{header}.c"));
+            std::fs::write(
+                &c_source,
+                format!("{prefix}int main(void) {{ return 0; }}\n"),
+            )
+            .expect("failed to write C header test");
+            assert!(
+                compile_c_header_test(&c_source, &include_dirs),
+                "C11 {case} consumer for <lance/{header}> failed to compile"
+            );
+
+            let cpp_source = build_dir.path().join(format!("{case}_{header}.cpp"));
+            std::fs::write(&cpp_source, format!("{prefix}int main() {{ return 0; }}\n"))
+                .expect("failed to write C++ header test");
+            assert!(
+                compile_cpp_header_test(&cpp_source, &include_dirs),
+                "C++20 {case} consumer for <lance/{header}> failed to compile"
+            );
+        }
+    }
+}
