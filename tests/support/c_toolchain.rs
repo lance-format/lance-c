@@ -7,9 +7,10 @@
 //! (or any MSVC-compatible compiler such as `clang-cl`) and link the
 //! `lance_c.dll.lib` import library explicitly.
 //!
-//! `CC` and `CXX` override the compiler on every platform. On Windows they must
-//! name an MSVC-compatible compiler; the harness passes `/`-style arguments
-//! either way.
+//! `CC` and `CXX` override the compiler on Linux and macOS. The MSVC targets
+//! always use the target-aware toolchain that `build.rs` resolves, so the
+//! harness never picks a `cl.exe` from `PATH` that targets another
+//! architecture.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -113,13 +114,8 @@ fn compiler_command(language: Language) -> Command {
 
     #[cfg(windows)]
     {
-        let default = "cl.exe";
-        let tool = std::env::var_os(variable).unwrap_or_else(|| default.into());
-        let mut command = Command::new(tool);
-        if let Some(environment) = msvc_environment() {
-            command.envs(environment);
-        }
-        command
+        let _ = variable;
+        msvc_compiler_command()
     }
     #[cfg(not(windows))]
     {
@@ -248,143 +244,24 @@ fn msvc_arguments(compilation: &Compilation<'_>) -> Vec<OsString> {
     arguments
 }
 
-/// Environment from the Visual Studio developer prompt.
+/// Compiler command for the MSVC targets.
 ///
-/// `cl.exe` is seldom on the default `PATH` outside a developer shell, so the
-/// harness resolves the installation with `vswhere.exe` and reads the
-/// environment that `vcvarsall.bat` would export. Returning `None` keeps the
-/// inherited environment, which is correct inside a developer shell and when
-/// `CC`/`CXX` point at a compiler that needs no MSVC environment.
+/// `cc::windows_registry` resolves the Visual Studio installation that matches
+/// the target architecture and returns the developer environment with it, the
+/// same lookup `build.rs` uses for `lib.exe`. That avoids a `cl.exe` picked up
+/// from `PATH`, which can target a different architecture than the library the
+/// harness links against.
 #[cfg(windows)]
-fn msvc_environment() -> Option<&'static std::collections::BTreeMap<OsString, OsString>> {
-    use std::sync::OnceLock;
+fn msvc_compiler_command() -> Command {
+    let target = format!("{}-pc-windows-msvc", std::env::consts::ARCH);
 
-    static ENVIRONMENT: OnceLock<Option<std::collections::BTreeMap<OsString, OsString>>> =
-        OnceLock::new();
-
-    ENVIRONMENT
-        .get_or_init(|| {
-            if command_exists("cl.exe") {
-                return None;
-            }
-            let installation = visual_studio_installation()?;
-            vcvars_environment(&installation)
-        })
-        .as_ref()
-}
-
-#[cfg(windows)]
-fn command_exists(name: &str) -> bool {
-    Command::new("where.exe")
-        .arg(name)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn visual_studio_installation() -> Option<PathBuf> {
-    let vswhere = ["ProgramFiles(x86)", "ProgramFiles"]
-        .iter()
-        .filter_map(|variable| std::env::var_os(variable))
-        .map(|root| {
-            PathBuf::from(root)
-                .join("Microsoft Visual Studio")
-                .join("Installer")
-                .join("vswhere.exe")
-        })
-        .find(|candidate| candidate.is_file())?;
-
-    let required_component = match std::env::consts::ARCH {
-        "aarch64" => "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
-        _ => "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-    };
-    let output = Command::new(vswhere)
-        .args([
-            "-latest",
-            "-products",
-            "*",
-            "-requires",
-            required_component,
-            "-property",
-            "installationPath",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let installation = String::from_utf8(output.stdout).ok()?;
-    let installation = installation.trim();
-    if installation.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(installation))
-}
-
-#[cfg(windows)]
-fn vcvars_environment(
-    installation: &Path,
-) -> Option<std::collections::BTreeMap<OsString, OsString>> {
-    let vcvars = installation
-        .join("VC")
-        .join("Auxiliary")
-        .join("Build")
-        .join("vcvarsall.bat");
-    if !vcvars.is_file() {
-        return None;
-    }
-
-    // `vcvarsall <arch>` picks the native host toolset; on Windows ARM64 the
-    // Visual Studio layout can still be x64-hosted, so retry with the explicit
-    // x64_arm64 form before giving up on the installation.
-    let target = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        _ => "x64",
-    };
-    let mut architectures = vec![target.to_owned()];
-    if target == "arm64" {
-        architectures.push("x64_arm64".to_owned());
-    }
-
-    // A batch file keeps the quoting for `cl.exe` out of the argument list:
-    // cmd strips the outer quotes of a single quoted script path.
-    let directory = tempfile::Builder::new()
-        .prefix("lance-c-msvc")
-        .tempdir()
-        .ok()?;
-    for architecture in architectures {
-        let script = format!(
-            "@echo off\r\n\
-             call \"{}\" {architecture} >nul || exit /b 1\r\n\
-             set\r\n",
-            vcvars.display()
-        );
-        let script_path = directory.path().join("vcvars.cmd");
-        std::fs::write(&script_path, script).ok()?;
-
-        let output = Command::new("cmd.exe")
-            .args(["/d", "/c"])
-            .arg(&script_path)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            return Some(parse_set_output(&output.stdout));
-        }
-    }
-    None
-}
-
-/// Parse the `set` output exported by a developer prompt.
-#[cfg(windows)]
-fn parse_set_output(stdout: &[u8]) -> std::collections::BTreeMap<OsString, OsString> {
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-        .collect()
+    let tool = cc::windows_registry::find_tool(&target, "cl.exe").unwrap_or_else(|| {
+        panic!(
+            "MSVC cl.exe was not found for {target}; install the Visual Studio C++ \
+             toolset for this architecture"
+        )
+    });
+    tool.to_command()
 }
 
 #[cfg(test)]
@@ -392,21 +269,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executable_path_names_the_binary_the_platform_runs() {
-        let path = executable_path(Path::new("/tmp/build"), "test_c_api");
-        if cfg!(windows) {
-            assert_eq!(path, Path::new("/tmp/build/test_c_api.exe"));
+    fn executable_path_names_the_binary_the_host_runs() {
+        let path = executable_path(Path::new("build"), "test_c_api");
+        let expected_name = if cfg!(windows) {
+            "test_c_api.exe"
         } else {
-            assert_eq!(path, Path::new("/tmp/build/test_c_api"));
-        }
+            "test_c_api"
+        };
+
+        assert_eq!(path.parent(), Some(Path::new("build")));
+        assert_eq!(path.file_name().unwrap(), expected_name);
     }
 
     #[test]
     fn import_library_appends_the_msvc_suffix() {
-        assert_eq!(
-            import_library(Path::new("/tmp/build/lance_c.dll")),
-            Path::new("/tmp/build/lance_c.dll.lib")
-        );
+        let import = import_library(Path::new("build/lance_c.dll"));
+
+        assert_eq!(import.parent(), Some(Path::new("build")));
+        assert_eq!(import.file_name().unwrap(), "lance_c.dll.lib");
     }
 
     fn as_strings(arguments: Vec<OsString>) -> Vec<String> {
@@ -418,37 +298,35 @@ mod tests {
 
     fn source(language: Language) -> &'static Path {
         match language {
-            Language::C => Path::new("/src/test_c_api.c"),
-            Language::Cpp => Path::new("/src/test_cpp_api.cpp"),
+            Language::C => Path::new("src/test_c_api.c"),
+            Language::Cpp => Path::new("src/test_cpp_api.cpp"),
         }
     }
 
-    /// GNU-style invocation with the build-tree library, mirroring what the
-    /// harness passes on Linux and macOS.
+    /// GNU-style invocation for a build under `build/`, mirroring Linux and
+    /// macOS.
     fn reference_gnu(language: Language, links: bool, deny_warnings: bool) -> Vec<String> {
         let source = source(language);
         let compilation = Compilation {
             language,
             sources: &[source],
-            includes: &[Path::new("/checkout/include")],
-            output: links.then(|| Path::new("/tmp/build/test_c_api")),
-            shared_library: Some(Path::new("/checkout/target/debug/liblance_c.so")),
+            includes: &[Path::new("include")],
+            output: links.then(|| Path::new("build/test_c_api")),
+            shared_library: Some(Path::new("build/liblance_c.so")),
             deny_warnings,
         };
         as_strings(gnu_arguments(&compilation))
     }
 
-    /// MSVC invocation with the DLL import library. The paths stay
-    /// slash-separated so the expectations hold on every host; MSVC receives
-    /// whatever separator the real platform path uses.
+    /// MSVC invocation for the same build layout.
     fn reference_msvc(language: Language, links: bool, deny_warnings: bool) -> Vec<String> {
         let source = source(language);
         let compilation = Compilation {
             language,
             sources: &[source],
-            includes: &[Path::new("/checkout/include")],
-            output: links.then(|| Path::new("/build/test_c_api.exe")),
-            shared_library: Some(Path::new("/build/lance_c.dll")),
+            includes: &[Path::new("include")],
+            output: links.then(|| Path::new("build/test_c_api.exe")),
+            shared_library: Some(Path::new("build/lance_c.dll")),
             deny_warnings,
         };
         as_strings(msvc_arguments(&compilation))
@@ -460,10 +338,10 @@ mod tests {
 
         assert!(arguments.contains(&"-std=c11".to_string()));
         assert!(arguments.contains(&"-o".to_string()));
-        assert!(arguments.contains(&"/tmp/build/test_c_api".to_string()));
-        assert!(arguments.contains(&"-I/checkout/include".to_string()));
-        assert!(arguments.contains(&"/src/test_c_api.c".to_string()));
-        assert!(arguments.contains(&"-L/checkout/target/debug".to_string()));
+        assert!(arguments.contains(&"build/test_c_api".to_string()));
+        assert!(arguments.contains(&"-Iinclude".to_string()));
+        assert!(arguments.contains(&"src/test_c_api.c".to_string()));
+        assert!(arguments.contains(&"-Lbuild".to_string()));
         assert!(arguments.contains(&"-llance_c".to_string()));
         assert!(!arguments.contains(&"-fsyntax-only".to_string()));
     }
@@ -501,11 +379,16 @@ mod tests {
         assert!(arguments.contains(&"/std:c11".to_string()));
         assert!(arguments.contains(&"/experimental:c11atomics".to_string()));
         assert!(arguments.contains(&"/W4".to_string()));
-        assert!(arguments.contains(&"/I/checkout/include".to_string()));
-        assert!(arguments.contains(&"/Fe:/build/test_c_api.exe".to_string()));
-        assert!(arguments.contains(&"/Fo/build\\".to_string()));
+        assert!(arguments.contains(&"/Iinclude".to_string()));
+        assert!(arguments.contains(&"/Fe:build/test_c_api.exe".to_string()));
+        assert!(arguments.contains(&"/Fobuild\\".to_string()));
         assert!(arguments.contains(&"/link".to_string()));
-        assert!(arguments.contains(&"/build/lance_c.dll.lib".to_string()));
+        // `with_file_name` inserts the host separator before the new name.
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.ends_with("lance_c.dll.lib"))
+        );
         assert!(!arguments.contains(&"/Zs".to_string()));
     }
 

@@ -1,24 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! `file://` URI construction for local test paths.
+//! `file://` URIs for local test paths.
+//!
+//! The native consumers receive these URIs from the Rust harness instead of
+//! assembling them from paths, so the conversion and its escaping live in one
+//! place. `Url::from_file_path` produces the drive-letter form on Windows and
+//! percent-encodes characters that would otherwise change meaning when the URI
+//! travels through JSON or a substring assertion.
 
 use std::path::Path;
 
-/// `file://` URI for a local filesystem path.
+/// `file://` URI for an absolute local path.
 ///
-/// A Unix path already starts with `/`, so the URI reads `file:///tmp/data`.
-/// A Windows path starts with a drive letter: `file://C:\Temp` would parse as
-/// host `C` with port `\Temp`, so the drive-letter form `file:///C:/Temp` is
-/// required instead.
+/// A Unix path becomes `file:///tmp/data`; a Windows path becomes
+/// `file:///C:/Temp/data`. `#`, `%`, spaces, and a literal backslash inside a
+/// Unix path are percent-encoded rather than rewritten.
 pub fn file_uri(path: &Path) -> String {
-    let path = path
-        .to_str()
-        .unwrap_or_else(|| panic!("test path is not valid UTF-8: {}", path.display()))
-        .replace('\\', "/");
-    if path.starts_with('/') {
-        format!("file://{path}")
-    } else {
-        format!("file:///{path}")
-    }
+    url::Url::from_file_path(path)
+        .unwrap_or_else(|()| panic!("test path must be absolute: {}", path.display()))
+        .to_string()
 }

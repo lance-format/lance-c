@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 #include "lance/lance.hpp"
-#include "test_local_uri.h"
 
 #include <algorithm>
 #include <array>
@@ -99,7 +98,7 @@ static uint64_t write_cpp_replacement_file(
 
     lance::FileWriterOptions options;
     options.version = std::string("2.1");
-    lance::FileSession files(lance_test_local_uri(uri + "/data"));
+    lance::FileSession files(uri + "/data");
     auto writer = files.open_writer(filename, &schema, options);
 
     while (true) {
@@ -976,7 +975,7 @@ void write_blob_replacement_file(
     root_schema.children = schema_children;
     root_schema.release = &publication_release_schema;
 
-    lance::FileSession files(lance_test_local_uri(uri + "/data"));
+    lance::FileSession files(uri + "/data");
     lance::FileWriterOptions options;
     options.version = std::string("2.2");
     options.keep_original_array = true;
@@ -1045,7 +1044,7 @@ static void test_blob_writer_data_replacement(const std::string& blob_uri) {
 
     const std::string packed_name = "cpp-packed-publication.lance";
     const std::string dedicated_name = "cpp-dedicated-publication.lance";
-    lance::FileSession files(lance_test_local_uri(blob_uri + "/data"));
+    lance::FileSession files(blob_uri + "/data");
 
     std::vector<uint8_t> packed_validity(1, 0x03);
     std::vector<int32_t> packed_offsets{0};
@@ -1256,7 +1255,7 @@ static void test_blob_writer_append(const std::string& blob_uri) {
 
     const std::string packed_name = "cpp-packed-append.lance";
     const std::string dedicated_name = "cpp-dedicated-append.lance";
-    lance::FileSession files(lance_test_local_uri(blob_uri + "/data"));
+    lance::FileSession files(blob_uri + "/data");
 
     std::vector<uint8_t> packed_validity(1, 0x05);
     std::vector<int32_t> packed_offsets{0};

@@ -209,18 +209,15 @@ static void write_table(
 }
 
 int main(int argc, char** argv) {
-    CHECK(argc > 1, "missing test root argument");
+    CHECK(argc > 2, "missing test root or root URI argument");
     char root[512];
     snprintf(root, sizeof(root), "%s/namespace", argv[1]);
     CHECK(test_mkdir(root) == 0 || test_path_exists(root), "namespace root");
-#if defined(_WIN32)
-    /* The native path contains backslashes, which are not valid JSON escapes;
-       the file URI form is both JSON-safe and a supported namespace root. */
+    /* argv[1] is the directory to create; argv[2] is its file URI. The JSON
+       root is the URI plus an ASCII suffix, so Windows backslashes never reach
+       the JSON text. */
     char root_json[520];
-    lance_test_local_uri(root_json, sizeof(root_json), root);
-#else
-    const char *root_json = root;
-#endif
+    snprintf(root_json, sizeof(root_json), "%s/namespace", argv[2]);
     char properties[1024];
     snprintf(properties, sizeof(properties),
              "{\"root\":\"%s\",\"manifest_enabled\":\"true\","

@@ -38,6 +38,9 @@ mod abi_layout;
 #[path = "support/c_toolchain.rs"]
 mod c_toolchain;
 
+#[path = "support/local_uri.rs"]
+mod local_uri;
+
 #[path = "support/substrait_aggregate.rs"]
 mod substrait_aggregate;
 
@@ -1307,10 +1310,11 @@ fn compile_header_with_args(
 }
 
 /// Run a compiled test binary with the source dataset URI, a destination URI
-/// for the write test, the Blob v2 and ordering datasets, the indexed session
-/// cache dataset, separate non-stable/stable fragment-deletion datasets, the
-/// cleanup and RTree geometry fixtures, the aggregate plan, and the
-/// config/base/file fixture. The destination path must not pre-exist.
+/// for the write test and its `file://` form, the Blob v2 and ordering
+/// datasets, the indexed session cache dataset, separate non-stable/stable
+/// fragment-deletion datasets, the cleanup and RTree geometry fixtures, the
+/// aggregate plan, and the config/base/file fixture. The destination path must
+/// not pre-exist.
 #[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
@@ -1326,6 +1330,7 @@ fn run_test_binary(
     aggregate_plan_path: &Path,
     config_base_files: &common::ConfigBaseFilesFixture,
 ) {
+    let write_file_uri = local_uri::file_uri(Path::new(write_uri));
     let output = Command::new(binary)
         .arg(dataset_uri)
         .arg(write_uri)
@@ -1339,6 +1344,7 @@ fn run_test_binary(
         .arg(aggregate_plan_path)
         .arg(&config_base_files.uri)
         .arg(&config_base_files.alternate_base_uri)
+        .arg(&write_file_uri)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -1595,7 +1601,11 @@ fn test_native_transaction_compilation_and_execution() {
     let (_cpp_blob_append_tmp, cpp_blob_append_uri) = create_blob_publication_dataset_on_disk();
     let base = tmp.path().join("native_transactions");
     std::fs::create_dir_all(&base).unwrap();
-    let base = base.to_str().unwrap();
+    // The consumers receive file URIs: they only use these locations through
+    // the dataset and file-session APIs, and a URI keeps Windows paths free of
+    // backslashes that would need escaping in JSON.
+    let dataset_uri = local_uri::file_uri(Path::new(&dataset_uri));
+    let base = local_uri::file_uri(&base);
     let build_dir = tempfile::tempdir().unwrap();
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1607,11 +1617,14 @@ fn test_native_transaction_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C transaction test compilation failed"
     );
+    let c_schema_uri = local_uri::file_uri(Path::new(&c_schema_uri));
+    let c_blob_publication_uri = local_uri::file_uri(Path::new(&c_blob_publication_uri));
+    let c_blob_append_uri = local_uri::file_uri(Path::new(&c_blob_append_uri));
     run_test_binary_with_args(
         &c_binary,
         &[
             &dataset_uri,
-            base,
+            &base,
             &c_schema_uri,
             &c_blob_publication_uri,
             &c_blob_append_uri,
@@ -1624,11 +1637,14 @@ fn test_native_transaction_compilation_and_execution() {
         compile_cpp_test(&[&cpp_source], &cpp_binary, &include_dir, &lib_path),
         "C++ transaction test compilation failed"
     );
+    let cpp_schema_uri = local_uri::file_uri(Path::new(&cpp_schema_uri));
+    let cpp_blob_publication_uri = local_uri::file_uri(Path::new(&cpp_blob_publication_uri));
+    let cpp_blob_append_uri = local_uri::file_uri(Path::new(&cpp_blob_append_uri));
     run_test_binary_with_args(
         &cpp_binary,
         &[
             &dataset_uri,
-            base,
+            &base,
             &cpp_schema_uri,
             &cpp_blob_publication_uri,
             &cpp_blob_append_uri,
@@ -1730,6 +1746,7 @@ fn test_raw_file_native_compilation_and_execution() {
     )
     .unwrap();
     let base_path = base.path().to_str().unwrap();
+    let base_uri = local_uri::file_uri(base.path());
     let build_dir = tempfile::tempdir().unwrap();
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1741,7 +1758,7 @@ fn test_raw_file_native_compilation_and_execution() {
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C raw-file test compilation failed"
     );
-    run_test_binary_with_dataset(&c_binary, base_path);
+    run_test_binary_with_args(&c_binary, &[base_path, &base_uri]);
 
     let cpp_source = tests_dir.join("test_file_api.cpp");
     let cpp_session_source = tests_dir.join("test_file_session.cpp");
@@ -1755,9 +1772,9 @@ fn test_raw_file_native_compilation_and_execution() {
         ),
         "C++ raw-file test compilation failed"
     );
-    run_test_binary_with_dataset(&cpp_binary, base_path);
+    run_test_binary_with_args(&cpp_binary, &[base_path, &base_uri]);
     #[cfg(unix)]
-    run_test_binary_with_two_args(&cpp_binary, base_path, "write-failure");
+    run_test_binary_with_args(&cpp_binary, &[base_path, &base_uri, "write-failure"]);
 }
 
 /// A fresh C executable must initialize OpenDAL even when archive constructors are omitted.
@@ -1786,14 +1803,15 @@ fn test_native_namespace_compilation_and_execution() {
         .join("cpp");
 
     let c_source = tests_dir.join("test_namespace.c");
-    let root = tempfile::tempdir().unwrap();
-    let root = root.path().to_str().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = root_dir.path().to_str().unwrap();
+    let root_uri = local_uri::file_uri(root_dir.path());
     let c_binary = c_toolchain::executable_path(build_dir.path(), "test_namespace_c");
     assert!(
         compile_c_test(&c_source, &c_binary, &include_dir, &lib_path),
         "C native namespace test compilation failed"
     );
-    run_test_binary_with_dataset(&c_binary, root);
+    run_test_binary_with_args(&c_binary, &[root, &root_uri]);
 
     let cpp_source = tests_dir.join("test_namespace.cpp");
     let cpp_binary = c_toolchain::executable_path(build_dir.path(), "test_namespace_cpp");

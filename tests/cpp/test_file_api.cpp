@@ -2,7 +2,6 @@
 /* SPDX-FileCopyrightText: Copyright The Lance Authors */
 
 #include "lance/lance.hpp"
-#include "test_local_uri.h"
 
 #include <cstdint>
 #include <cstring>
@@ -293,7 +292,8 @@ std::filesystem::path object_path_on_disk(const std::string& object_path) {
     return std::filesystem::path("/") / object_path;
 }
 
-int test_transfer_write_failures(const std::string& base_path) {
+int test_transfer_write_failures(const std::string& base_path,
+                                const std::string& base_uri) {
     const auto directory = std::filesystem::path(base_path) / "write-failures";
     std::filesystem::create_directories(directory);
     const std::string expected(4096, 'x');
@@ -306,7 +306,7 @@ int test_transfer_write_failures(const std::string& base_path) {
         CHECK(output.good(), "create complete write-failure fixture");
     }
     if (failures) return 1;
-    lance::FileSession files(lance_test_local_uri(directory.string()));
+    lance::FileSession files(base_uri + "/write-failures");
 
     struct rlimit original{};
     if (getrlimit(RLIMIT_FSIZE, &original) != 0) return 2;
@@ -394,13 +394,15 @@ int test_transfer_write_failures(const std::string& base_path) {
 }  // namespace
 
 int main(int argc, char **argv) {
+    if (argc != 3 && argc != 4) return 2;
 #if defined(__unix__) || defined(__APPLE__)
-    if (argc == 3 && std::string(argv[2]) == "write-failure") {
-        return test_transfer_write_failures(argv[1]);
+    if (argc == 4 && std::string(argv[3]) == "write-failure") {
+        return test_transfer_write_failures(argv[1], argv[2]);
     }
 #endif
-    if (argc != 2) return 2;
-    const std::string base_uri = lance_test_local_uri(argv[1]);
+    if (argc != 3) return 2;
+    /* argv[1] is the directory for local fixture files; argv[2] is its URI. */
+    const std::string base_uri = argv[2];
 
     SchemaFixture schema;
     lance::StorageOptions static_options;

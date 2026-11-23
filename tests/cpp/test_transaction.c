@@ -2,7 +2,6 @@
 /* SPDX-FileCopyrightText: Copyright The Lance Authors */
 
 #include "lance/lance.h"
-#include "test_local_uri.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -292,10 +291,8 @@ static void write_c_replacement_file(const char *uri,
            "read replacement schema");
     CHECK_OK();
 
-    char dataset_uri[4096];
-    lance_test_local_uri(dataset_uri, sizeof(dataset_uri), uri);
     char data_uri[4096];
-    snprintf(data_uri, sizeof(data_uri), "%s/data", dataset_uri);
+    snprintf(data_uri, sizeof(data_uri), "%s/data", uri);
     LanceFileSession *session =
         lance_file_session_new(data_uri, NULL, NULL, NULL);
     ASSERT(session != NULL, "replacement file session");
@@ -2055,10 +2052,8 @@ static void test_blob_writer_publication(const char *uri) {
     CHECK_OK();
     check_publication_payloads(uri, 4, after_delete, 6);
 
-    char dataset_uri[4096];
-    lance_test_local_uri(dataset_uri, sizeof(dataset_uri), uri);
     char data_uri[4096];
-    snprintf(data_uri, sizeof(data_uri), "%s/data", dataset_uri);
+    snprintf(data_uri, sizeof(data_uri), "%s/data", uri);
     LanceFileSession *session =
         lance_file_session_new(data_uri, NULL, NULL, NULL);
     ASSERT(session != NULL, "open publication session");
@@ -2384,10 +2379,8 @@ static void test_blob_writer_append(const char *uri) {
            "blob append initial row IDs");
     check_publication_payloads(uri, 3, pristine, 7);
 
-    char dataset_uri[4096];
-    lance_test_local_uri(dataset_uri, sizeof(dataset_uri), uri);
     char data_uri[4096];
-    snprintf(data_uri, sizeof(data_uri), "%s/data", dataset_uri);
+    snprintf(data_uri, sizeof(data_uri), "%s/data", uri);
     LanceFileSession *session =
         lance_file_session_new(data_uri, NULL, NULL, NULL);
     ASSERT(session != NULL, "open blob append session");

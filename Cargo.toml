@@ -95,6 +95,13 @@ tempfile = "3"
 # Direct for `libc::SIGABRT` in the panic-guard test's child-process assertions;
 # already in the graph transitively via tokio/lance.
 libc = "0.2"
+# Direct for `cc::windows_registry::find_tool`, the same target-aware MSVC
+# discovery build.rs uses for the Windows export library; already a
+# build-dependency, so no new crate version enters the graph.
+cc = "1"
+# Direct for `Url::from_file_path`, which builds the `file://` URIs the native
+# tests hand to C/C++ consumers; already in the graph via object_store.
+url = "2"
 
 [package.metadata.capi.header]
 subdirectory = "lance"
