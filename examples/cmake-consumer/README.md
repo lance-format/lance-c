@@ -17,6 +17,9 @@ elsewhere, it calls `find_package(LanceC CONFIG REQUIRED)` without a version and
 accepts the package in `CMAKE_PREFIX_PATH`; the repository layout is not
 required.
 
+The executables link `LanceC::lance_cpp` for the C++20 wrappers. Applications
+using only `<lance/lance.h>` link `LanceC::lance_c` and can use C11 or C++17.
+
 ## Build
 
 After unpacking the [0.2.x release archive](../../README.md#quickstart), use its install prefix:

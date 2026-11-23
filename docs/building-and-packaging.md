@@ -82,6 +82,17 @@ cmake --build build --parallel
 cmake --install build --prefix /your/prefix
 ```
 
+An installed Corrosion 0.5 package in `CMAKE_PREFIX_PATH` is used before
+fetching the pinned Corrosion 0.5.1 sources. This also works on CMake 3.22;
+offline builds must provide the Rust dependencies separately.
+
+The equivalent preset commands are `cmake --preset release`,
+`cmake --build --preset release`, and `ctest --preset release`.
+Standalone builds enable `BUILD_TESTING` by default. CTest runs the CMake
+metadata and consumer compilation tests without rebuilding Rust; use
+`-DBUILD_TESTING=OFF` to omit them. Embedded builds leave testing and compiler
+defaults under the parent project's control.
+
 On macOS, export `MACOSX_DEPLOYMENT_TARGET` in the environment that invokes CMake. With the pinned Corrosion 0.5.1, setting only `CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts:
 
 ```bash
@@ -98,6 +109,27 @@ cmake --install build --prefix /your/prefix
 find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(myapp PRIVATE LanceC::lance_c)
 ```
+
+`LanceC::lance_c`, `LanceC::lance_c_static`, and `LanceC::lance_c_shared`
+expose the C11 API in `<lance/lance.h>`. They also support C++ applications
+using that header without raising the application's C++ standard.
+For the header-only C++20 wrappers in `<lance/lance.hpp>`, use:
+
+```cmake
+target_link_libraries(myapp PRIVATE LanceC::lance_cpp)
+```
+
+`LanceC::lance_cpp` links the default C target, so `LanceC_LINK=shared` selects
+shared linkage for the wrapper too. Static targets propagate the required
+platform system libraries; shared targets keep those dependencies private.
+The same targets are available through `add_subdirectory()` and `FetchContent`;
+set `LANCE_C_LINK` for their default linkage.
+
+Migration: C++ consumers that previously relied on `LanceC::lance_c` to enable
+C++20 should switch to `LanceC::lance_cpp`, or explicitly request
+`target_compile_features(myapp PRIVATE cxx_std_20)` while linking their chosen
+C target. Older release packages without `LanceC::lance_cpp` still need that
+explicit C++ standard.
 
 An unversioned `find_package(LanceC CONFIG REQUIRED)` accepts the package in the selected prefix. Pass a version number only to require a specific minor release line; `SameMinorVersion` compatibility rejects a `0.1` request against a `0.2` package.
 

@@ -48,6 +48,10 @@ find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
+C and C++ applications using `<lance/lance.h>` link `LanceC::lance_c`.
+For the C++20 wrapper `<lance/lance.hpp>`, link `LanceC::lance_cpp` instead;
+it selects the required C++ standard and links the C library.
+
 CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to use the shared library. On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules).
 
 With pkg-config, point `PKG_CONFIG_PATH` at the archive's `lib/pkgconfig`:
