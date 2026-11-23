@@ -15444,6 +15444,15 @@ fn native_descriptor_parts(
     builder.finish().unwrap().into_parts()
 }
 
+/// Object-store path reported by the C API.
+///
+/// `Path::from` percent-encodes object-key characters such as `~`, so a Windows
+/// 8.3 temporary path (`RUNNER~1`) becomes `RUNNER%7E1` and no longer names the
+/// file the writer created. `Path::parse` keeps the reported spelling.
+fn reported_object_path(path: &str) -> object_store::path::Path {
+    object_store::path::Path::parse(path).unwrap()
+}
+
 fn read_blob_sidecar(
     store: &lance_io::object_store::ObjectStore,
     path: &object_store::path::Path,
@@ -15620,7 +15629,7 @@ fn test_packed_blob_writer_c_matches_native_binary_types_and_descriptor_identity
             take_last_error_message()
         );
         let (c_field, c_array) = output_parts(out_array, out_schema);
-        let c_bytes = read_blob_sidecar(&store, &object_store::path::Path::from(c_path.as_str()));
+        let c_bytes = read_blob_sidecar(&store, &reported_object_path(&c_path));
         assert_eq!(c_bytes, expected_payload_bytes(&rows));
         unsafe { lance_packed_blob_writer_close(writer) };
 
@@ -15693,7 +15702,7 @@ fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
         take_last_error_message()
     );
     let (c_field, c_array) = output_parts(out_array, out_schema);
-    let c_bytes = read_blob_sidecar(&store, &object_store::path::Path::from(c_path.as_str()));
+    let c_bytes = read_blob_sidecar(&store, &reported_object_path(&c_path));
     assert_eq!(c_bytes, b"alphaomega");
     assert_eq!(c_array.len(), 1);
     unsafe { lance_dedicated_blob_writer_close(writer) };
@@ -15740,8 +15749,7 @@ fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
     );
     let (empty_field, empty_array) = output_parts(empty_array, empty_schema);
     assert_eq!(empty_field.name(), "");
-    let empty_bytes =
-        read_blob_sidecar(&store, &object_store::path::Path::from(empty_path.as_str()));
+    let empty_bytes = read_blob_sidecar(&store, &reported_object_path(&empty_path));
     assert!(empty_bytes.is_empty());
     unsafe { lance_dedicated_blob_writer_close(empty_writer) };
 
