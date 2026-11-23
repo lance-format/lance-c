@@ -30,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1518,27 +1519,71 @@ static void test_dataset_take_rows(const std::string& uri) {
 
     auto ds = lance::Dataset::open(uri);
 
-    // The smoke fixture has one fragment, so its first row IDs are 0, 1, 2.
+    // Row IDs 0, 1 and 2 exist in the smoke fixture.
     uint64_t row_ids[] = {0, 1, 2};
+
+    // Keep the pointer/count calls used by existing consumers.
     ArrowArrayStream stream;
     memset(&stream, 0, sizeof(stream));
     ds.take_rows(row_ids, 3, &stream);
+    assert(drain_scan_rows(stream) == 3);
 
-    uint64_t total = 0;
-    while (true) {
-        ArrowArray arr;
-        memset(&arr, 0, sizeof(arr));
-        int rc = stream.get_next(&stream, &arr);
-        assert(rc == 0);
-        if (!arr.release) break;
-        total += (uint64_t)arr.length;
-        arr.release(&arr);
-    }
+    ArrowArrayStream null_stream;
+    memset(&null_stream, 0, sizeof(null_stream));
+    ds.take_rows(nullptr, 0, &null_stream);
+    assert(drain_scan_rows(null_stream) == 0);
 
-    assert(total == 3);
-    printf("rows=%llu... ", (unsigned long long)total);
+    // Braced null/zero arguments still select the pointer/count overload.
+    ArrowArrayStream braced_null_stream;
+    memset(&braced_null_stream, 0, sizeof(braced_null_stream));
+    ds.take_rows({}, {}, &braced_null_stream);
+    assert(drain_scan_rows(braced_null_stream) == 0);
 
-    if (stream.release) stream.release(&stream);
+    // C arrays and braced vectors bind to the borrowing span overload.
+    ArrowArrayStream array_stream;
+    memset(&array_stream, 0, sizeof(array_stream));
+    ds.take_rows(row_ids, &array_stream);
+    assert(drain_scan_rows(array_stream) == 3);
+
+    std::vector<uint64_t> vector_ids{0, 1, 2};
+    ArrowArrayStream vector_stream;
+    memset(&vector_stream, 0, sizeof(vector_stream));
+    ds.take_rows(vector_ids, &vector_stream);
+    assert(drain_scan_rows(vector_stream) == 3);
+
+    std::array<uint64_t, 3> std_array_ids{0, 1, 2};
+    ArrowArrayStream std_array_stream;
+    memset(&std_array_stream, 0, sizeof(std_array_stream));
+    ds.take_rows(std_array_ids, &std_array_stream);
+    assert(drain_scan_rows(std_array_stream) == 3);
+
+    // The column-list overload also accepts a braced column list.
+    std::span<const uint64_t> span_ids(vector_ids);
+    ArrowArrayStream projected_stream;
+    memset(&projected_stream, 0, sizeof(projected_stream));
+    ds.take_rows(span_ids, {"id", "name"}, &projected_stream);
+    assert_scan_schema(projected_stream, {{"id", "i"}, {"name", "u"}});
+    assert(drain_scan_rows(projected_stream) == 3);
+
+    // Empty vectors, empty spans and `{}` are valid empty row-ID ranges.
+    std::vector<uint64_t> no_ids;
+    ArrowArrayStream empty_vector_stream;
+    memset(&empty_vector_stream, 0, sizeof(empty_vector_stream));
+    ds.take_rows(no_ids, &empty_vector_stream);
+    assert(drain_scan_rows(empty_vector_stream) == 0);
+
+    ArrowArrayStream empty_span_stream;
+    memset(&empty_span_stream, 0, sizeof(empty_span_stream));
+    ds.take_rows(std::span<const uint64_t>{}, {"id"}, &empty_span_stream);
+    assert_scan_schema(empty_span_stream, {{"id", "i"}});
+    assert(drain_scan_rows(empty_span_stream) == 0);
+
+    ArrowArrayStream empty_braces_stream;
+    memset(&empty_braces_stream, 0, sizeof(empty_braces_stream));
+    ds.take_rows({}, &empty_braces_stream);
+    assert(drain_scan_rows(empty_braces_stream) == 0);
+
+    printf("rows=3, empty=0... ");
     PASS();
 }
 
