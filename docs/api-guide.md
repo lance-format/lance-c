@@ -92,6 +92,23 @@ dataset.take(offsets, 3, &raw);  /* the overload accepts a column list */
 lance::ArrowStream rows(raw);
 ```
 
+`take_rows` also has a borrowing overload that takes
+`std::span<const uint64_t>`. `std::vector`, `std::array` and C arrays convert
+to it directly. The range is read only during the call, and an empty range
+(even one with a null data pointer) reads zero rows. The pointer/count
+overloads keep working.
+
+```cpp
+std::vector<uint64_t> row_ids{0, 4, 9};
+ArrowArrayStream raw{};
+dataset.take_rows(row_ids, &raw);  /* all columns */
+lance::ArrowStream all_columns(raw);
+
+ArrowArrayStream projected_raw{};
+dataset.take_rows(row_ids, {"id", "name"}, &projected_raw);
+lance::ArrowStream projected(projected_raw);
+```
+
 ## Vector and full-text search
 
 A vector query sets `k` on the scanner and can be combined with a SQL filter, projection, limit, offset, and ordering. The query vector length is the column dimension, not the byte length. The default scoring path adds `_distance` to the output; `Scanner::disable_scoring_autoprojection()` or `lance_scanner_disable_scoring_autoprojection()` keeps it only when named explicitly. `prefilter(true)` applies the filter before ranking; postfiltering can return fewer than `k` rows. An indexed query remains approximate. Use `use_index(false)` for an exact scan, still subject to `k`.
