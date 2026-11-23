@@ -277,7 +277,7 @@ typedef struct LanceScalarIndexOptions {
  *
  * @return 0 on success, -1 on an invalid or non-UTF-8 filter.
  */
-int32_t lance_init_logging(const char* filter);
+LANCE_API int32_t lance_init_logging(const char* filter);
 /* ─── Thread safety ─── */
 
 /**
@@ -407,7 +407,7 @@ typedef struct LanceSessionCacheSpec {
  * Cache limits are specified in bytes. Pass 0 to request zero capacity.
  * @return Session handle, or NULL on error
  */
-LanceSession* lance_session_new(
+LANCE_NODISCARD LANCE_API LanceSession* lance_session_new(
     uint64_t index_cache_size_bytes,
     uint64_t metadata_cache_size_bytes
 );
@@ -426,7 +426,7 @@ LanceSession* lance_session_new(
  *
  * @return Session handle, or NULL on error
  */
-LanceSession* lance_session_new_with_cache_specs(
+LANCE_NODISCARD LANCE_API LanceSession* lance_session_new_with_cache_specs(
     const LanceSessionCacheSpec* index_cache,
     const LanceSessionCacheSpec* metadata_cache
 );
@@ -435,14 +435,14 @@ LanceSession* lance_session_new_with_cache_specs(
  * Close a session handle. Safe to call with NULL. Datasets previously opened
  * with the session remain valid and retain the shared cache state.
  */
-void lance_session_close(LanceSession* session);
+LANCE_API void lance_session_close(LanceSession* session);
 
 /**
  * Copy current cache statistics to `out_stats`.
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_session_get_cache_stats(
+LANCE_API int32_t lance_session_get_cache_stats(
     const LanceSession* session,
     LanceSessionCacheStats* out_stats
 );
@@ -456,7 +456,7 @@ int32_t lance_session_get_cache_stats(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_session_get_size_bytes(
+LANCE_API int32_t lance_session_get_size_bytes(
     const LanceSession* session,
     uint64_t* out_size_bytes
 );
@@ -470,7 +470,7 @@ int32_t lance_session_get_size_bytes(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_session_get_approx_num_items(
+LANCE_API int32_t lance_session_get_approx_num_items(
     const LanceSession* session,
     uint64_t* out_num_items
 );
@@ -607,7 +607,7 @@ typedef struct LanceCleanupOldVersionsOptions {
  * @param out_stats Receives copied native stats on success only.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_cleanup_old_versions(
+LANCE_API int32_t lance_dataset_cleanup_old_versions(
     const LanceDataset* dataset,
     const LanceCleanupOldVersionsOptions* options,
     LanceRemovalStats* out_stats
@@ -627,7 +627,7 @@ int32_t lance_dataset_cleanup_old_versions(
  * @param out_stats         Receives copied native stats on success only.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_cleanup(
+LANCE_API int32_t lance_dataset_cleanup(
     const LanceDataset* dataset,
     const LanceCleanupPolicy* policy,
     const LanceCleanupOperationOptions* operation_options,
@@ -648,14 +648,14 @@ int32_t lance_dataset_cleanup(
  *         `lance_cleanup_explanation_close`. All strings borrowed from it
  *         remain valid until close.
  */
-LanceCleanupExplanation* lance_dataset_cleanup_explain(
+LANCE_NODISCARD LANCE_API LanceCleanupExplanation* lance_dataset_cleanup_explain(
     const LanceDataset* dataset,
     const LanceCleanupPolicy* policy,
     const LanceCleanupOperationOptions* operation_options
 );
 
 /** Dataset version observed when the explanation was produced. */
-uint64_t lance_cleanup_explanation_read_version(
+LANCE_API uint64_t lance_cleanup_explanation_read_version(
     const LanceCleanupExplanation* explanation
 );
 
@@ -665,13 +665,13 @@ uint64_t lance_cleanup_explanation_read_version(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_cleanup_explanation_stats(
+LANCE_API int32_t lance_cleanup_explanation_stats(
     const LanceCleanupExplanation* explanation,
     LanceRemovalStats* out_stats
 );
 
 /** Number of candidate files included in the explanation. */
-uint64_t lance_cleanup_explanation_candidate_count(
+LANCE_API uint64_t lance_cleanup_explanation_candidate_count(
     const LanceCleanupExplanation* explanation
 );
 
@@ -679,17 +679,17 @@ uint64_t lance_cleanup_explanation_candidate_count(
  * Whether more candidate files were found than included.
  * @return 1 or 0 on success, -1 on error.
  */
-int32_t lance_cleanup_explanation_candidate_files_truncated(
+LANCE_API int32_t lance_cleanup_explanation_candidate_files_truncated(
     const LanceCleanupExplanation* explanation
 );
 
 /** Native maximum candidate-file count used by the explanation. */
-uint64_t lance_cleanup_explanation_candidate_file_limit(
+LANCE_API uint64_t lance_cleanup_explanation_candidate_file_limit(
     const LanceCleanupExplanation* explanation
 );
 
 /** Candidate path at `index`; owned by `explanation`. NULL on error. */
-const char* lance_cleanup_explanation_candidate_path_at(
+LANCE_NODISCARD LANCE_API const char* lance_cleanup_explanation_candidate_path_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
@@ -698,7 +698,7 @@ const char* lance_cleanup_explanation_candidate_path_at(
  * Candidate `LanceCleanupFileKind` at `index`.
  * @return the fixed-width discriminant, or -1 on error.
  */
-int32_t lance_cleanup_explanation_candidate_kind_at(
+LANCE_API int32_t lance_cleanup_explanation_candidate_kind_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
@@ -707,30 +707,30 @@ int32_t lance_cleanup_explanation_candidate_kind_at(
  * Candidate unverified flag at `index`.
  * @return 1 or 0 on success, -1 on error.
  */
-int32_t lance_cleanup_explanation_candidate_unverified_at(
+LANCE_API int32_t lance_cleanup_explanation_candidate_unverified_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
 
 /** Candidate file size in bytes at `index`; 0 on error (check error code). */
-uint64_t lance_cleanup_explanation_candidate_size_bytes_at(
+LANCE_API uint64_t lance_cleanup_explanation_candidate_size_bytes_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
 
 /** Number of referenced child branches in the explanation. */
-uint64_t lance_cleanup_explanation_referenced_branch_count(
+LANCE_API uint64_t lance_cleanup_explanation_referenced_branch_count(
     const LanceCleanupExplanation* explanation
 );
 
 /** Referenced branch name at `index`; owned by `explanation`. NULL on error. */
-const char* lance_cleanup_explanation_referenced_branch_name_at(
+LANCE_NODISCARD LANCE_API const char* lance_cleanup_explanation_referenced_branch_name_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
 
 /** Referenced version at `index`; 0 on error (check error code). */
-uint64_t lance_cleanup_explanation_referenced_branch_version_at(
+LANCE_API uint64_t lance_cleanup_explanation_referenced_branch_version_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
@@ -739,31 +739,31 @@ uint64_t lance_cleanup_explanation_referenced_branch_version_at(
  * Whether the referenced branch at `index` is a cascade cleanup candidate.
  * @return 1 or 0 on success, -1 on error.
  */
-int32_t lance_cleanup_explanation_referenced_branch_cleanup_candidate_at(
+LANCE_API int32_t lance_cleanup_explanation_referenced_branch_cleanup_candidate_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
 
 /** Number of non-fatal warnings in the explanation. */
-uint64_t lance_cleanup_explanation_warning_count(
+LANCE_API uint64_t lance_cleanup_explanation_warning_count(
     const LanceCleanupExplanation* explanation
 );
 
 /** Warning at `index`; owned by `explanation`. NULL on error. */
-const char* lance_cleanup_explanation_warning_at(
+LANCE_NODISCARD LANCE_API const char* lance_cleanup_explanation_warning_at(
     const LanceCleanupExplanation* explanation,
     size_t index
 );
 
 /** Close an explanation snapshot. Safe to call with NULL. */
-void lance_cleanup_explanation_close(LanceCleanupExplanation* explanation);
+LANCE_API void lance_cleanup_explanation_close(LanceCleanupExplanation* explanation);
 
 /**
  * Validate the dataset's fragments, stable row IDs and indices.
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_validate(const LanceDataset* dataset);
+LANCE_API int32_t lance_dataset_validate(const LanceDataset* dataset);
 
 /**
  * Count rows hidden by deletion files across all fragments.
@@ -772,7 +772,7 @@ int32_t lance_dataset_validate(const LanceDataset* dataset);
  * @param out_rows Receives the native count on success only.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_count_deleted_rows(
+LANCE_API int32_t lance_dataset_count_deleted_rows(
     const LanceDataset* dataset,
     uint64_t* out_rows
 );
@@ -785,7 +785,7 @@ int32_t lance_dataset_count_deleted_rows(
  *
  * @return 0 on success, -1 on binding input error.
  */
-int32_t lance_dataset_num_small_files(
+LANCE_API int32_t lance_dataset_num_small_files(
     const LanceDataset* dataset,
     size_t max_rows_per_group,
     uint64_t* out_count
@@ -810,7 +810,7 @@ typedef enum {
  * Caller must free the returned string with `lance_free_string()`.
  * Returns NULL on error.
  */
-const char* lance_dataset_metadata_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_metadata_json(const LanceDataset* dataset);
 
 /**
  * Merge or replace table metadata and return the complete updated map as a
@@ -837,7 +837,7 @@ const char* lance_dataset_metadata_json(const LanceDataset* dataset);
  * Caller must free the returned JSON string with `lance_free_string()`.
  * Returns NULL on error. Commit and error semantics follow the native core.
  */
-const char* lance_dataset_update_metadata_json(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_update_metadata_json(
     LanceDataset* dataset,
     const char* const* keys,
     const char* const* values,
@@ -857,7 +857,7 @@ const char* lance_dataset_update_metadata_json(
  * Caller must free the returned JSON string with `lance_free_string()`.
  * Returns NULL on error. Commit and error semantics follow the native core.
  */
-const char* lance_dataset_update_schema_metadata_json(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_update_schema_metadata_json(
     LanceDataset* dataset,
     const char* const* keys,
     const char* const* values,
@@ -920,7 +920,7 @@ typedef struct LanceFieldMetadataUpdate {
  * Returns 0 on success, -1 on error. Input, field lookup, validation and commit
  * errors follow the native Lance core.
  */
-int32_t lance_dataset_update_field_metadata(
+LANCE_API int32_t lance_dataset_update_field_metadata(
     LanceDataset* dataset,
     const LanceFieldMetadataUpdate* updates,
     size_t update_count
@@ -933,14 +933,14 @@ int32_t lance_dataset_update_field_metadata(
  * Caller must free the returned string with `lance_free_string()`.
  * Returns NULL on error.
  */
-const char* lance_dataset_data_storage_version(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_data_storage_version(const LanceDataset* dataset);
 
 /**
  * Report whether the current snapshot uses stable row IDs.
  * On success writes `*out_has_stable_row_ids` and returns 0; on error returns
  * -1 and leaves the output untouched.
  */
-int32_t lance_dataset_has_stable_row_ids(
+LANCE_API int32_t lance_dataset_has_stable_row_ids(
     const LanceDataset* dataset,
     bool* out_has_stable_row_ids
 );
@@ -951,7 +951,7 @@ int32_t lance_dataset_has_stable_row_ids(
  * On success writes `*out_count` and returns 0; on error returns -1 and leaves
  * the output untouched.
  */
-int32_t lance_dataset_field_id_count(
+LANCE_API int32_t lance_dataset_field_id_count(
     const LanceDataset* dataset,
     size_t* out_count
 );
@@ -962,7 +962,7 @@ int32_t lance_dataset_field_id_count(
  * On success writes `*out_field_id` and returns 0; on error returns -1 and
  * leaves the output untouched.
  */
-int32_t lance_dataset_field_id_at(
+LANCE_API int32_t lance_dataset_field_id_at(
     const LanceDataset* dataset,
     size_t index,
     int32_t* out_field_id
@@ -974,7 +974,7 @@ int32_t lance_dataset_field_id_at(
  * On success writes `*out_field_id` and returns 0; on error returns -1 and
  * leaves the output untouched.
  */
-int32_t lance_dataset_resolve_field_id(
+LANCE_API int32_t lance_dataset_resolve_field_id(
     const LanceDataset* dataset,
     const LanceFieldReference* field,
     int32_t* out_field_id
@@ -986,14 +986,14 @@ int32_t lance_dataset_resolve_field_id(
  * nested fields. Caller must free the returned string with
  * `lance_free_string()`. Returns NULL on error, including an unknown ID.
  */
-const char* lance_dataset_field_path(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_field_path(
     const LanceDataset* dataset,
     int32_t field_id
 );
 /* ─── Native references and checkout ─── */
 
 /** Construct Ref::VersionNumber(version). Caller frees with lance_ref_close(). */
-LanceRef* lance_ref_version_number(uint64_t version);
+LANCE_NODISCARD LANCE_API LanceRef* lance_ref_version_number(uint64_t version);
 
 /**
  * Construct the native Ref::Version variant.
@@ -1003,7 +1003,7 @@ LanceRef* lance_ref_version_number(uint64_t version);
  * "main" to the default branch. No C-side validation policy is applied here;
  * the native operation that consumes the ref validates it.
  */
-LanceRef* lance_ref_version(
+LANCE_NODISCARD LANCE_API LanceRef* lance_ref_version(
     const char* branch,
     bool has_version,
     uint64_t version
@@ -1013,10 +1013,10 @@ LanceRef* lance_ref_version(
  * Construct Ref::Tag(tag_name). A NULL name is rejected; an empty name is
  * passed through to the native operation for its normal validation.
  */
-LanceRef* lance_ref_tag(const char* tag_name);
+LANCE_NODISCARD LANCE_API LanceRef* lance_ref_tag(const char* tag_name);
 
 /** Close and free a native reference. Safe to call with NULL. */
-void lance_ref_close(LanceRef* reference);
+LANCE_API void lance_ref_close(LanceRef* reference);
 
 /**
  * Check out a native Ref as a new dataset handle.
@@ -1026,7 +1026,7 @@ void lance_ref_close(LanceRef* reference);
  * Caller closes it with lance_dataset_close().
  * @return new dataset handle, or NULL on error
  */
-LanceDataset* lance_dataset_checkout_ref(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_checkout_ref(
     const LanceDataset* dataset,
     const LanceRef* reference
 );
@@ -1084,7 +1084,7 @@ LanceDataset* lance_dataset_checkout_ref(
  * @param out receives the new dataset handle on success (must not be NULL)
  * @return 0 on success, -1 on error; the out handle is not written on error
  */
-int32_t lance_dataset_deep_clone(
+LANCE_API int32_t lance_dataset_deep_clone(
     const LanceDataset* dataset,
     const char* target_path,
     const LanceRef* reference,
@@ -1147,7 +1147,7 @@ int32_t lance_dataset_deep_clone(
  * @param out receives the new dataset handle on success (must not be NULL)
  * @return 0 on success, -1 on error; the out handle is not written on error
  */
-int32_t lance_dataset_shallow_clone(
+LANCE_API int32_t lance_dataset_shallow_clone(
     const LanceDataset* dataset,
     const char* target_path,
     const LanceRef* reference,
@@ -1180,7 +1180,7 @@ int32_t lance_dataset_shallow_clone(
  * the source dataset or reference is closed.
  * @return new dataset handle, or NULL on error
  */
-LanceDataset* lance_dataset_branch_create(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_branch_create(
     const LanceDataset* dataset,
     const char* branch_name,
     const LanceRef* reference,
@@ -1194,7 +1194,7 @@ LanceDataset* lance_dataset_branch_create(
  * the source dataset is closed.
  * @return new dataset handle, or NULL on error
  */
-LanceDataset* lance_dataset_checkout_branch(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_checkout_branch(
     const LanceDataset* dataset,
     const char* branch_name
 );
@@ -1210,7 +1210,7 @@ LanceDataset* lance_dataset_checkout_branch(
  * lance_free_string().
  * @return JSON string, or NULL on error
  */
-const char* lance_dataset_branches_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_branches_json(const LanceDataset* dataset);
 
 /**
  * Serialize one native BranchContents as JSON.
@@ -1219,7 +1219,7 @@ const char* lance_dataset_branches_json(const LanceDataset* dataset);
  * caller owns the string and frees it with lance_free_string().
  * @return JSON string, or NULL on error (including LANCE_ERR_NOT_FOUND)
  */
-const char* lance_dataset_branch_get_json(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_branch_get_json(
     const LanceDataset* dataset,
     const char* branch_name
 );
@@ -1232,7 +1232,7 @@ const char* lance_dataset_branch_get_json(
  * empty. The caller owns the string and frees it with lance_free_string().
  * @return JSON string, or NULL on error
  */
-const char* lance_dataset_branch_identifier_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_branch_identifier_json(const LanceDataset* dataset);
 
 /**
  * Delete a branch.
@@ -1243,7 +1243,7 @@ const char* lance_dataset_branch_identifier_json(const LanceDataset* dataset);
  * native implementation.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_branch_delete(
+LANCE_API int32_t lance_dataset_branch_delete(
     const LanceDataset* dataset,
     const char* branch_name
 );
@@ -1256,7 +1256,7 @@ int32_t lance_dataset_branch_delete(
  * reference checks still apply and surface as LANCE_ERR_COMMIT_CONFLICT.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_branch_force_delete(
+LANCE_API int32_t lance_dataset_branch_force_delete(
     const LanceDataset* dataset,
     const char* branch_name
 );
@@ -1271,7 +1271,7 @@ int32_t lance_dataset_branch_force_delete(
  * LANCE_ERR_NOT_FOUND.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_branch_replace_metadata(
+LANCE_API int32_t lance_dataset_branch_replace_metadata(
     const LanceDataset* dataset,
     const char* branch_name,
     const char* const* metadata
@@ -1283,25 +1283,25 @@ int32_t lance_dataset_branch_replace_metadata(
  * remains valid after the dataset is closed. Entry order is unspecified.
  * @return handle on success, or NULL on error
  */
-LanceTags* lance_dataset_tags(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceTags* lance_dataset_tags(const LanceDataset* dataset);
 
 /** Number of tags, or 0 on error (check lance_last_error_code()). */
-uint64_t lance_tags_count(const LanceTags* tags);
+LANCE_API uint64_t lance_tags_count(const LanceTags* tags);
 
 /**
  * Borrowed tag at `index` (0 <= index < count), or NULL on error. The pointer
  * remains valid until lance_tags_close().
  */
-const LanceTag* lance_tags_at(const LanceTags* tags, size_t index);
+LANCE_NODISCARD LANCE_API const LanceTag* lance_tags_at(const LanceTags* tags, size_t index);
 
 /** Close and free a tag-list snapshot. Safe to call with NULL. */
-void lance_tags_close(LanceTags* tags);
+LANCE_API void lance_tags_close(LanceTags* tags);
 
 /**
  * Fetch one tag by name. Caller frees with lance_tag_close().
  * @return tag handle, or NULL on error
  */
-LanceTag* lance_dataset_tag_get(
+LANCE_NODISCARD LANCE_API LanceTag* lance_dataset_tag_get(
     const LanceDataset* dataset,
     const char* tag_name
 );
@@ -1315,7 +1315,7 @@ LanceTag* lance_dataset_tag_get(
  * LANCE_ERR_NOT_FOUND.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_tag_create(
+LANCE_API int32_t lance_dataset_tag_create(
     const LanceDataset* dataset,
     const char* tag_name,
     const LanceRef* reference
@@ -1326,7 +1326,7 @@ int32_t lance_dataset_tag_create(
  * metadata while updating the target and timestamps.
  * @return 0 on success, -1 on error (including LANCE_ERR_NOT_FOUND)
  */
-int32_t lance_dataset_tag_update(
+LANCE_API int32_t lance_dataset_tag_update(
     const LanceDataset* dataset,
     const char* tag_name,
     const LanceRef* reference
@@ -1336,7 +1336,7 @@ int32_t lance_dataset_tag_update(
  * Delete a tag. An unknown tag surfaces as LANCE_ERR_NOT_FOUND.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_tag_delete(
+LANCE_API int32_t lance_dataset_tag_delete(
     const LanceDataset* dataset,
     const char* tag_name
 );
@@ -1349,17 +1349,17 @@ int32_t lance_dataset_tag_delete(
  * map on read, so absent and empty metadata are observationally equivalent.
  * @return 0 on success, -1 on error (including LANCE_ERR_NOT_FOUND)
  */
-int32_t lance_dataset_tag_replace_metadata(
+LANCE_API int32_t lance_dataset_tag_replace_metadata(
     const LanceDataset* dataset,
     const char* tag_name,
     const char* const* metadata
 );
 
 /** Tag name, borrowed until the tag handle is closed. NULL on error. */
-const char* lance_tag_name(const LanceTag* tag);
+LANCE_NODISCARD LANCE_API const char* lance_tag_name(const LanceTag* tag);
 
 /** Tagged version id, or 0 on error. */
-uint64_t lance_tag_version(const LanceTag* tag);
+LANCE_API uint64_t lance_tag_version(const LanceTag* tag);
 
 /**
  * Report the tag's optional branch.
@@ -1367,7 +1367,7 @@ uint64_t lance_tag_version(const LanceTag* tag);
  * Returns 1 and writes a borrowed branch when present, 0 and writes NULL when
  * absent, or -1 on error. The branch remains valid until the tag is closed.
  */
-int32_t lance_tag_branch(
+LANCE_API int32_t lance_tag_branch(
     const LanceTag* tag,
     const char** out_branch
 );
@@ -1378,7 +1378,7 @@ int32_t lance_tag_branch(
  * A present timestamp outside the i64 nanosecond range returns -1 with
  * LANCE_ERR_INVALID_ARGUMENT. On absence or error, the output is unchanged.
  */
-int32_t lance_tag_created_at_ns(
+LANCE_API int32_t lance_tag_created_at_ns(
     const LanceTag* tag,
     int64_t* out_timestamp_ns
 );
@@ -1389,28 +1389,28 @@ int32_t lance_tag_created_at_ns(
  * A present timestamp outside the i64 nanosecond range returns -1 with
  * LANCE_ERR_INVALID_ARGUMENT. On absence or error, the output is unchanged.
  */
-int32_t lance_tag_updated_at_ns(
+LANCE_API int32_t lance_tag_updated_at_ns(
     const LanceTag* tag,
     int64_t* out_timestamp_ns
 );
 
 /** Manifest size recorded in the tag, or 0 on error. */
-uint64_t lance_tag_manifest_size(const LanceTag* tag);
+LANCE_API uint64_t lance_tag_manifest_size(const LanceTag* tag);
 
 /**
  * Number of tag metadata entries, or 0 on error. Missing metadata and an empty
  * map both produce zero entries, matching native TagContents deserialization.
  */
-uint64_t lance_tag_metadata_count(const LanceTag* tag);
+LANCE_API uint64_t lance_tag_metadata_count(const LanceTag* tag);
 
 /** Metadata key at `index`, borrowed until the tag is closed. NULL on error. */
-const char* lance_tag_metadata_key_at(const LanceTag* tag, size_t index);
+LANCE_NODISCARD LANCE_API const char* lance_tag_metadata_key_at(const LanceTag* tag, size_t index);
 
 /** Metadata value at `index`, borrowed until the tag is closed. NULL on error. */
-const char* lance_tag_metadata_value_at(const LanceTag* tag, size_t index);
+LANCE_NODISCARD LANCE_API const char* lance_tag_metadata_value_at(const LanceTag* tag, size_t index);
 
 /** Close and free one tag handle. Safe to call with NULL. */
-void lance_tag_close(LanceTag* tag);
+LANCE_API void lance_tag_close(LanceTag* tag);
 /* ─── Data statistics ─── */
 
 /**
@@ -1422,7 +1422,7 @@ void lance_tag_close(LanceTag* tag);
  * struct/list children).
  * @return handle on success, or NULL on error
  */
-LanceDataStatistics* lance_dataset_calculate_data_stats(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceDataStatistics* lance_dataset_calculate_data_stats(const LanceDataset* dataset);
 
 /**
  * Number of fields in the statistics snapshot. Clears the thread-local error
@@ -1430,7 +1430,7 @@ LanceDataStatistics* lance_dataset_calculate_data_stats(const LanceDataset* data
  * a dataset with an empty schema also yields 0 with no error set, so check
  * lance_last_error_code() to distinguish the error case from an empty result.
  */
-uint64_t lance_data_statistics_count(const LanceDataStatistics* stats);
+LANCE_API uint64_t lance_data_statistics_count(const LanceDataStatistics* stats);
 
 /**
  * Schema field id at `index` (0 <= index < count).
@@ -1439,7 +1439,7 @@ uint64_t lance_data_statistics_count(const LanceDataStatistics* stats);
  * lance_last_error_code() when passing an untrusted index; iterating
  * `0..count` never errors.
  */
-uint32_t lance_data_statistics_field_id_at(const LanceDataStatistics* stats, size_t index);
+LANCE_API uint32_t lance_data_statistics_field_id_at(const LanceDataStatistics* stats, size_t index);
 
 /**
  * Compressed on-disk byte size of the field at `index`.
@@ -1448,10 +1448,10 @@ uint32_t lance_data_statistics_field_id_at(const LanceDataStatistics* stats, siz
  * format also reports 0 but sets no error, so check lance_last_error_code() to
  * distinguish a genuine 0 from the error sentinel.
  */
-uint64_t lance_data_statistics_bytes_on_disk_at(const LanceDataStatistics* stats, size_t index);
+LANCE_API uint64_t lance_data_statistics_bytes_on_disk_at(const LanceDataStatistics* stats, size_t index);
 
 /** Close and free a data statistics handle. Safe to call with NULL. */
-void lance_data_statistics_close(LanceDataStatistics* stats);
+LANCE_API void lance_data_statistics_close(LanceDataStatistics* stats);
 /* ─── Dataset config ─── */
 
 /**
@@ -1467,21 +1467,21 @@ void lance_data_statistics_close(LanceDataStatistics* stats);
  * containing an embedded NUL byte cannot be represented and fails the
  * snapshot with LANCE_ERR_INTERNAL. Entry order is unspecified.
  */
-LanceDatasetConfig* lance_dataset_config(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceDatasetConfig* lance_dataset_config(const LanceDataset* dataset);
 
 /**
  * Return the number of entries in the config snapshot. Returns 0 and sets
  * LANCE_ERR_INVALID_ARGUMENT on a NULL handle. An empty config also yields 0
  * with no error set, so check lance_last_error_code() to distinguish the two.
  */
-uint64_t lance_dataset_config_count(const LanceDatasetConfig* config);
+LANCE_API uint64_t lance_dataset_config_count(const LanceDatasetConfig* config);
 
 /**
  * Return the key at `index` (0 <= index < count). The pointer is borrowed from
  * the snapshot. Returns NULL and sets LANCE_ERR_INVALID_ARGUMENT on a NULL
  * handle or out-of-range index.
  */
-const char* lance_dataset_config_key_at(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_config_key_at(
     const LanceDatasetConfig* config,
     size_t index
 );
@@ -1491,13 +1491,13 @@ const char* lance_dataset_config_key_at(
  * from the snapshot. Returns NULL and sets LANCE_ERR_INVALID_ARGUMENT on a
  * NULL handle or out-of-range index.
  */
-const char* lance_dataset_config_value_at(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_config_value_at(
     const LanceDatasetConfig* config,
     size_t index
 );
 
 /** Close and free a dataset config snapshot. Safe to call with NULL. */
-void lance_dataset_config_close(LanceDatasetConfig* config);
+LANCE_API void lance_dataset_config_close(LanceDatasetConfig* config);
 
 /**
  * Apply merge-style dataset config updates and commit a new manifest.
@@ -1514,7 +1514,7 @@ void lance_dataset_config_close(LanceDatasetConfig* config);
  * On success the dataset handle points at the newly committed version.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_update_config(
+LANCE_API int32_t lance_dataset_update_config(
     LanceDataset* dataset,
     const char* const* keys,
     const char* const* values,
@@ -1545,7 +1545,7 @@ int32_t lance_dataset_update_config(
  * Caller must free the returned JSON string with `lance_free_string()`.
  * Returns NULL on error.
  */
-const char* lance_dataset_update_config_json(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_update_config_json(
     LanceDataset* dataset,
     const char* const* keys,
     const char* const* values,
@@ -1568,7 +1568,7 @@ const char* lance_dataset_update_config_json(
  * versions. Caller must free the returned string with `lance_free_string()`.
  * Returns NULL on error.
  */
-const char* lance_dataset_base_paths_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_base_paths_json(const LanceDataset* dataset);
 
 /**
  * One native `BasePath` field set for registration.
@@ -1642,7 +1642,7 @@ typedef struct LanceTransactionProperties {
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_add_bases(
+LANCE_API int32_t lance_dataset_add_bases(
     LanceDataset* dataset,
     const LanceBasePath* bases,
     size_t base_count,
@@ -1715,7 +1715,7 @@ typedef struct LanceTrackedFilesOptions {
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_tracked_files_stream(
+LANCE_API int32_t lance_dataset_tracked_files_stream(
     const LanceDataset* dataset,
     const LanceTrackedFilesOptions* options,
     struct ArrowArrayStream* out
@@ -1734,7 +1734,7 @@ int32_t lance_dataset_tracked_files_stream(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_all_files_stream(
+LANCE_API int32_t lance_dataset_all_files_stream(
     const LanceDataset* dataset,
     struct ArrowArrayStream* out
 );
@@ -1753,7 +1753,7 @@ int32_t lance_dataset_all_files_stream(
  *         LANCE_ERR_NOT_FOUND (unknown version),
  *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
  */
-LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t version);
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t version);
 
 /**
  * Delete rows matching the SQL `predicate`, committing a new manifest.
@@ -1775,7 +1775,7 @@ LanceDataset* lance_dataset_restore(const LanceDataset* dataset, uint64_t versio
  *         the upstream parser since Lance 9.1; previously LANCE_ERR_INTERNAL),
  *         and LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_delete(
+LANCE_API int32_t lance_dataset_delete(
     LanceDataset* dataset,
     const char* predicate,
     uint64_t* out_num_deleted
@@ -1808,7 +1808,7 @@ int32_t lance_dataset_delete(
  *         malformed SQL, and unknown columns; LANCE_ERR_COMMIT_CONFLICT for
  *         a concurrent writer.
  */
-int32_t lance_dataset_update(
+LANCE_API int32_t lance_dataset_update(
     LanceDataset* dataset,
     const char* predicate,
     const char* const* columns,
@@ -1914,7 +1914,7 @@ typedef struct LanceMergeInsertResult {
  *         SQL, unknown columns, schema incompatibility, and no-op
  *         configurations; LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_merge_insert(
+LANCE_API int32_t lance_dataset_merge_insert(
     LanceDataset* dataset,
     const char* const* on_columns,
     size_t num_on_columns,
@@ -1956,7 +1956,7 @@ int32_t lance_dataset_merge_insert(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_merge(
+LANCE_API int32_t lance_dataset_merge(
     LanceDataset* dataset,
     const char* left_on,
     const char* right_on,
@@ -2173,7 +2173,7 @@ typedef struct LanceBatchUDFV2 {
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_add_columns_batch_udf(
+LANCE_API int32_t lance_dataset_add_columns_batch_udf(
     LanceDataset* dataset,
     const LanceBatchUDF* udf,
     const char* const* read_columns,
@@ -2191,7 +2191,7 @@ int32_t lance_dataset_add_columns_batch_udf(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_add_columns_batch_udf_v2(
+LANCE_API int32_t lance_dataset_add_columns_batch_udf_v2(
     LanceDataset* dataset,
     const LanceBatchUDFV2* udf,
     const char* const* read_columns,
@@ -2284,7 +2284,7 @@ typedef struct LanceCommitLockCallbacks {
  *
  * @return Owned lock handle, or NULL on error
  */
-LanceCommitLock* lance_commit_lock_new(
+LANCE_NODISCARD LANCE_API LanceCommitLock* lance_commit_lock_new(
     const LanceCommitLockCallbacks* callbacks
 );
 
@@ -2293,7 +2293,7 @@ LanceCommitLock* lance_commit_lock_new(
  *
  * Retained datasets and leases keep their native context owner.
  */
-void lance_commit_lock_close(LanceCommitLock* lock);
+LANCE_API void lance_commit_lock_close(LanceCommitLock* lock);
 /* ─── lance_dataset_compact_files ─────────────────────────────────────────── */
 
 /**
@@ -2355,7 +2355,7 @@ typedef struct LanceCompactionMetrics {
  *         overrides that exceed usize::MAX on the running target;
  *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_compact_files(
+LANCE_API int32_t lance_dataset_compact_files(
     LanceDataset* dataset,
     const LanceCompactionOptions* options,
     LanceCompactionMetrics* out_metrics
@@ -2363,10 +2363,10 @@ int32_t lance_dataset_compact_files(
 /* ─── Native maintenance lifecycle ────────────────────────────────────────── */
 
 /** Migrate this dataset's manifest paths to v2 naming. Native rename behavior. */
-int32_t lance_dataset_migrate_manifest_paths_v2(LanceDataset* dataset);
+LANCE_API int32_t lance_dataset_migrate_manifest_paths_v2(LanceDataset* dataset);
 
 /** Delete all rows through native Dataset::truncate_table. */
-int32_t lance_dataset_truncate_table(LanceDataset* dataset);
+LANCE_API int32_t lance_dataset_truncate_table(LanceDataset* dataset);
 /* ─── Native compaction options V2 ────────────────────────────────────────── */
 
 /** Controls how data is rewritten during compaction. */
@@ -2383,40 +2383,40 @@ typedef enum LanceIndexRemapMode {
 } LanceIndexRemapMode;
 
 /** Create options from native CompactionOptions::default(). */
-LanceCompactionOptionsV2* lance_compaction_options_v2_new(void);
+LANCE_NODISCARD LANCE_API LanceCompactionOptionsV2* lance_compaction_options_v2_new(void);
 
 /** Create options from native CompactionOptions::from_dataset_config(). */
-LanceCompactionOptionsV2* lance_compaction_options_v2_from_dataset(
+LANCE_NODISCARD LANCE_API LanceCompactionOptionsV2* lance_compaction_options_v2_from_dataset(
     const LanceDataset* dataset
 );
 
 /** Clone an owned native options value. */
-LanceCompactionOptionsV2* lance_compaction_options_v2_clone(
+LANCE_NODISCARD LANCE_API LanceCompactionOptionsV2* lance_compaction_options_v2_clone(
     const LanceCompactionOptionsV2* options
 );
 
 /** Free options. NULL-safe. */
-void lance_compaction_options_v2_free(LanceCompactionOptionsV2* options);
+LANCE_API void lance_compaction_options_v2_free(LanceCompactionOptionsV2* options);
 
-int32_t lance_compaction_options_v2_set_target_rows_per_fragment(
+LANCE_API int32_t lance_compaction_options_v2_set_target_rows_per_fragment(
     LanceCompactionOptionsV2* options,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_max_rows_per_group(
+LANCE_API int32_t lance_compaction_options_v2_set_max_rows_per_group(
     LanceCompactionOptionsV2* options,
     uint64_t value
 );
 /** `has_value == false` selects native None; true preserves zero. */
-int32_t lance_compaction_options_v2_set_max_bytes_per_file(
+LANCE_API int32_t lance_compaction_options_v2_set_max_bytes_per_file(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_materialize_deletions(
+LANCE_API int32_t lance_compaction_options_v2_set_materialize_deletions(
     LanceCompactionOptionsV2* options,
     bool value
 );
-int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
+LANCE_API int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
     LanceCompactionOptionsV2* options,
     float value
 );
@@ -2425,73 +2425,73 @@ int32_t lance_compaction_options_v2_set_materialize_deletions_threshold(
  * native default. An explicit zero is stored by this setter but rejected
  * with LANCE_ERR_INVALID_ARGUMENT when native compaction executes.
  */
-int32_t lance_compaction_options_v2_set_num_threads(
+LANCE_API int32_t lance_compaction_options_v2_set_num_threads(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_batch_size(
+LANCE_API int32_t lance_compaction_options_v2_set_batch_size(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_io_buffer_size(
+LANCE_API int32_t lance_compaction_options_v2_set_io_buffer_size(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_defer_index_remap(
+LANCE_API int32_t lance_compaction_options_v2_set_defer_index_remap(
     LanceCompactionOptionsV2* options,
     bool value
 );
-int32_t lance_compaction_options_v2_set_index_remap_mode(
+LANCE_API int32_t lance_compaction_options_v2_set_index_remap_mode(
     LanceCompactionOptionsV2* options,
     int32_t mode
 );
 /** `has_value == false` selects native None; true selects the given mode. */
-int32_t lance_compaction_options_v2_set_compaction_mode(
+LANCE_API int32_t lance_compaction_options_v2_set_compaction_mode(
     LanceCompactionOptionsV2* options,
     bool has_value,
     int32_t mode
 );
-int32_t lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
+LANCE_API int32_t lance_compaction_options_v2_set_binary_copy_read_batch_bytes(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_max_source_fragments(
+LANCE_API int32_t lance_compaction_options_v2_set_max_source_fragments(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_max_source_rows(
+LANCE_API int32_t lance_compaction_options_v2_set_max_source_rows(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_compaction_options_v2_set_max_source_bytes(
+LANCE_API int32_t lance_compaction_options_v2_set_max_source_bytes(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
 /** Replace excluded IDs. NULL with count=0 is the empty list. */
-int32_t lance_compaction_options_v2_set_excluded_fragment_ids(
+LANCE_API int32_t lance_compaction_options_v2_set_excluded_fragment_ids(
     LanceCompactionOptionsV2* options,
     const uint32_t* fragment_ids,
     size_t count
 );
-int32_t lance_compaction_options_v2_set_max_overlays_per_fragment(
+LANCE_API int32_t lance_compaction_options_v2_set_max_overlays_per_fragment(
     LanceCompactionOptionsV2* options,
     bool has_value,
     uint64_t value
 );
 /** Parse the selector with native LanceFileVersion::from_str(). NULL = None. */
-int32_t lance_compaction_options_v2_set_data_storage_version(
+LANCE_API int32_t lance_compaction_options_v2_set_data_storage_version(
     LanceCompactionOptionsV2* options,
     const char* selector
 );
 /** NULL = native None; non-NULL with count=0 = Some(empty map). */
-int32_t lance_compaction_options_v2_set_transaction_properties(
+LANCE_API int32_t lance_compaction_options_v2_set_transaction_properties(
     LanceCompactionOptionsV2* options,
     const LanceTransactionProperties* properties
 );
@@ -2501,86 +2501,86 @@ int32_t lance_compaction_options_v2_set_transaction_properties(
  * NULL options select from_dataset_config. Metrics are written only on
  * success.
  */
-int32_t lance_dataset_compact_files_v2(
+LANCE_API int32_t lance_dataset_compact_files_v2(
     LanceDataset* dataset,
     const LanceCompactionOptionsV2* options,
     LanceCompactionMetrics* out_metrics
 );
 
 /** Plan compaction. NULL options select from_dataset_config. */
-LanceCompactionPlan* lance_dataset_plan_compaction(
+LANCE_NODISCARD LANCE_API LanceCompactionPlan* lance_dataset_plan_compaction(
     const LanceDataset* dataset,
     const LanceCompactionOptionsV2* options
 );
 
-uint64_t lance_compaction_plan_read_version(const LanceCompactionPlan* plan);
-size_t lance_compaction_plan_task_count(const LanceCompactionPlan* plan);
+LANCE_API uint64_t lance_compaction_plan_read_version(const LanceCompactionPlan* plan);
+LANCE_API size_t lance_compaction_plan_task_count(const LanceCompactionPlan* plan);
 
 /** Owned task snapshot; free with lance_compaction_task_close(). */
-LanceCompactionTask* lance_compaction_plan_task_at(
+LANCE_NODISCARD LANCE_API LanceCompactionTask* lance_compaction_plan_task_at(
     const LanceCompactionPlan* plan,
     size_t index
 );
 
 /** Clone effective plan options, including the resolved exact storage version. */
-LanceCompactionOptionsV2* lance_compaction_plan_options_clone(
+LANCE_NODISCARD LANCE_API LanceCompactionOptionsV2* lance_compaction_plan_options_clone(
     const LanceCompactionPlan* plan
 );
 
 /** Native serde transport. Free strings with lance_free_string(). */
-const char* lance_compaction_plan_json(const LanceCompactionPlan* plan);
-LanceCompactionPlan* lance_compaction_plan_from_json(const char* json);
-void lance_compaction_plan_close(LanceCompactionPlan* plan);
+LANCE_NODISCARD LANCE_API const char* lance_compaction_plan_json(const LanceCompactionPlan* plan);
+LANCE_NODISCARD LANCE_API LanceCompactionPlan* lance_compaction_plan_from_json(const char* json);
+LANCE_API void lance_compaction_plan_close(LanceCompactionPlan* plan);
 
-uint64_t lance_compaction_task_read_version(const LanceCompactionTask* task);
-size_t lance_compaction_task_fragment_count(const LanceCompactionTask* task);
-const char* lance_compaction_task_fragment_metadata_json_at(
+LANCE_API uint64_t lance_compaction_task_read_version(const LanceCompactionTask* task);
+LANCE_API size_t lance_compaction_task_fragment_count(const LanceCompactionTask* task);
+LANCE_NODISCARD LANCE_API const char* lance_compaction_task_fragment_metadata_json_at(
     const LanceCompactionTask* task,
     size_t index
 );
-LanceCompactionOptionsV2* lance_compaction_task_options_clone(
+LANCE_NODISCARD LANCE_API LanceCompactionOptionsV2* lance_compaction_task_options_clone(
     const LanceCompactionTask* task
 );
 
 /** Execute against the dataset at the task's planned read version. */
-LanceRewriteResult* lance_compaction_task_execute(
+LANCE_NODISCARD LANCE_API LanceRewriteResult* lance_compaction_task_execute(
     const LanceDataset* dataset,
     const LanceCompactionTask* task
 );
 
-const char* lance_compaction_task_json(const LanceCompactionTask* task);
-LanceCompactionTask* lance_compaction_task_from_json(const char* json);
-void lance_compaction_task_close(LanceCompactionTask* task);
+LANCE_NODISCARD LANCE_API const char* lance_compaction_task_json(const LanceCompactionTask* task);
+LANCE_NODISCARD LANCE_API LanceCompactionTask* lance_compaction_task_from_json(const char* json);
+LANCE_API void lance_compaction_task_close(LanceCompactionTask* task);
 
-uint64_t lance_rewrite_result_read_version(const LanceRewriteResult* result);
-int32_t lance_rewrite_result_metrics(
+LANCE_API uint64_t lance_rewrite_result_read_version(const LanceRewriteResult* result);
+LANCE_API int32_t lance_rewrite_result_metrics(
     const LanceRewriteResult* result,
     LanceCompactionMetrics* out_metrics
 );
-size_t lance_rewrite_result_original_fragment_count(
+LANCE_API size_t lance_rewrite_result_original_fragment_count(
     const LanceRewriteResult* result
 );
-size_t lance_rewrite_result_new_fragment_count(
+LANCE_API size_t lance_rewrite_result_new_fragment_count(
     const LanceRewriteResult* result
 );
-const char* lance_rewrite_result_original_fragment_metadata_json_at(
+LANCE_NODISCARD LANCE_API const char* lance_rewrite_result_original_fragment_metadata_json_at(
     const LanceRewriteResult* result,
     size_t index
 );
-const char* lance_rewrite_result_new_fragment_metadata_json_at(
+LANCE_NODISCARD LANCE_API const char* lance_rewrite_result_new_fragment_metadata_json_at(
     const LanceRewriteResult* result,
     size_t index
 );
-const char* lance_rewrite_result_json(const LanceRewriteResult* result);
-LanceRewriteResult* lance_rewrite_result_from_json(const char* json);
-void lance_rewrite_result_close(LanceRewriteResult* result);
+LANCE_NODISCARD LANCE_API const char* lance_rewrite_result_json(const LanceRewriteResult* result);
+LANCE_NODISCARD LANCE_API LanceRewriteResult* lance_rewrite_result_from_json(const char* json);
+LANCE_API void lance_rewrite_result_close(LanceRewriteResult* result);
 
 /**
  * Commit rewrite results through native commit_compaction.
  * NULL options select CompactionOptions::default(). Metrics are written only
  * on success.
  */
-int32_t lance_dataset_commit_compaction(
+LANCE_API int32_t lance_dataset_commit_compaction(
     LanceDataset* dataset,
     const LanceRewriteResult* const* results,
     size_t result_count,
@@ -2590,213 +2590,213 @@ int32_t lance_dataset_commit_compaction(
 /* ─── Native index optimization ───────────────────────────────────────────── */
 
 /** Create options from native OptimizeOptions::default(). */
-LanceOptimizeIndicesOptions* lance_optimize_indices_options_new(void);
-LanceOptimizeIndicesOptions* lance_optimize_indices_options_clone(
+LANCE_NODISCARD LANCE_API LanceOptimizeIndicesOptions* lance_optimize_indices_options_new(void);
+LANCE_NODISCARD LANCE_API LanceOptimizeIndicesOptions* lance_optimize_indices_options_clone(
     const LanceOptimizeIndicesOptions* options
 );
-void lance_optimize_indices_options_free(LanceOptimizeIndicesOptions* options);
+LANCE_API void lance_optimize_indices_options_free(LanceOptimizeIndicesOptions* options);
 
-int32_t lance_optimize_indices_options_set_num_indices_to_merge(
+LANCE_API int32_t lance_optimize_indices_options_set_num_indices_to_merge(
     LanceOptimizeIndicesOptions* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_optimize_indices_options_set_enable_partition_rebalancing(
+LANCE_API int32_t lance_optimize_indices_options_set_enable_partition_rebalancing(
     LanceOptimizeIndicesOptions* options,
     bool value
 );
 /** false = native None; true + count=0 = native Some(empty). */
-int32_t lance_optimize_indices_options_set_index_names(
+LANCE_API int32_t lance_optimize_indices_options_set_index_names(
     LanceOptimizeIndicesOptions* options,
     bool has_value,
     const char* const* names,
     size_t count
 );
-int32_t lance_optimize_indices_options_set_retrain(
+LANCE_API int32_t lance_optimize_indices_options_set_retrain(
     LanceOptimizeIndicesOptions* options,
     bool value
 );
-int32_t lance_optimize_indices_options_set_transaction_properties(
+LANCE_API int32_t lance_optimize_indices_options_set_transaction_properties(
     LanceOptimizeIndicesOptions* options,
     const LanceTransactionProperties* properties
 );
-int32_t lance_optimize_indices_options_set_max_rows_per_task(
+LANCE_API int32_t lance_optimize_indices_options_set_max_rows_per_task(
     LanceOptimizeIndicesOptions* options,
     bool has_value,
     uint64_t value
 );
-int32_t lance_optimize_indices_options_set_max_rows_per_segment(
+LANCE_API int32_t lance_optimize_indices_options_set_max_rows_per_segment(
     LanceOptimizeIndicesOptions* options,
     bool has_value,
     uint64_t value
 );
 
 /** Single-process native optimize_indices. NULL options use defaults. */
-int32_t lance_dataset_optimize_indices(
+LANCE_API int32_t lance_dataset_optimize_indices(
     LanceDataset* dataset,
     const LanceOptimizeIndicesOptions* options
 );
 
 /** Plan the native distributed optimize workflow. */
-LanceOptimizeIndicesPlan* lance_dataset_plan_optimize_indices(
+LANCE_NODISCARD LANCE_API LanceOptimizeIndicesPlan* lance_dataset_plan_optimize_indices(
     const LanceDataset* dataset,
     const LanceOptimizeIndicesOptions* options
 );
 
 /** Copy a native UUID as 16 raw RFC 4122 bytes. */
-int32_t lance_optimize_indices_plan_id(
+LANCE_API int32_t lance_optimize_indices_plan_id(
     const LanceOptimizeIndicesPlan* plan,
     uint8_t out_uuid[16]
 );
-uint64_t lance_optimize_indices_plan_read_version(
+LANCE_API uint64_t lance_optimize_indices_plan_read_version(
     const LanceOptimizeIndicesPlan* plan
 );
-size_t lance_optimize_indices_plan_task_count(
+LANCE_API size_t lance_optimize_indices_plan_task_count(
     const LanceOptimizeIndicesPlan* plan
 );
-size_t lance_optimize_indices_plan_merge_count(
+LANCE_API size_t lance_optimize_indices_plan_merge_count(
     const LanceOptimizeIndicesPlan* plan
 );
-LanceOptimizeIndexTask* lance_optimize_indices_plan_task_at(
+LANCE_NODISCARD LANCE_API LanceOptimizeIndexTask* lance_optimize_indices_plan_task_at(
     const LanceOptimizeIndicesPlan* plan,
     size_t index
 );
-LanceOptimizeIndexMerge* lance_optimize_indices_plan_merge_at(
+LANCE_NODISCARD LANCE_API LanceOptimizeIndexMerge* lance_optimize_indices_plan_merge_at(
     const LanceOptimizeIndicesPlan* plan,
     size_t index
 );
-const char* lance_optimize_indices_plan_json(
+LANCE_NODISCARD LANCE_API const char* lance_optimize_indices_plan_json(
     const LanceOptimizeIndicesPlan* plan
 );
-LanceOptimizeIndicesPlan* lance_optimize_indices_plan_from_json(
+LANCE_NODISCARD LANCE_API LanceOptimizeIndicesPlan* lance_optimize_indices_plan_from_json(
     const char* json
 );
-void lance_optimize_indices_plan_close(LanceOptimizeIndicesPlan* plan);
+LANCE_API void lance_optimize_indices_plan_close(LanceOptimizeIndicesPlan* plan);
 
-int32_t lance_optimize_index_task_plan_id(
+LANCE_API int32_t lance_optimize_index_task_plan_id(
     const LanceOptimizeIndexTask* task,
     uint8_t out_uuid[16]
 );
-uint64_t lance_optimize_index_task_read_version(
+LANCE_API uint64_t lance_optimize_index_task_read_version(
     const LanceOptimizeIndexTask* task
 );
-uint32_t lance_optimize_index_task_group(
+LANCE_API uint32_t lance_optimize_index_task_group(
     const LanceOptimizeIndexTask* task
 );
-size_t lance_optimize_index_task_fragment_count(
+LANCE_API size_t lance_optimize_index_task_fragment_count(
     const LanceOptimizeIndexTask* task
 );
-int32_t lance_optimize_index_task_fragment_id_at(
+LANCE_API int32_t lance_optimize_index_task_fragment_id_at(
     const LanceOptimizeIndexTask* task,
     size_t index,
     uint32_t* out_id
 );
 /** Owned LanceIndexSegmentMetadata; free with its existing free function. */
-LanceIndexSegmentMetadata* lance_optimize_index_task_reference(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentMetadata* lance_optimize_index_task_reference(
     const LanceOptimizeIndexTask* task
 );
-size_t lance_optimize_index_task_old_segment_count(
+LANCE_API size_t lance_optimize_index_task_old_segment_count(
     const LanceOptimizeIndexTask* task
 );
-LanceIndexSegmentMetadata* lance_optimize_index_task_old_segment_at(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentMetadata* lance_optimize_index_task_old_segment_at(
     const LanceOptimizeIndexTask* task,
     size_t index
 );
-int32_t lance_optimize_index_task_num_indices_to_merge(
+LANCE_API int32_t lance_optimize_index_task_num_indices_to_merge(
     const LanceOptimizeIndexTask* task,
     bool* out_has_value,
     uint64_t* out_value
 );
-int32_t lance_optimize_index_task_enable_partition_rebalancing(
+LANCE_API int32_t lance_optimize_index_task_enable_partition_rebalancing(
     const LanceOptimizeIndexTask* task,
     bool* out_value
 );
-int32_t lance_optimize_index_task_retrain(
+LANCE_API int32_t lance_optimize_index_task_retrain(
     const LanceOptimizeIndexTask* task,
     bool* out_value
 );
 
 /** `*out_result` receives NULL when native returns None; untouched on error. */
-int32_t lance_optimize_index_task_execute(
+LANCE_API int32_t lance_optimize_index_task_execute(
     const LanceDataset* dataset,
     const LanceOptimizeIndexTask* task,
     LanceIndexSegmentResult** out_result
 );
 
-const char* lance_optimize_index_task_json(
+LANCE_NODISCARD LANCE_API const char* lance_optimize_index_task_json(
     const LanceOptimizeIndexTask* task
 );
-LanceOptimizeIndexTask* lance_optimize_index_task_from_json(const char* json);
-void lance_optimize_index_task_close(LanceOptimizeIndexTask* task);
+LANCE_NODISCARD LANCE_API LanceOptimizeIndexTask* lance_optimize_index_task_from_json(const char* json);
+LANCE_API void lance_optimize_index_task_close(LanceOptimizeIndexTask* task);
 
-int32_t lance_optimize_index_merge_plan_id(
+LANCE_API int32_t lance_optimize_index_merge_plan_id(
     const LanceOptimizeIndexMerge* merge,
     uint8_t out_uuid[16]
 );
-uint64_t lance_optimize_index_merge_read_version(
+LANCE_API uint64_t lance_optimize_index_merge_read_version(
     const LanceOptimizeIndexMerge* merge
 );
-uint32_t lance_optimize_index_merge_group(
+LANCE_API uint32_t lance_optimize_index_merge_group(
     const LanceOptimizeIndexMerge* merge
 );
-size_t lance_optimize_index_merge_old_segment_count(
+LANCE_API size_t lance_optimize_index_merge_old_segment_count(
     const LanceOptimizeIndexMerge* merge
 );
-LanceIndexSegmentMetadata* lance_optimize_index_merge_old_segment_at(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentMetadata* lance_optimize_index_merge_old_segment_at(
     const LanceOptimizeIndexMerge* merge,
     size_t index
 );
-size_t lance_optimize_index_merge_replace_count(
+LANCE_API size_t lance_optimize_index_merge_replace_count(
     const LanceOptimizeIndexMerge* merge
 );
-int32_t lance_optimize_index_merge_replace_uuid_at(
+LANCE_API int32_t lance_optimize_index_merge_replace_uuid_at(
     const LanceOptimizeIndexMerge* merge,
     size_t index,
     uint8_t out_uuid[16]
 );
 /** Native plan/group/version checks remain authoritative. */
-int32_t lance_optimize_index_merge_execute(
+LANCE_API int32_t lance_optimize_index_merge_execute(
     const LanceDataset* dataset,
     const LanceOptimizeIndexMerge* merge,
     const LanceIndexSegmentResult* const* task_results,
     size_t task_result_count,
     LanceIndexSegmentResult** out_result
 );
-const char* lance_optimize_index_merge_json(
+LANCE_NODISCARD LANCE_API const char* lance_optimize_index_merge_json(
     const LanceOptimizeIndexMerge* merge
 );
-LanceOptimizeIndexMerge* lance_optimize_index_merge_from_json(const char* json);
-void lance_optimize_index_merge_close(LanceOptimizeIndexMerge* merge);
+LANCE_NODISCARD LANCE_API LanceOptimizeIndexMerge* lance_optimize_index_merge_from_json(const char* json);
+LANCE_API void lance_optimize_index_merge_close(LanceOptimizeIndexMerge* merge);
 
-int32_t lance_index_segment_result_plan_id(
+LANCE_API int32_t lance_index_segment_result_plan_id(
     const LanceIndexSegmentResult* result,
     uint8_t out_uuid[16]
 );
-uint64_t lance_index_segment_result_read_version(
+LANCE_API uint64_t lance_index_segment_result_read_version(
     const LanceIndexSegmentResult* result
 );
-uint32_t lance_index_segment_result_group(
+LANCE_API uint32_t lance_index_segment_result_group(
     const LanceIndexSegmentResult* result
 );
-LanceIndexSegmentMetadata* lance_index_segment_result_segment(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentMetadata* lance_index_segment_result_segment(
     const LanceIndexSegmentResult* result
 );
-size_t lance_index_segment_result_replace_count(
+LANCE_API size_t lance_index_segment_result_replace_count(
     const LanceIndexSegmentResult* result
 );
-int32_t lance_index_segment_result_replace_uuid_at(
+LANCE_API int32_t lance_index_segment_result_replace_uuid_at(
     const LanceIndexSegmentResult* result,
     size_t index,
     uint8_t out_uuid[16]
 );
-const char* lance_index_segment_result_json(
+LANCE_NODISCARD LANCE_API const char* lance_index_segment_result_json(
     const LanceIndexSegmentResult* result
 );
-LanceIndexSegmentResult* lance_index_segment_result_from_json(const char* json);
-void lance_index_segment_result_close(LanceIndexSegmentResult* result);
+LANCE_NODISCARD LANCE_API LanceIndexSegmentResult* lance_index_segment_result_from_json(const char* json);
+LANCE_API void lance_index_segment_result_close(LanceIndexSegmentResult* result);
 
 /** Commit merged results. Empty results retain native no-op/MemWAL behavior. */
-int32_t lance_dataset_commit_optimize_indices(
+LANCE_API int32_t lance_dataset_commit_optimize_indices(
     LanceDataset* dataset,
     const LanceIndexSegmentResult* const* results,
     size_t result_count,
@@ -2827,7 +2827,7 @@ int32_t lance_dataset_commit_optimize_indices(
  *         to drop every column;
  *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_drop_columns(
+LANCE_API int32_t lance_dataset_drop_columns(
     LanceDataset* dataset,
     const char* const* columns,
     size_t num_columns
@@ -2901,7 +2901,7 @@ typedef struct LanceColumnAlteration {
  *         cast, or tightening nullability when existing rows hold NULLs;
  *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_alter_columns(
+LANCE_API int32_t lance_dataset_alter_columns(
     LanceDataset* dataset,
     const LanceColumnAlteration* alterations,
     size_t num_alterations
@@ -2945,7 +2945,7 @@ typedef struct LanceSqlColumn {
  *         LANCE_ERR_INTERNAL), or a `batch_size` beyond UINT32_MAX.
  *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_add_columns_sql(
+LANCE_API int32_t lance_dataset_add_columns_sql(
     LanceDataset* dataset,
     const LanceSqlColumn* columns,
     size_t num_columns,
@@ -2976,7 +2976,7 @@ int32_t lance_dataset_add_columns_sql(
  *         all-null columns as a metadata-only change).
  *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_add_columns_nulls(
+LANCE_API int32_t lance_dataset_add_columns_nulls(
     LanceDataset* dataset,
     const struct ArrowSchema* schema
 );
@@ -3007,7 +3007,7 @@ int32_t lance_dataset_add_columns_nulls(
  *         with an existing column, or a `batch_size` beyond UINT32_MAX.
  *         LANCE_ERR_COMMIT_CONFLICT for a concurrent writer.
  */
-int32_t lance_dataset_add_columns_stream(
+LANCE_API int32_t lance_dataset_add_columns_stream(
     LanceDataset* dataset,
     struct ArrowArrayStream* stream,
     uint64_t batch_size
@@ -3019,7 +3019,7 @@ int32_t lance_dataset_add_columns_stream(
  * @param out      Pointer to caller-allocated ArrowSchema struct
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_schema(
+LANCE_API int32_t lance_dataset_schema(
     const LanceDataset* dataset,
     struct ArrowSchema* out
 );
@@ -3038,7 +3038,7 @@ int32_t lance_dataset_schema(
  * @return 0 on success, -1 on error. Close the result with
  *         lance_schema_close().
  */
-int32_t lance_dataset_schema_clone(
+LANCE_API int32_t lance_dataset_schema_clone(
     const LanceDataset* dataset,
     LanceSchema** out_schema
 );
@@ -3050,7 +3050,7 @@ int32_t lance_dataset_schema_clone(
  * Closing the dataset, fragment, or operation that produced the schema does
  * not invalidate an independently cloned handle.
  */
-void lance_schema_close(LanceSchema* schema);
+LANCE_API void lance_schema_close(LanceSchema* schema);
 
 /**
  * Clone a native schema handle into an independently owned handle.
@@ -3059,7 +3059,7 @@ void lance_schema_close(LanceSchema* schema);
  * nested metadata, encodings, and dictionary values. It does not pass through
  * Arrow. Returns NULL on error.
  */
-LanceSchema* lance_schema_clone(const LanceSchema* schema);
+LANCE_NODISCARD LANCE_API LanceSchema* lance_schema_clone(const LanceSchema* schema);
 
 /**
  * Create a native schema from an Arrow C Data Interface schema.
@@ -3074,7 +3074,7 @@ LanceSchema* lance_schema_clone(const LanceSchema* schema);
  * On success writes an independently owned handle to `*out_schema` and
  * returns 0. On error the output slot is untouched.
  */
-int32_t lance_schema_from_arrow(
+LANCE_API int32_t lance_schema_from_arrow(
     const struct ArrowSchema* schema,
     LanceSchema** out_schema
 );
@@ -3090,7 +3090,7 @@ int32_t lance_schema_from_arrow(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_schema_to_arrow(
+LANCE_API int32_t lance_schema_to_arrow(
     const LanceSchema* schema,
     struct ArrowSchema* out
 );
@@ -3113,7 +3113,7 @@ int32_t lance_schema_to_arrow(
  * @return 0 on success, -1 on error. Close the result with
  *         lance_schema_close().
  */
-int32_t lance_schema_project(
+LANCE_API int32_t lance_schema_project(
     const LanceSchema* schema,
     const char* const* columns,
     size_t num_columns,
@@ -3126,7 +3126,7 @@ int32_t lance_schema_project(
  * Nested paths use native field-path syntax. On success writes
  * `*out_field_id` and returns 0. On error the output slot is untouched.
  */
-int32_t lance_schema_field_id(
+LANCE_API int32_t lance_schema_field_id(
     const LanceSchema* schema,
     const char* column,
     int32_t* out_field_id
@@ -3137,14 +3137,14 @@ int32_t lance_schema_field_id(
  * Return the number of fragments in the dataset. Returns 0 on error; a
  * dataset with no fragments also returns 0, so check lance_last_error_code().
  */
-uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
+LANCE_API uint64_t lance_dataset_fragment_count(const LanceDataset* dataset);
 
 /**
  * Fill out_ids with the fragment IDs of the dataset.
  * Caller must allocate out_ids with at least lance_dataset_fragment_count() elements.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
+LANCE_API int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_ids);
 /* ─── Fragment handles ─── */
 
 /**
@@ -3160,7 +3160,7 @@ int32_t lance_dataset_fragment_ids(const LanceDataset* dataset, uint64_t* out_id
  *         LANCE_ERR_NOT_FOUND; a NULL dataset sets
  *         LANCE_ERR_INVALID_ARGUMENT.
  */
-LanceFragment* lance_dataset_open_fragment(
+LANCE_NODISCARD LANCE_API LanceFragment* lance_dataset_open_fragment(
     const LanceDataset* dataset,
     uint64_t fragment_id
 );
@@ -3186,7 +3186,7 @@ LanceFragment* lance_dataset_open_fragment(
  * operation construction but rejects dataset-bound reads. On success the
  * caller closes it with `lance_fragment_close()`. Returns NULL on error.
  */
-LanceFragment* lance_fragment_new(
+LANCE_NODISCARD LANCE_API LanceFragment* lance_fragment_new(
     uint64_t fragment_id,
     const LanceDataFile* const* data_files,
     size_t data_file_count,
@@ -3194,20 +3194,20 @@ LanceFragment* lance_fragment_new(
 );
 
 /** Close and free a fragment handle. Safe to call with NULL. */
-void lance_fragment_close(LanceFragment* fragment);
+LANCE_API void lance_fragment_close(LanceFragment* fragment);
 
 /**
  * Return the fragment ID. Returns 0 and sets LANCE_ERR_INVALID_ARGUMENT on a
  * NULL handle.
  */
-uint64_t lance_fragment_id(const LanceFragment* fragment);
+LANCE_API uint64_t lance_fragment_id(const LanceFragment* fragment);
 
 /**
  * Return the number of Native base data files in the fragment. Overlay files
  * and the deletion file are not included. Returns 0 and sets an error on a
  * NULL handle.
  */
-uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
+LANCE_API uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
 
 /**
  * Return whether this handle retains a dataset-bound native fragment.
@@ -3218,7 +3218,7 @@ uint64_t lance_fragment_data_file_count(const LanceFragment* fragment);
  *
  * @return 0 on success, -1 on error (including NULL fragment/out_is_bound).
  */
-int32_t lance_fragment_is_bound(
+LANCE_API int32_t lance_fragment_is_bound(
     const LanceFragment* fragment,
     bool* out_is_bound
 );
@@ -3234,7 +3234,7 @@ int32_t lance_fragment_is_bound(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_read_version(
+LANCE_API int32_t lance_fragment_read_version(
     const LanceFragment* fragment,
     uint64_t* out_version
 );
@@ -3248,7 +3248,7 @@ int32_t lance_fragment_read_version(
  * @return 0 on success, -1 on error. A missing index sets
  *         LANCE_ERR_INVALID_ARGUMENT; `*out_file` is unchanged on error.
  */
-int32_t lance_fragment_data_file_at(
+LANCE_API int32_t lance_fragment_data_file_at(
     const LanceFragment* fragment,
     size_t index,
     LanceDataFile** out_file
@@ -3265,7 +3265,7 @@ int32_t lance_fragment_data_file_at(
  *
  * @return 0 on success, -1 on error; the output slot is unchanged on error.
  */
-int32_t lance_fragment_data_file_for_field(
+LANCE_API int32_t lance_fragment_data_file_for_field(
     const LanceFragment* fragment,
     int32_t field_id,
     LanceDataFile** out_file
@@ -3283,7 +3283,7 @@ int32_t lance_fragment_data_file_for_field(
  * The caller must free the returned string with lance_free_string(). Returns
  * NULL and sets an error for a NULL handle or serialization failure.
  */
-const char* lance_fragment_metadata_json(const LanceFragment* fragment);
+LANCE_NODISCARD LANCE_API const char* lance_fragment_metadata_json(const LanceFragment* fragment);
 
 /**
  * Export the fragment's logical dataset schema via Arrow C Data Interface.
@@ -3294,7 +3294,7 @@ const char* lance_fragment_metadata_json(const LanceFragment* fragment);
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_schema(
+LANCE_API int32_t lance_fragment_schema(
     const LanceFragment* fragment,
     struct ArrowSchema* out
 );
@@ -3310,7 +3310,7 @@ int32_t lance_fragment_schema(
  * On success writes `*out_schema` and returns 0; on error the output slot is
  * untouched.
  */
-int32_t lance_fragment_schema_clone(
+LANCE_API int32_t lance_fragment_schema_clone(
     const LanceFragment* fragment,
     LanceSchema** out_schema
 );
@@ -3325,7 +3325,7 @@ int32_t lance_fragment_schema_clone(
  * @param out_rows  Receives the count on success; unchanged on failure.
  * @return 0 on success, -1 on error (including NULL fragment/out_rows).
  */
-int32_t lance_fragment_physical_rows(
+LANCE_API int32_t lance_fragment_physical_rows(
     const LanceFragment* fragment,
     uint64_t* out_rows
 );
@@ -3340,7 +3340,7 @@ int32_t lance_fragment_physical_rows(
  * @param out_rows  Receives the count on success; unchanged on failure.
  * @return 0 on success, -1 on error (including NULL fragment/out_rows).
  */
-int32_t lance_fragment_deleted_rows(
+LANCE_API int32_t lance_fragment_deleted_rows(
     const LanceFragment* fragment,
     uint64_t* out_rows
 );
@@ -3355,7 +3355,7 @@ int32_t lance_fragment_deleted_rows(
  * @param out_rows  Receives the count on success; unchanged on failure.
  * @return 0 on success, -1 on error (including NULL fragment/out_rows).
  */
-int32_t lance_fragment_logical_rows(
+LANCE_API int32_t lance_fragment_logical_rows(
     const LanceFragment* fragment,
     uint64_t* out_rows
 );
@@ -3371,7 +3371,7 @@ int32_t lance_fragment_logical_rows(
  * @param fragment  Fragment snapshot. Must not be NULL.
  * @return Scanner handle, or NULL on error.
  */
-LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
+LANCE_NODISCARD LANCE_API LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
 
 /**
  * Take fragment-local logical rows by index.
@@ -3405,7 +3405,7 @@ LanceScanner* lance_fragment_scan(const LanceFragment* fragment);
  * @param out          Pointer to caller-allocated ArrowArrayStream.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_take(
+LANCE_API int32_t lance_fragment_take(
     const LanceFragment* fragment,
     const uint32_t* indices,
     size_t num_indices,
@@ -3433,7 +3433,7 @@ int32_t lance_fragment_take(
  * @param out_writer  Receives the writer on success; unchanged on failure.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_overlay_writer_new(
+LANCE_API int32_t lance_fragment_overlay_writer_new(
     const LanceFragment* fragment,
     const LanceSchema* schema,
     LanceFragmentOverlayWriter** out_writer
@@ -3450,7 +3450,7 @@ int32_t lance_fragment_overlay_writer_new(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_fragment_overlay_writer_write_batch(
+LANCE_API int32_t lance_fragment_overlay_writer_write_batch(
     LanceFragmentOverlayWriter* writer,
     const LanceBatch* batch
 );
@@ -3464,7 +3464,7 @@ int32_t lance_fragment_overlay_writer_write_batch(
  * result must be closed with `lance_data_overlay_group_close`. Returns 0 on
  * success, -1 on error.
  */
-int32_t lance_fragment_overlay_writer_finish(
+LANCE_API int32_t lance_fragment_overlay_writer_finish(
     LanceFragmentOverlayWriter* writer,
     LanceDataOverlayGroup** out_group
 );
@@ -3476,7 +3476,7 @@ int32_t lance_fragment_overlay_writer_finish(
  * the native abort path, not a finish or publication. NULL-safe. No error is
  * reported.
  */
-void lance_fragment_overlay_writer_abort(
+LANCE_API void lance_fragment_overlay_writer_abort(
     LanceFragmentOverlayWriter* writer
 );
 
@@ -3486,7 +3486,7 @@ void lance_fragment_overlay_writer_abort(
  * Consumes the writer allocation and drops the native writer, matching ordinary
  * Rust drop. NULL-safe.
  */
-void lance_fragment_overlay_writer_close(
+LANCE_API void lance_fragment_overlay_writer_close(
     LanceFragmentOverlayWriter* writer
 );
 
@@ -3502,7 +3502,7 @@ void lance_fragment_overlay_writer_close(
  * @param out_rows  Receives the count on success; unchanged on failure.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_count_rows(
+LANCE_API int32_t lance_fragment_count_rows(
     const LanceFragment* fragment,
     const char* filter,
     uint64_t* out_rows
@@ -3535,7 +3535,7 @@ int32_t lance_fragment_count_rows(
  * @param out_fragment  Receives the fragment or NULL on success. Must not be NULL.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_delete(
+LANCE_API int32_t lance_fragment_delete(
     const LanceFragment* fragment,
     const char* predicate,
     LanceFragment** out_fragment
@@ -3559,7 +3559,7 @@ int32_t lance_fragment_delete(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_add_columns_sql(
+LANCE_API int32_t lance_fragment_add_columns_sql(
     const LanceFragment* fragment,
     const LanceSqlColumn* columns,
     size_t column_count,
@@ -3581,7 +3581,7 @@ int32_t lance_fragment_add_columns_sql(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_add_columns_nulls(
+LANCE_API int32_t lance_fragment_add_columns_nulls(
     const LanceFragment* fragment,
     const struct ArrowSchema* columns,
     LanceFragment** out_fragment,
@@ -3600,7 +3600,7 @@ int32_t lance_fragment_add_columns_nulls(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_add_columns_stream(
+LANCE_API int32_t lance_fragment_add_columns_stream(
     const LanceFragment* fragment,
     struct ArrowArrayStream* stream,
     const uint32_t* batch_size,
@@ -3623,7 +3623,7 @@ int32_t lance_fragment_add_columns_stream(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_add_columns_batch_udf(
+LANCE_API int32_t lance_fragment_add_columns_batch_udf(
     const LanceFragment* fragment,
     const LanceBatchUDF* udf,
     const char* const* read_columns,
@@ -3644,7 +3644,7 @@ int32_t lance_fragment_add_columns_batch_udf(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_add_columns_batch_udf_v2(
+LANCE_API int32_t lance_fragment_add_columns_batch_udf_v2(
     const LanceFragment* fragment,
     const LanceBatchUDFV2* udf,
     const char* const* read_columns,
@@ -3666,7 +3666,7 @@ int32_t lance_fragment_add_columns_batch_udf_v2(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_merge_columns(
+LANCE_API int32_t lance_fragment_merge_columns(
     const LanceFragment* fragment,
     struct ArrowArrayStream* stream,
     const char* left_on,
@@ -3689,7 +3689,7 @@ int32_t lance_fragment_merge_columns(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_update_columns(
+LANCE_API int32_t lance_fragment_update_columns(
     const LanceFragment* fragment,
     struct ArrowArrayStream* stream,
     const char* left_on,
@@ -3708,7 +3708,7 @@ int32_t lance_fragment_update_columns(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_write_columns(
+LANCE_API int32_t lance_fragment_write_columns(
     const LanceFragment* fragment,
     const LanceSchema* schema,
     struct ArrowArrayStream* stream,
@@ -3725,7 +3725,7 @@ int32_t lance_fragment_write_columns(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_write_column_with_version(
+LANCE_API int32_t lance_fragment_write_column_with_version(
     const LanceFragment* fragment,
     const LanceSchema* schema,
     struct ArrowArrayStream* stream,
@@ -3744,7 +3744,7 @@ int32_t lance_fragment_write_column_with_version(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_delete_rows(
+LANCE_API int32_t lance_fragment_delete_rows(
     const LanceFragment* fragment,
     const uint32_t* offsets,
     size_t offset_count,
@@ -3754,7 +3754,7 @@ int32_t lance_fragment_delete_rows(
 /**
  * Close an update-columns result. NULL-safe.
  */
-void lance_fragment_update_columns_result_close(
+LANCE_API void lance_fragment_update_columns_result_close(
     LanceFragmentUpdateColumnsResult* result
 );
 
@@ -3766,7 +3766,7 @@ void lance_fragment_update_columns_result_close(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_update_columns_result_fragment(
+LANCE_API int32_t lance_fragment_update_columns_result_fragment(
     const LanceFragmentUpdateColumnsResult* result,
     LanceFragment** out_fragment
 );
@@ -3776,7 +3776,7 @@ int32_t lance_fragment_update_columns_result_fragment(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_update_columns_result_fields_modified_count(
+LANCE_API int32_t lance_fragment_update_columns_result_fields_modified_count(
     const LanceFragmentUpdateColumnsResult* result,
     uint64_t* out_count
 );
@@ -3786,7 +3786,7 @@ int32_t lance_fragment_update_columns_result_fields_modified_count(
  *
  * @return 0 on success, -1 on error. The output is unchanged on error.
  */
-int32_t lance_fragment_update_columns_result_fields_modified_at(
+LANCE_API int32_t lance_fragment_update_columns_result_fields_modified_at(
     const LanceFragmentUpdateColumnsResult* result,
     size_t index,
     uint32_t* out_field_id
@@ -3797,7 +3797,7 @@ int32_t lance_fragment_update_columns_result_fields_modified_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_update_columns_result_matched_offset_count(
+LANCE_API int32_t lance_fragment_update_columns_result_matched_offset_count(
     const LanceFragmentUpdateColumnsResult* result,
     uint64_t* out_count
 );
@@ -3811,7 +3811,7 @@ int32_t lance_fragment_update_columns_result_matched_offset_count(
  *
  * @return 0 on success, -1 on error. The output is unchanged on error.
  */
-int32_t lance_fragment_update_columns_result_matched_offset_at(
+LANCE_API int32_t lance_fragment_update_columns_result_matched_offset_at(
     const LanceFragmentUpdateColumnsResult* result,
     size_t index,
     uint32_t* out_offset
@@ -3827,7 +3827,7 @@ int32_t lance_fragment_update_columns_result_matched_offset_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
+LANCE_API int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
     const LanceFragmentUpdateColumnsResult* result,
     uint8_t** out_bytes,
     size_t* out_len
@@ -3844,7 +3844,7 @@ int32_t lance_fragment_update_columns_result_matched_offsets_serialize(
  *
  * @return 0 on success, -1 on error. The output buffer is unchanged on error.
  */
-int32_t lance_fragment_update_columns_result_matched_offsets(
+LANCE_API int32_t lance_fragment_update_columns_result_matched_offsets(
     const LanceFragmentUpdateColumnsResult* result,
     uint32_t* out_offsets,
     size_t count
@@ -3869,7 +3869,7 @@ int32_t lance_fragment_update_columns_result_matched_offsets(
  * @param out          Pointer to caller-allocated ArrowArrayStream
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_take(
+LANCE_API int32_t lance_dataset_take(
     const LanceDataset* dataset,
     const uint64_t* indices,
     size_t num_indices,
@@ -3902,7 +3902,7 @@ int32_t lance_dataset_take(
  * @param out          Pointer to caller-allocated ArrowArrayStream.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_take_rows(
+LANCE_API int32_t lance_dataset_take_rows(
     const LanceDataset* dataset,
     const uint64_t* row_ids,
     size_t num_row_ids,
@@ -3960,7 +3960,7 @@ typedef struct LanceBlobRange {
  *                     handle pointers. Must not be NULL.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_take_blobs(
+LANCE_API int32_t lance_dataset_take_blobs(
     const LanceDataset* dataset,
     const uint64_t* row_ids,
     size_t num_row_ids,
@@ -3985,7 +3985,7 @@ int32_t lance_dataset_take_blobs(
  *                     handle pointers. Must not be NULL.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_take_blobs_by_indices(
+LANCE_API int32_t lance_dataset_take_blobs_by_indices(
     const LanceDataset* dataset,
     const uint64_t* indices,
     size_t num_indices,
@@ -4020,7 +4020,7 @@ int32_t lance_dataset_take_blobs_by_indices(
  *                           NULL.
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_take_blobs_by_addresses(
+LANCE_API int32_t lance_dataset_take_blobs_by_addresses(
     const LanceDataset* dataset,
     const uint64_t* row_addresses,
     size_t num_row_addresses,
@@ -4038,7 +4038,7 @@ int32_t lance_dataset_take_blobs_by_addresses(
  * @return The blob size, or 0 on error. A return of 0 may be an empty blob
  *         or an error; check lance_last_error_code() to tell them apart.
  */
-uint64_t lance_blob_file_size(const LanceBlobFile* blob);
+LANCE_API uint64_t lance_blob_file_size(const LanceBlobFile* blob);
 
 /**
  * Read from the current cursor to the end of the blob.
@@ -4055,7 +4055,7 @@ uint64_t lance_blob_file_size(const LanceBlobFile* blob);
  *                 or past the end.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_read(LanceBlobFile* blob, uint8_t* dst, size_t dst_len);
+LANCE_API int32_t lance_blob_file_read(LanceBlobFile* blob, uint8_t* dst, size_t dst_len);
 
 /**
  * Read at most `len` bytes from the current cursor.
@@ -4072,7 +4072,7 @@ int32_t lance_blob_file_read(LanceBlobFile* blob, uint8_t* dst, size_t dst_len);
  *                    success.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_read_up_to(
+LANCE_API int32_t lance_blob_file_read_up_to(
     LanceBlobFile* blob,
     uint8_t* dst,
     size_t len,
@@ -4093,7 +4093,7 @@ int32_t lance_blob_file_read_up_to(
  * @param len     Number of bytes to read. Zero is a no-op that succeeds.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_read_range(
+LANCE_API int32_t lance_blob_file_read_range(
     const LanceBlobFile* blob,
     uint64_t offset,
     uint8_t* dst,
@@ -4127,7 +4127,7 @@ int32_t lance_blob_file_read_range(
  * @param destination_lens  Parallel array of destination capacities in bytes.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_read_ranges(
+LANCE_API int32_t lance_blob_file_read_ranges(
     const LanceBlobFile* blob,
     const LanceBlobRange* ranges,
     size_t num_ranges,
@@ -4145,7 +4145,7 @@ int32_t lance_blob_file_read_ranges(
  * @param pos   New cursor position, in bytes from the start of the blob.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos);
+LANCE_API int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos);
 
 /**
  * Report the current cursor position.
@@ -4155,7 +4155,7 @@ int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos);
  *              blob. Must not be NULL. Written only on success.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos);
+LANCE_API int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos);
 
 /**
  * Set the sequential read-ahead size used by future reads.
@@ -4168,7 +4168,7 @@ int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos);
  * @param buffer_size  Read-ahead size in bytes; zero disables it.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_set_buffer_size(
+LANCE_API int32_t lance_blob_file_set_buffer_size(
     LanceBlobFile* blob,
     size_t buffer_size
 );
@@ -4189,7 +4189,7 @@ int32_t lance_blob_file_set_buffer_size(
  * @param blob  Blob handle. NULL is an error.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_mark_closed(LanceBlobFile* blob);
+LANCE_API int32_t lance_blob_file_mark_closed(LanceBlobFile* blob);
 
 /**
  * Report whether the native blob file is closed.
@@ -4199,7 +4199,7 @@ int32_t lance_blob_file_mark_closed(LanceBlobFile* blob);
  *                    Written only on success.
  * @return 0 on success, -1 on error
  */
-int32_t lance_blob_file_is_closed(
+LANCE_API int32_t lance_blob_file_is_closed(
     const LanceBlobFile* blob,
     bool* out_closed
 );
@@ -4215,7 +4215,7 @@ int32_t lance_blob_file_is_closed(
  *
  * @param blob  Blob handle, or NULL.
  */
-void lance_blob_file_close(LanceBlobFile* blob);
+LANCE_API void lance_blob_file_close(LanceBlobFile* blob);
 /* ─── Blob v2 fields and prepared descriptor arrays ─── */
 
 /**
@@ -4248,7 +4248,7 @@ typedef struct LanceBlobFieldOptions {
  * @param out       Caller-owned ArrowSchema. Must not be NULL.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_field(
+LANCE_API int32_t lance_blob_field(
     const char* name,
     bool nullable,
     struct ArrowSchema* out
@@ -4267,7 +4267,7 @@ int32_t lance_blob_field(
  * @param out       Caller-owned ArrowSchema. Must not be NULL.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_field_with_options(
+LANCE_API int32_t lance_blob_field_with_options(
     const char* name,
     bool nullable,
     const LanceBlobFieldOptions* options,
@@ -4284,7 +4284,7 @@ int32_t lance_blob_field_with_options(
  * @param column  Blob column name. Must not be NULL.
  * @return Builder handle, or NULL on error.
  */
-LanceBlobDescriptorArrayBuilder* lance_blob_descriptor_array_builder_new(
+LANCE_NODISCARD LANCE_API LanceBlobDescriptorArrayBuilder* lance_blob_descriptor_array_builder_new(
     const char* column
 );
 
@@ -4298,7 +4298,7 @@ LanceBlobDescriptorArrayBuilder* lance_blob_descriptor_array_builder_new(
  * @param out      Caller-owned ArrowSchema. Must not be NULL.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_field(
+LANCE_API int32_t lance_blob_descriptor_array_builder_field(
     const LanceBlobDescriptorArrayBuilder* builder,
     struct ArrowSchema* out
 );
@@ -4312,7 +4312,7 @@ int32_t lance_blob_descriptor_array_builder_field(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_append_inline(
+LANCE_API int32_t lance_blob_descriptor_array_builder_append_inline(
     LanceBlobDescriptorArrayBuilder* builder,
     const uint8_t* data,
     size_t len
@@ -4322,7 +4322,7 @@ int32_t lance_blob_descriptor_array_builder_append_inline(
  * Append a null blob descriptor.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_append_null(
+LANCE_API int32_t lance_blob_descriptor_array_builder_append_null(
     LanceBlobDescriptorArrayBuilder* builder
 );
 
@@ -4334,7 +4334,7 @@ int32_t lance_blob_descriptor_array_builder_append_null(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_append_packed(
+LANCE_API int32_t lance_blob_descriptor_array_builder_append_packed(
     LanceBlobDescriptorArrayBuilder* builder,
     uint32_t blob_id,
     uint64_t offset,
@@ -4350,7 +4350,7 @@ int32_t lance_blob_descriptor_array_builder_append_packed(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_extend_packed(
+LANCE_API int32_t lance_blob_descriptor_array_builder_extend_packed(
     LanceBlobDescriptorArrayBuilder* builder,
     uint32_t blob_id,
     const LanceBlobRange* ranges,
@@ -4361,7 +4361,7 @@ int32_t lance_blob_descriptor_array_builder_extend_packed(
  * Append one dedicated descriptor. Native validates the blob ID.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_append_dedicated(
+LANCE_API int32_t lance_blob_descriptor_array_builder_append_dedicated(
     LanceBlobDescriptorArrayBuilder* builder,
     uint32_t blob_id,
     uint64_t length
@@ -4379,7 +4379,7 @@ int32_t lance_blob_descriptor_array_builder_append_dedicated(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_append_managed(
+LANCE_API int32_t lance_blob_descriptor_array_builder_append_managed(
     LanceBlobDescriptorArrayBuilder* builder,
     const char* uri,
     uint64_t offset,
@@ -4395,7 +4395,7 @@ int32_t lance_blob_descriptor_array_builder_append_managed(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_append_external(
+LANCE_API int32_t lance_blob_descriptor_array_builder_append_external(
     LanceBlobDescriptorArrayBuilder* builder,
     uint32_t base_id,
     const char* uri,
@@ -4413,7 +4413,7 @@ int32_t lance_blob_descriptor_array_builder_append_external(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_push_external(
+LANCE_API int32_t lance_blob_descriptor_array_builder_push_external(
     LanceBlobDescriptorArrayBuilder* builder,
     const char* uri,
     bool has_range,
@@ -4435,7 +4435,7 @@ int32_t lance_blob_descriptor_array_builder_push_external(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_blob_descriptor_array_builder_finish(
+LANCE_API int32_t lance_blob_descriptor_array_builder_finish(
     LanceBlobDescriptorArrayBuilder* builder,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
@@ -4445,7 +4445,7 @@ int32_t lance_blob_descriptor_array_builder_finish(
  * Free a descriptor builder handle. NULL is a no-op. An unfinished native
  * builder is dropped without sidecar rollback or publication.
  */
-void lance_blob_descriptor_array_builder_close(
+LANCE_API void lance_blob_descriptor_array_builder_close(
     LanceBlobDescriptorArrayBuilder* builder
 );
 /* ─── Planned whole-blob and blob-range reads ─── */
@@ -4527,7 +4527,7 @@ typedef struct LanceBlobRangeRequest {
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_read_blobs(
+LANCE_API int32_t lance_dataset_read_blobs(
     const LanceDataset* dataset,
     const char* column,
     int32_t selector,
@@ -4572,7 +4572,7 @@ int32_t lance_dataset_read_blobs(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_read_blob_ranges(
+LANCE_API int32_t lance_dataset_read_blob_ranges(
     const LanceDataset* dataset,
     const char* column,
     int32_t selector,
@@ -4603,7 +4603,7 @@ int32_t lance_dataset_read_blob_ranges(
  * @param storage_opts NULL-terminated key-value pairs ["k","v",NULL], or NULL.
  * @return 0 on success, -1 on error
  */
-int32_t lance_write_fragments(
+LANCE_API int32_t lance_write_fragments(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -4684,7 +4684,7 @@ typedef void (*LanceIndexBuildProgressCallback)(
  * @param replace    If true, replace any existing index of the same name.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_vector_index(
+LANCE_API int32_t lance_dataset_create_vector_index(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4709,7 +4709,7 @@ int32_t lance_dataset_create_vector_index(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_vector_index_with_progress(
+LANCE_API int32_t lance_dataset_create_vector_index_with_progress(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4731,7 +4731,7 @@ int32_t lance_dataset_create_vector_index_with_progress(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_vector_index_with_options(
+LANCE_API int32_t lance_dataset_create_vector_index_with_options(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4755,7 +4755,7 @@ int32_t lance_dataset_create_vector_index_with_options(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_vector_index_with_options_and_progress(
+LANCE_API int32_t lance_dataset_create_vector_index_with_options_and_progress(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4784,7 +4784,7 @@ int32_t lance_dataset_create_vector_index_with_options_and_progress(
  * @param replace If true, replace any existing index of the same name.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_scalar_index(
+LANCE_API int32_t lance_dataset_create_scalar_index(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4809,7 +4809,7 @@ int32_t lance_dataset_create_scalar_index(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_scalar_index_with_progress(
+LANCE_API int32_t lance_dataset_create_scalar_index_with_progress(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4826,7 +4826,7 @@ int32_t lance_dataset_create_scalar_index_with_progress(
  * `options == NULL` or `options->has_train == false` preserves the native
  * default. `params_json` remains the native plugin parameter object.
  */
-int32_t lance_dataset_create_scalar_index_with_options(
+LANCE_API int32_t lance_dataset_create_scalar_index_with_options(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4852,7 +4852,7 @@ int32_t lance_dataset_create_scalar_index_with_options(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_scalar_index_with_options_and_progress(
+LANCE_API int32_t lance_dataset_create_scalar_index_with_options_and_progress(
     LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4966,7 +4966,7 @@ typedef struct LanceVectorIndexSegmentScope {
  * @param options Optional build options, or NULL for defaults.
  * @return Builder handle on success, or NULL on error.
  */
-LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
     const LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4979,7 +4979,7 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(
  * Create a scalar segment builder with the additive native train control.
  * `scalar_options == NULL` or an unset `has_train` preserves native defaults.
  */
-LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar_with_options(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar_with_options(
     const LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -4995,7 +4995,7 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar_with_options(
  * caller-owned. When no model set is supplied, AUTO trains locally. PQ
  * variants require both the IVF centroids and PQ codebook, or neither.
  */
-LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
     const LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -5016,7 +5016,7 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(
  * preserving the legacy protection against incompatible PQ assignment.
  * Definition-only builds with `train` set to false accept fragment subsets.
  */
-LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector_with_options(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector_with_options(
     const LanceDataset* dataset,
     const char* column,
     const char* index_name,
@@ -5029,7 +5029,7 @@ LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector_with_options(
  * The output structs must be zero-initialized; the caller owns and releases
  * both Arrow C Data Interface outputs after success.
  */
-int32_t lance_index_train_ivf_model(
+LANCE_API int32_t lance_index_train_ivf_model(
     const LanceDataset* dataset,
     const char* column,
     uint32_t num_partitions,
@@ -5045,7 +5045,7 @@ int32_t lance_index_train_ivf_model(
  * `options == NULL` is equivalent to both fields absent. A present zero is
  * forwarded to Lance; this binding does not add a zero-value policy.
  */
-int32_t lance_index_train_ivf_model_with_options(
+LANCE_API int32_t lance_index_train_ivf_model_with_options(
     const LanceDataset* dataset,
     const char* column,
     uint32_t num_partitions,
@@ -5067,7 +5067,7 @@ int32_t lance_index_train_ivf_model_with_options(
  * them synchronously: it may replace the ArrowArray struct, but leaves a live
  * caller-owned equivalent in place.
  */
-int32_t lance_index_train_pq_model(
+LANCE_API int32_t lance_index_train_pq_model(
     const LanceDataset* dataset,
     const char* column,
     uint32_t num_sub_vectors,
@@ -5086,7 +5086,7 @@ int32_t lance_index_train_pq_model(
  * The IVF centroids and Arrow output otherwise follow
  * lance_index_train_pq_model.
  */
-int32_t lance_index_train_pq_model_with_options(
+LANCE_API int32_t lance_index_train_pq_model_with_options(
     const LanceDataset* dataset,
     const char* column,
     uint32_t num_sub_vectors,
@@ -5107,23 +5107,23 @@ int32_t lance_index_train_pq_model_with_options(
  *
  * Returns NULL on error. `index_name` must be non-NULL and non-empty.
  */
-LanceIvfModel* lance_dataset_get_ivf_model(
+LANCE_NODISCARD LANCE_API LanceIvfModel* lance_dataset_get_ivf_model(
     const LanceDataset* dataset,
     const char* index_name
 );
 
 /** Free an IVF model. NULL-safe. */
-void lance_ivf_model_free(LanceIvfModel* model);
+LANCE_API void lance_ivf_model_free(LanceIvfModel* model);
 
 /** Whether the model contains centroids. NULL sets INVALID_ARGUMENT. */
-bool lance_ivf_model_has_centroids(const LanceIvfModel* model);
+LANCE_API bool lance_ivf_model_has_centroids(const LanceIvfModel* model);
 
 /**
  * Export an owned Arrow copy of the centroids. Both output structs must be
  * zero-initialized and are unchanged on error. A model without centroids
  * returns LANCE_ERR_NOT_FOUND.
  */
-int32_t lance_ivf_model_export_centroids(
+LANCE_API int32_t lance_ivf_model_export_centroids(
     const LanceIvfModel* model,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
@@ -5136,9 +5136,9 @@ int32_t lance_ivf_model_export_centroids(
  * absent partition also returns 0 from lance_ivf_model_partition_size(),
  * preserving IvfModel::partition_size for every representable usize.
  */
-uint64_t lance_ivf_model_num_partitions(const LanceIvfModel* model);
-uint64_t lance_ivf_model_dimension(const LanceIvfModel* model);
-uint64_t lance_ivf_model_partition_size(
+LANCE_API uint64_t lance_ivf_model_num_partitions(const LanceIvfModel* model);
+LANCE_API uint64_t lance_ivf_model_dimension(const LanceIvfModel* model);
+LANCE_API uint64_t lance_ivf_model_partition_size(
     const LanceIvfModel* model,
     uint64_t partition_id
 );
@@ -5150,7 +5150,7 @@ uint64_t lance_ivf_model_partition_size(
  * after the source dataset is closed. The caller releases it once with its
  * Arrow release callback.
  */
-int32_t lance_dataset_read_index_partition(
+LANCE_API int32_t lance_dataset_read_index_partition(
     const LanceDataset* dataset,
     const char* index_name,
     uint64_t partition_id,
@@ -5171,7 +5171,7 @@ int32_t lance_dataset_read_index_partition(
  * Returns a library-owned NUL-terminated string on success, or NULL on error.
  * Free a successful result with lance_free_string().
  */
-const char* lance_index_build_rq_model(uint32_t dimension, uint32_t num_bits);
+LANCE_NODISCARD LANCE_API const char* lance_index_build_rq_model(uint32_t dimension, uint32_t num_bits);
 
 /**
  * Build segment artifacts without committing them to the dataset manifest.
@@ -5183,7 +5183,7 @@ const char* lance_index_build_rq_model(uint32_t dimension, uint32_t num_bits);
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_index_segment_builder_execute_uncommitted(
+LANCE_API int32_t lance_index_segment_builder_execute_uncommitted(
     LanceIndexSegmentBuilder* builder,
     uint8_t** out_bytes,
     size_t* out_len
@@ -5210,7 +5210,7 @@ int32_t lance_index_segment_builder_execute_uncommitted(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_index_segment_builder_set_progress_callback(
+LANCE_API int32_t lance_index_segment_builder_set_progress_callback(
     LanceIndexSegmentBuilder* builder,
     LanceIndexBuildProgressCallback callback,
     void* callback_ctx
@@ -5233,7 +5233,7 @@ int32_t lance_index_segment_builder_set_progress_callback(
  *
  * Complete publication requires a separate CreateIndex operation.
  */
-int32_t lance_dataset_merge_index_metadata(
+LANCE_API int32_t lance_dataset_merge_index_metadata(
     const LanceDataset* dataset,
     const uint8_t index_uuid[16],
     const char* index_type,
@@ -5244,24 +5244,24 @@ int32_t lance_dataset_merge_index_metadata(
 );
 
 /** Free metadata bytes returned by an uncommitted segment build. NULL-safe. */
-void lance_free_bytes(uint8_t* bytes);
+LANCE_API void lance_free_bytes(uint8_t* bytes);
 
 /** Free an index segment builder. NULL-safe. */
-void lance_index_segment_builder_free(LanceIndexSegmentBuilder* builder);
+LANCE_API void lance_index_segment_builder_free(LanceIndexSegmentBuilder* builder);
 
 /**
  * Parse protobuf-encoded IndexMetadata into an opaque metadata handle.
  * `bytes` is borrowed only for this call. On error, `*out_metadata` is left
  * unchanged.
  */
-int32_t lance_index_segment_metadata_parse(
+LANCE_API int32_t lance_index_segment_metadata_parse(
     const uint8_t* bytes,
     size_t len,
     LanceIndexSegmentMetadata** out_metadata
 );
 
 /** Copy the segment UUID into a caller-provided 16-byte buffer. */
-int32_t lance_index_segment_metadata_uuid(
+LANCE_API int32_t lance_index_segment_metadata_uuid(
     const LanceIndexSegmentMetadata* metadata,
     uint8_t* out_uuid
 );
@@ -5270,7 +5270,7 @@ int32_t lance_index_segment_metadata_uuid(
  * Return the segment name. The string is borrowed from `metadata` and remains
  * valid until lance_index_segment_metadata_free(); do not free it separately.
  */
-const char* lance_index_segment_metadata_name(
+LANCE_NODISCARD LANCE_API const char* lance_index_segment_metadata_name(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5278,12 +5278,12 @@ const char* lance_index_segment_metadata_name(
  * Return the dataset version against which the segment was built, or 0 on
  * error (check lance_last_error_code()).
  */
-uint64_t lance_index_segment_metadata_dataset_version(
+LANCE_API uint64_t lance_index_segment_metadata_dataset_version(
     const LanceIndexSegmentMetadata* metadata
 );
 
 /** Return the physical index version, or -1 on error. */
-int32_t lance_index_segment_metadata_index_version(
+LANCE_API int32_t lance_index_segment_metadata_index_version(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5291,7 +5291,7 @@ int32_t lance_index_segment_metadata_index_version(
  * Return the LanceScalarIndexType/LanceVectorIndexType discriminant, or -1 on
  * error. Both enum domains use the stable, non-overlapping values above.
  */
-int32_t lance_index_segment_metadata_index_type(
+LANCE_API int32_t lance_index_segment_metadata_index_type(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5299,7 +5299,7 @@ int32_t lance_index_segment_metadata_index_type(
  * Return the protobuf Any type URL, borrowed until metadata is freed.
  * Returns NULL if metadata has no index_details.
  */
-const char* lance_index_segment_metadata_index_details_type_url(
+LANCE_NODISCARD LANCE_API const char* lance_index_segment_metadata_index_details_type_url(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5307,12 +5307,12 @@ const char* lance_index_segment_metadata_index_details_type_url(
  * Return the number of indexed field IDs. Returns 0 on error; zero may also be
  * a valid count, so check lance_last_error_code().
  */
-size_t lance_index_segment_metadata_field_count(
+LANCE_API size_t lance_index_segment_metadata_field_count(
     const LanceIndexSegmentMetadata* metadata
 );
 
 /** Copy indexed field IDs in metadata order. */
-int32_t lance_index_segment_metadata_field_ids(
+LANCE_API int32_t lance_index_segment_metadata_field_ids(
     const LanceIndexSegmentMetadata* metadata,
     int32_t* out_field_ids,
     size_t capacity,
@@ -5323,7 +5323,7 @@ int32_t lance_index_segment_metadata_field_ids(
  * Return the number of fragment IDs covered by the segment. Returns 0 on
  * error; zero may also be a valid count, so check lance_last_error_code().
  */
-size_t lance_index_segment_metadata_fragment_count(
+LANCE_API size_t lance_index_segment_metadata_fragment_count(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5334,7 +5334,7 @@ size_t lance_index_segment_metadata_fragment_count(
  * receives the number written. `out_fragment_ids` may be NULL only when the
  * metadata covers zero fragments.
  */
-int32_t lance_index_segment_metadata_fragment_ids(
+LANCE_API int32_t lance_index_segment_metadata_fragment_ids(
     const LanceIndexSegmentMetadata* metadata,
     uint32_t* out_fragment_ids,
     size_t capacity,
@@ -5350,7 +5350,7 @@ int32_t lance_index_segment_metadata_fragment_ids(
  * distinct from None even though the protobuf decoder normalizes it.
  * Returns NULL on error.
  */
-LanceIndexSegmentMetadata* lance_index_segment_metadata_clone(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentMetadata* lance_index_segment_metadata_clone(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5373,7 +5373,7 @@ LanceIndexSegmentMetadata* lance_index_segment_metadata_clone(
  *
  * Returns an independently owned handle, or NULL on error.
  */
-LanceIndexSegmentMetadata* lance_index_segment_metadata_clone_with_fragment_ids(
+LANCE_NODISCARD LANCE_API LanceIndexSegmentMetadata* lance_index_segment_metadata_clone_with_fragment_ids(
     const LanceIndexSegmentMetadata* metadata,
     bool has_fragment_ids,
     const uint32_t* fragment_ids,
@@ -5392,7 +5392,7 @@ LanceIndexSegmentMetadata* lance_index_segment_metadata_clone_with_fragment_ids(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_index_segment_metadata_encode(
+LANCE_API int32_t lance_index_segment_metadata_encode(
     const LanceIndexSegmentMetadata* metadata,
     uint8_t** out_bytes,
     size_t* out_len
@@ -5402,7 +5402,7 @@ int32_t lance_index_segment_metadata_encode(
  * Return the number of covering field IDs. Returns 0 on error; zero is also a
  * valid count, so check lance_last_error_code().
  */
-size_t lance_index_segment_metadata_covering_field_count(
+LANCE_API size_t lance_index_segment_metadata_covering_field_count(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5410,7 +5410,7 @@ size_t lance_index_segment_metadata_covering_field_count(
  * Copy one covering field ID in metadata order.
  * Returns 0 on success, -1 on error; `*out_field_id` is unchanged on error.
  */
-int32_t lance_index_segment_metadata_covering_field_id_at(
+LANCE_API int32_t lance_index_segment_metadata_covering_field_id_at(
     const LanceIndexSegmentMetadata* metadata,
     size_t index,
     int32_t* out_field_id
@@ -5424,7 +5424,7 @@ int32_t lance_index_segment_metadata_covering_field_id_at(
  * index details return NULL with LANCE_ERR_NOT_FOUND. `*out_len` is unchanged
  * on error.
  */
-const uint8_t* lance_index_segment_metadata_index_details_value(
+LANCE_NODISCARD LANCE_API const uint8_t* lance_index_segment_metadata_index_details_value(
     const LanceIndexSegmentMetadata* metadata,
     size_t* out_len
 );
@@ -5434,7 +5434,7 @@ const uint8_t* lance_index_segment_metadata_index_details_value(
  * when the native `files` option is absent; check lance_last_error_code() to
  * distinguish.
  */
-size_t lance_index_segment_metadata_file_count(
+LANCE_API size_t lance_index_segment_metadata_file_count(
     const LanceIndexSegmentMetadata* metadata
 );
 
@@ -5442,7 +5442,7 @@ size_t lance_index_segment_metadata_file_count(
  * Return one recorded file path, borrowed from the metadata handle. Returns
  * NULL on error, including an out-of-range index.
  */
-const char* lance_index_segment_metadata_file_path_at(
+LANCE_NODISCARD LANCE_API const char* lance_index_segment_metadata_file_path_at(
     const LanceIndexSegmentMetadata* metadata,
     size_t index
 );
@@ -5451,7 +5451,7 @@ const char* lance_index_segment_metadata_file_path_at(
  * Copy one recorded file size. Returns 0 on success, -1 on error; `*out_size`
  * is unchanged on error.
  */
-int32_t lance_index_segment_metadata_file_size_at(
+LANCE_API int32_t lance_index_segment_metadata_file_size_at(
     const LanceIndexSegmentMetadata* metadata,
     size_t index,
     uint64_t* out_size
@@ -5464,7 +5464,7 @@ int32_t lance_index_segment_metadata_file_size_at(
  * present is reported with `is_set == true`. The output is unchanged on error.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_index_segment_metadata_created_at(
+LANCE_API int32_t lance_index_segment_metadata_created_at(
     const LanceIndexSegmentMetadata* metadata,
     LanceOptionalTimestamp* out_timestamp
 );
@@ -5476,14 +5476,14 @@ int32_t lance_index_segment_metadata_created_at(
  * present is reported with `is_set == true`. Both outputs are unchanged on
  * error. Returns 0 on success, -1 on error.
  */
-int32_t lance_index_segment_metadata_base_id(
+LANCE_API int32_t lance_index_segment_metadata_base_id(
     const LanceIndexSegmentMetadata* metadata,
     bool* out_is_set,
     uint32_t* out_base_id
 );
 
 /** Free parsed segment metadata. NULL-safe. */
-void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
+LANCE_API void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 
 /**
  * Commit previously built uncommitted index segments as one logical index.
@@ -5528,7 +5528,7 @@ void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
  * @param segment_count          Number of segments; must be > 0.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_commit_index_segments(
+LANCE_API int32_t lance_dataset_commit_index_segments(
     LanceDataset* dataset,
     const char* index_name,
     const char* column,
@@ -5548,7 +5548,7 @@ int32_t lance_dataset_commit_index_segments(
  * lance_dataset_commit_index_segments(). This call does not commit or mutate
  * the in-memory dataset snapshot.
  */
-int32_t lance_dataset_merge_index_segments(
+LANCE_API int32_t lance_dataset_merge_index_segments(
     const LanceDataset* dataset,
     const uint8_t* const* segment_metadata_bytes,
     const size_t* segment_metadata_lens,
@@ -5579,7 +5579,7 @@ typedef struct LanceIndexPrewarmOptions {
  * Existing index-name/schema-column collision handling applies. Cache entries
  * remain evictable; no residency or latency guarantee is made.
  */
-int32_t lance_dataset_prewarm_index_with_options(
+LANCE_API int32_t lance_dataset_prewarm_index_with_options(
     const LanceDataset* dataset,
     const char* index_name,
     const LanceIndexPrewarmOptions* options
@@ -5603,24 +5603,24 @@ int32_t lance_dataset_prewarm_index_with_options(
  * NULL/empty/invalid UTF-8 arguments yield LANCE_ERR_INVALID_ARGUMENT;
  * an index absent from this snapshot yields LANCE_ERR_NOT_FOUND.
  */
-int32_t lance_dataset_prewarm_index(const LanceDataset* dataset, const char* index_name);
+LANCE_API int32_t lance_dataset_prewarm_index(const LanceDataset* dataset, const char* index_name);
 
 /** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
-int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
+LANCE_API int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
 
 /**
  * Number of user indexes (excludes system indexes). Returns 0 on error; a
  * dataset with no user indexes also returns 0, so check
  * lance_last_error_code().
  */
-uint64_t lance_dataset_index_count(const LanceDataset* dataset);
+LANCE_API uint64_t lance_dataset_index_count(const LanceDataset* dataset);
 
 /**
  * JSON array describing all user indexes.
  * Caller must free the returned string with lance_free_string().
  * Returns NULL on error.
  */
-const char* lance_dataset_index_list_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_index_list_json(const LanceDataset* dataset);
 
 /**
  * JSON array of every native IndexDescription, including system indexes.
@@ -5635,7 +5635,7 @@ const char* lance_dataset_index_list_json(const LanceDataset* dataset);
  *
  * Caller must free the returned string with lance_free_string().
  */
-const char* lance_dataset_describe_indices_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_describe_indices_json(const LanceDataset* dataset);
 
 /**
  * Return the native index-family-specific statistics JSON unchanged.
@@ -5645,7 +5645,7 @@ const char* lance_dataset_describe_indices_json(const LanceDataset* dataset);
  * returning; this handle is not automatically refreshed. Caller must free the
  * returned string with lance_free_string().
  */
-const char* lance_dataset_index_statistics_json(
+LANCE_NODISCARD LANCE_API const char* lance_dataset_index_statistics_json(
     LanceDataset* dataset,
     const char* index_name
 );
@@ -5669,7 +5669,7 @@ const char* lance_dataset_index_statistics_json(
  * Caller must free the returned string with lance_free_string().
  * Returns NULL on error (see lance_last_error_code/message).
  */
-const char* lance_dataset_index_segments_json(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_index_segments_json(const LanceDataset* dataset);
 /* ─── Distributed vector search: index segment enumeration ─── */
 
 /**
@@ -5679,7 +5679,7 @@ const char* lance_dataset_index_segments_json(const LanceDataset* dataset);
  * worker, or one per fragment range). Each segment has a stable UUID. Returns
  * 0 if the index does not exist (also sets `LANCE_ERR_NOT_FOUND`) or on error.
  */
-uint64_t lance_dataset_index_segment_count(
+LANCE_API uint64_t lance_dataset_index_segment_count(
     const LanceDataset* dataset,
     const char* index_name
 );
@@ -5699,7 +5699,7 @@ uint64_t lance_dataset_index_segment_count(
  * `capacity`, returns LANCE_ERR_INVALID_ARGUMENT without writing anything;
  * the caller can retry with a larger buffer.
  */
-int32_t lance_dataset_index_segments(
+LANCE_API int32_t lance_dataset_index_segments(
     const LanceDataset* dataset,
     const char* index_name,
     uint8_t* out_uuids,
@@ -5718,7 +5718,7 @@ int32_t lance_dataset_index_segments(
  * @param k             Number of nearest neighbors to return.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_nearest(
+LANCE_API int32_t lance_scanner_nearest(
     LanceScanner* scanner,
     const char* column,
     const void* query_data,
@@ -5746,7 +5746,7 @@ int32_t lance_scanner_nearest(
  * @param upper_bound  Exclusive upper bound, or NULL.
  * @return 0 on success, -1 on error (check lance_last_error_*).
  */
-int32_t lance_scanner_set_distance_range(
+LANCE_API int32_t lance_scanner_set_distance_range(
     LanceScanner* scanner,
     const float* lower_bound,
     const float* upper_bound
@@ -5774,7 +5774,7 @@ int32_t lance_scanner_set_distance_range(
  * Streams retain the existing ownership, error and early-release/cancellation contract.
  * Returns 0 on success, -1 on error; use lance_last_error_code/message for details.
  */
-int32_t lance_scanner_nearest_batch(
+LANCE_API int32_t lance_scanner_nearest_batch(
     LanceScanner* scanner, const char* column, const void* query_data,
     size_t dimension, size_t num_queries, LanceDataType element_type, uint32_t k
 );
@@ -5789,7 +5789,7 @@ int32_t lance_scanner_nearest_batch(
  * Scores sum each query vector's minimum distance; refinement defaults to 1.
  * Returns 0 on success, -1 on error. Stored invalid elements fail during execution.
  */
-int32_t lance_scanner_nearest_multivector(
+LANCE_API int32_t lance_scanner_nearest_multivector(
     LanceScanner* scanner, const char* column, const void* query_data,
     size_t dimension, size_t num_vectors, LanceDataType element_type, uint32_t k
 );
@@ -5800,7 +5800,7 @@ int32_t lance_scanner_nearest_multivector(
  * This replaces both bounds configured by earlier calls to any nprobes
  * setter. The value must be greater than zero. Must be set before scanning.
  */
-int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
+LANCE_API int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
 
 /**
  * Set the minimum number of vector-index partitions to search.
@@ -5811,7 +5811,7 @@ int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
  * without changing either bound.
  * Must be set before scanning starts.
  */
-int32_t lance_scanner_set_minimum_nprobes(
+LANCE_API int32_t lance_scanner_set_minimum_nprobes(
     LanceScanner* scanner,
     uint32_t minimum_nprobes
 );
@@ -5826,7 +5826,7 @@ int32_t lance_scanner_set_minimum_nprobes(
  * An invalid explicit range is rejected without changing either bound.
  * Must be set before scanning starts.
  */
-int32_t lance_scanner_set_maximum_nprobes(
+LANCE_API int32_t lance_scanner_set_maximum_nprobes(
     LanceScanner* scanner,
     uint32_t maximum_nprobes
 );
@@ -5840,7 +5840,7 @@ int32_t lance_scanner_set_maximum_nprobes(
  * without changing the previous configuration. Must be set before scanning.
  * A scanner without nearest() fails when materialized.
  */
-int32_t lance_scanner_set_search_effort(
+LANCE_API int32_t lance_scanner_set_search_effort(
     LanceScanner* scanner,
     double effort
 );
@@ -5849,7 +5849,7 @@ int32_t lance_scanner_set_search_effort(
  * Configure the speed / accuracy tradeoff for approximate vector search.
  * Must be set before scanning starts.
  */
-int32_t lance_scanner_set_approx_mode(
+LANCE_API int32_t lance_scanner_set_approx_mode(
     LanceScanner* scanner,
     LanceApproxMode approx_mode
 );
@@ -5862,14 +5862,14 @@ int32_t lance_scanner_set_approx_mode(
  * partition search. The effective value is capped by available parallelism.
  * Values below -1 are rejected. Must be set before scanning starts.
  */
-int32_t lance_scanner_set_query_parallelism(
+LANCE_API int32_t lance_scanner_set_query_parallelism(
     LanceScanner* scanner,
     int32_t query_parallelism
 );
-int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
-int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
-int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
-int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
+LANCE_API int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f);
+LANCE_API int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e);
+LANCE_API int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric);
+LANCE_API int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
 
 /**
  * Configure native indexed-only fast search.
@@ -5893,7 +5893,7 @@ int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable);
  * @param enable  True for indexed-only search, false for native default.
  * @return 0 on success, -1 on error (check `lance_last_error_*`).
  */
-int32_t lance_scanner_set_fast_search(LanceScanner* scanner, bool enable);
+LANCE_API int32_t lance_scanner_set_fast_search(LanceScanner* scanner, bool enable);
 
 /**
  * Choose when scanner filter expressions are applied during vector or MinHash
@@ -5902,7 +5902,7 @@ int32_t lance_scanner_set_fast_search(LanceScanner* scanner, bool enable);
  * than the configured limit. This does not change the fragment search domain set
  * by lance_scanner_set_fragment_ids().
  */
-int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
+LANCE_API int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
 
 /**
  * Restrict the next k-NN query to a specific subset of vector index segments.
@@ -5919,7 +5919,7 @@ int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable);
  *                      to clear any previously-set segment restriction.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_set_index_segments(
+LANCE_API int32_t lance_scanner_set_index_segments(
     LanceScanner* scanner,
     const uint8_t* segment_uuids,
     size_t len
@@ -5961,14 +5961,14 @@ int32_t lance_scanner_set_index_segments(
  * UUID bytes are copied. Metadata and final option compatibility are validated
  * when creating the stream. Index corruption or I/O failures remain errors.
  */
-int32_t lance_scanner_set_scalar_index_segment(
+LANCE_API int32_t lance_scanner_set_scalar_index_segment(
     LanceScanner* scanner, const uint8_t* segment_uuid);
 
 /* Opt in to bounded runtime BTree page-cost selection for a scalar segment scan.
  * Applies only to scalar_index_segment scans and defaults to false.
  * The explicit fragment domain and complete filter are preserved.
  * Unsupported/unknown estimates retain the selected segment. Returns 0 or -1. */
-int32_t lance_scanner_set_scalar_index_auto_selection(LanceScanner* scanner, bool enabled);
+LANCE_API int32_t lance_scanner_set_scalar_index_auto_selection(LanceScanner* scanner, bool enabled);
 /* ─── Full-text search (Phase 2) ─── */
 
 /**
@@ -6089,21 +6089,21 @@ typedef struct LanceFtsBoostOptions {
 } LanceFtsBoostOptions;
 
 /** Initialize Match options with the native defaults. NULL-safe. */
-void lance_fts_query_match_options_init(LanceFtsMatchOptions* options);
+LANCE_API void lance_fts_query_match_options_init(LanceFtsMatchOptions* options);
 
 /** Initialize Phrase options with the native defaults. NULL-safe. */
-void lance_fts_query_phrase_options_init(LanceFtsPhraseOptions* options);
+LANCE_API void lance_fts_query_phrase_options_init(LanceFtsPhraseOptions* options);
 
 /** Initialize MultiMatch options with the native defaults. NULL-safe. */
-void lance_fts_query_multi_match_options_init(LanceFtsMultiMatchOptions* options);
+LANCE_API void lance_fts_query_multi_match_options_init(LanceFtsMultiMatchOptions* options);
 
 /** Initialize CombinedFields options with the native defaults. NULL-safe. */
-void lance_fts_query_combined_fields_options_init(
+LANCE_API void lance_fts_query_combined_fields_options_init(
     LanceFtsCombinedFieldsOptions* options
 );
 
 /** Initialize Boost options with the native defaults. NULL-safe. */
-void lance_fts_query_boost_options_init(LanceFtsBoostOptions* options);
+LANCE_API void lance_fts_query_boost_options_init(LanceFtsBoostOptions* options);
 
 /**
  * Create an immutable Match query.
@@ -6114,7 +6114,7 @@ void lance_fts_query_boost_options_init(LanceFtsBoostOptions* options);
  * @param options  Match options, or NULL for the native defaults.
  * @return Query handle on success, or NULL on error.
  */
-LanceFtsQuery* lance_fts_query_match_new(
+LANCE_NODISCARD LANCE_API LanceFtsQuery* lance_fts_query_match_new(
     const char* terms,
     const char* column,
     const LanceFtsMatchOptions* options
@@ -6132,7 +6132,7 @@ LanceFtsQuery* lance_fts_query_match_new(
  * @param options  Phrase options, or NULL for the native defaults.
  * @return Query handle on success, or NULL on error.
  */
-LanceFtsQuery* lance_fts_query_phrase_new(
+LANCE_NODISCARD LANCE_API LanceFtsQuery* lance_fts_query_phrase_new(
     const char* terms,
     const char* column,
     const LanceFtsPhraseOptions* options
@@ -6153,7 +6153,7 @@ LanceFtsQuery* lance_fts_query_phrase_new(
  * @param options       MultiMatch options, or NULL for the native defaults.
  * @return Query handle on success, or NULL on error.
  */
-LanceFtsQuery* lance_fts_query_multi_match_new(
+LANCE_NODISCARD LANCE_API LanceFtsQuery* lance_fts_query_multi_match_new(
     const char* terms,
     const char* const* columns,
     size_t column_count,
@@ -6174,7 +6174,7 @@ LanceFtsQuery* lance_fts_query_multi_match_new(
  * @param options       CombinedFields options, or NULL for the native defaults.
  * @return Query handle on success, or NULL on error.
  */
-LanceFtsQuery* lance_fts_query_combined_fields_new(
+LANCE_NODISCARD LANCE_API LanceFtsQuery* lance_fts_query_combined_fields_new(
     const char* terms,
     const char* const* columns,
     size_t column_count,
@@ -6193,7 +6193,7 @@ LanceFtsQuery* lance_fts_query_combined_fields_new(
  * @param query_count  Number of entries in both arrays.
  * @return Query handle on success, or NULL on error.
  */
-LanceFtsQuery* lance_fts_query_boolean_new(
+LANCE_NODISCARD LANCE_API LanceFtsQuery* lance_fts_query_boolean_new(
     const int32_t* occurs,
     const LanceFtsQuery* const* queries,
     size_t query_count
@@ -6209,7 +6209,7 @@ LanceFtsQuery* lance_fts_query_boolean_new(
  * @param options   Boost options, or NULL for the native default.
  * @return Query handle on success, or NULL on error.
  */
-LanceFtsQuery* lance_fts_query_boost_new(
+LANCE_NODISCARD LANCE_API LanceFtsQuery* lance_fts_query_boost_new(
     const LanceFtsQuery* positive,
     const LanceFtsQuery* negative,
     const LanceFtsBoostOptions* options
@@ -6219,7 +6219,7 @@ LanceFtsQuery* lance_fts_query_boost_new(
  * Close a typed query handle. NULL-safe. Composite children and scanners that
  * already attached this query retain their own cloned values.
  */
-void lance_fts_query_close(LanceFtsQuery* query);
+LANCE_API void lance_fts_query_close(LanceFtsQuery* query);
 
 /**
  * Prepare an OR Match query context for one column.
@@ -6228,7 +6228,7 @@ void lance_fts_query_close(LanceFtsQuery* query);
  *             operator explicitly. This compatibility API is equivalent to
  *             LANCE_FTS_MATCH_OPERATOR_OR.
  */
-LanceFtsQueryContext* lance_dataset_prepare_fts_query(
+LANCE_DEPRECATED("Use lance_dataset_prepare_fts_match_query() to select the Match operator explicitly") LANCE_NODISCARD LANCE_API LanceFtsQueryContext* lance_dataset_prepare_fts_query(
     const LanceDataset* dataset,
     const char* column,
     const char* query,
@@ -6265,7 +6265,7 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_query(
  * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
  * @return Context handle on success, or NULL on error.
  */
-LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(
+LANCE_NODISCARD LANCE_API LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(
     const LanceDataset* dataset,
     const char* column,
     const char* query,
@@ -6290,7 +6290,7 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(
  * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
  * @return Context handle on success, or NULL on error.
  */
-LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(
+LANCE_NODISCARD LANCE_API LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(
     const LanceDataset* dataset,
     const char* column,
     const char* query,
@@ -6302,7 +6302,7 @@ LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(
  * Close a context handle. NULL-safe. Scanners that already attached this
  * context retain shared ownership and remain valid.
  */
-void lance_fts_query_context_close(LanceFtsQueryContext* context);
+LANCE_API void lance_fts_query_context_close(LanceFtsQueryContext* context);
 
 /**
  * Set a BM25 full-text search query on the scanner.
@@ -6317,7 +6317,7 @@ void lance_fts_query_context_close(LanceFtsQueryContext* context);
  * @param max_fuzzy_distance 0 = exact match; >0 = MatchQuery::with_fuzziness.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_full_text_search(
+LANCE_API int32_t lance_scanner_full_text_search(
     LanceScanner* scanner,
     const char* query,
     const char* const* columns,
@@ -6339,7 +6339,7 @@ int32_t lance_scanner_full_text_search(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_set_fts_query(
+LANCE_API int32_t lance_scanner_set_fts_query(
     LanceScanner* scanner,
     const LanceFtsQuery* query
 );
@@ -6352,7 +6352,7 @@ int32_t lance_scanner_set_fts_query(
  * This is mutually exclusive with nearest and lance_scanner_full_text_search
  * because the context already owns the FTS query.
  */
-int32_t lance_scanner_set_fts_query_context(
+LANCE_API int32_t lance_scanner_set_fts_query_context(
     LanceScanner* scanner,
     const LanceFtsQueryContext* context
 );
@@ -6378,7 +6378,7 @@ int32_t lance_scanner_set_fts_query_context(
  * @param text    Query text. Must not be NULL; empty text is allowed.
  * @return 0 on success, -1 on error (check `lance_last_error_*`).
  */
-int32_t lance_scanner_set_minhash_query(
+LANCE_API int32_t lance_scanner_set_minhash_query(
     LanceScanner* scanner,
     const char* column,
     const char* text
@@ -6389,7 +6389,7 @@ int32_t lance_scanner_set_minhash_query(
  * by the caller's planner. Pass `len == 0` to clear the restriction and search
  * all context segments. Duplicate or unknown UUIDs are rejected.
  */
-int32_t lance_scanner_set_fts_index_segments(
+LANCE_API int32_t lance_scanner_set_fts_index_segments(
     LanceScanner* scanner,
     const uint8_t* segment_uuids,
     size_t len
@@ -6449,7 +6449,7 @@ typedef enum {
  *         schema mismatch),
  *         LANCE_ERR_COMMIT_CONFLICT (concurrent writer).
  */
-int32_t lance_dataset_write(
+LANCE_API int32_t lance_dataset_write(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6540,7 +6540,7 @@ typedef struct LanceWriteOptions {
  *         code list; invalid `data_storage_version` also returns
  *         LANCE_ERR_INVALID_ARGUMENT.
  */
-int32_t lance_dataset_write_with_params(
+LANCE_API int32_t lance_dataset_write_with_params(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6570,7 +6570,7 @@ int32_t lance_dataset_write_with_params(
  *         lance_dataset_write. Invalid auto-cleanup values also return
  *         LANCE_ERR_INVALID_ARGUMENT.
  */
-int32_t lance_dataset_write_with_options(
+LANCE_API int32_t lance_dataset_write_with_options(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6588,7 +6588,7 @@ int32_t lance_dataset_write_with_options(
  * the accessor's initial options. This entry point keeps the legacy
  * 20-version / 14-day auto-cleanup policy.
  */
-int32_t lance_dataset_write_with_accessor(
+LANCE_API int32_t lance_dataset_write_with_accessor(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6603,7 +6603,7 @@ int32_t lance_dataset_write_with_accessor(
  * retained by the returned dataset. A NULL accessor uses native defaults.
  * This entry point keeps the legacy 20/14 auto-cleanup policy.
  */
-int32_t lance_dataset_write_with_params_and_accessor(
+LANCE_API int32_t lance_dataset_write_with_params_and_accessor(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6619,7 +6619,7 @@ int32_t lance_dataset_write_with_params_and_accessor(
  * retained by the returned dataset. A NULL accessor uses native defaults.
  * `options` may be NULL to select native WriteParams::default().
  */
-int32_t lance_dataset_write_with_options_and_accessor(
+LANCE_API int32_t lance_dataset_write_with_options_and_accessor(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6645,7 +6645,7 @@ int32_t lance_dataset_write_with_options_and_accessor(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_write_with_options_with_commit_lock(
+LANCE_API int32_t lance_dataset_write_with_options_with_commit_lock(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6890,7 +6890,7 @@ typedef struct LanceNativeWriteOptionsSpec {
  * constructor rejects only values that cannot be parsed or represented at the
  * C boundary. Returns NULL on error.
  */
-LanceNativeWriteOptions* lance_native_write_options_new(
+LANCE_NODISCARD LANCE_API LanceNativeWriteOptions* lance_native_write_options_new(
     const LanceNativeWriteOptionsSpec* spec
 );
 
@@ -6902,7 +6902,7 @@ LanceNativeWriteOptions* lance_native_write_options_new(
  * storage accessors, commit lock and progress context; the progress release
  * callback may run from this call. NULL-safe.
  */
-void lance_native_write_options_close(LanceNativeWriteOptions* options);
+LANCE_API void lance_native_write_options_close(LanceNativeWriteOptions* options);
 
 /**
  * Write with an owned native-backed options handle.
@@ -6914,7 +6914,7 @@ void lance_native_write_options_close(LanceNativeWriteOptions* options);
  * NULL `stream`. `out_dataset` follows the same success-only contract as
  * `lance_dataset_write`. Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_write_with_native_options(
+LANCE_API int32_t lance_dataset_write_with_native_options(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -6939,7 +6939,7 @@ int32_t lance_dataset_write_with_native_options(
  * `LanceCommitOptions`. Returns 0 on success, -1 on error; a failed stage is
  * guaranteed not to publish a version.
  */
-int32_t lance_dataset_write_uncommitted_stream_with_native_options(
+LANCE_API int32_t lance_dataset_write_uncommitted_stream_with_native_options(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -7001,7 +7001,7 @@ typedef struct LanceFragmentCreateOptions {
  *         empty input), native schema mismatches, storage errors and
  *         commit-less I/O failures.
  */
-int32_t lance_fragment_create(
+LANCE_API int32_t lance_fragment_create(
     const char* dataset_uri,
     uint64_t fragment_id,
     const LanceFragmentCreateOptions* options,
@@ -7025,7 +7025,7 @@ int32_t lance_fragment_create(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_create_many(
+LANCE_API int32_t lance_fragment_create_many(
     const char* dataset_uri,
     const LanceFragmentCreateOptions* options,
     struct ArrowArrayStream* stream,
@@ -7038,7 +7038,7 @@ int32_t lance_fragment_create_many(
  * then release the array allocation. NULL-safe. `count` must be the count
  * returned by `create_many`; slots already cleared by a wrapper are skipped.
  */
-void lance_fragment_array_free(LanceFragment** fragments, size_t count);
+LANCE_API void lance_fragment_array_free(LanceFragment** fragments, size_t count);
 
 /**
  * Create one fragment from an existing Lance data file.
@@ -7065,7 +7065,7 @@ void lance_fragment_array_free(LanceFragment** fragments, size_t count);
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_fragment_create_from_file(
+LANCE_API int32_t lance_fragment_create_from_file(
     const LanceDataset* dataset,
     const char* filename,
     uint64_t fragment_id,
@@ -7090,7 +7090,7 @@ int32_t lance_fragment_create_from_file(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_create_data_file(
+LANCE_API int32_t lance_dataset_create_data_file(
     const LanceDataset* dataset,
     const char* path,
     const uint32_t* base_id,
@@ -7098,31 +7098,31 @@ int32_t lance_dataset_create_data_file(
 );
 
 /** Close a data-file handle. NULL-safe. Close exactly once. */
-void lance_data_file_close(LanceDataFile* file);
+LANCE_API void lance_data_file_close(LanceDataFile* file);
 
 /**
  * Clone a data-file handle into an independent snapshot.
  * Returns NULL on error; close the result exactly once.
  */
-LanceDataFile* lance_data_file_clone(const LanceDataFile* file);
+LANCE_NODISCARD LANCE_API LanceDataFile* lance_data_file_clone(const LanceDataFile* file);
 
 /**
  * Return the native data-file path. The pointer is borrowed from `file` and
  * remains valid until the handle is closed. Returns NULL on error.
  */
-const char* lance_data_file_path(const LanceDataFile* file);
+LANCE_NODISCARD LANCE_API const char* lance_data_file_path(const LanceDataFile* file);
 
 /**
  * Read the number of native field IDs. Returns 0 on error; check
  * `lance_last_error_code()` to distinguish failure from an empty list.
  */
-size_t lance_data_file_field_count(const LanceDataFile* file);
+LANCE_API size_t lance_data_file_field_count(const LanceDataFile* file);
 
 /**
  * Read one native field ID. Returns 0 on success, -1 on error.
  * `out_field_id` is written only on success.
  */
-int32_t lance_data_file_field_id_at(
+LANCE_API int32_t lance_data_file_field_id_at(
     const LanceDataFile* file,
     size_t index,
     int32_t* out_field_id
@@ -7132,13 +7132,13 @@ int32_t lance_data_file_field_id_at(
  * Read the number of native column indices. Returns 0 on error; check
  * `lance_last_error_code()` to distinguish failure from an empty list.
  */
-size_t lance_data_file_column_index_count(const LanceDataFile* file);
+LANCE_API size_t lance_data_file_column_index_count(const LanceDataFile* file);
 
 /**
  * Read one native column index, including the native `-1` marker.
  * Returns 0 on success, -1 on error. The output is written only on success.
  */
-int32_t lance_data_file_column_index_at(
+LANCE_API int32_t lance_data_file_column_index_at(
     const LanceDataFile* file,
     size_t index,
     int32_t* out_column_index
@@ -7148,7 +7148,7 @@ int32_t lance_data_file_column_index_at(
  * Read the native data-file format version. Both outputs are required and
  * written only on success. Returns 0 on success, -1 on error.
  */
-int32_t lance_data_file_file_version(
+LANCE_API int32_t lance_data_file_file_version(
     const LanceDataFile* file,
     uint32_t* out_major,
     uint32_t* out_minor
@@ -7159,7 +7159,7 @@ int32_t lance_data_file_file_version(
  * native `Some`/`None`; `out_size` is written only when present.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_data_file_file_size(
+LANCE_API int32_t lance_data_file_file_size(
     const LanceDataFile* file,
     bool* out_is_set,
     uint64_t* out_size
@@ -7170,7 +7170,7 @@ int32_t lance_data_file_file_size(
  * `Some`/`None`; `out_base_id` is written only when present.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_data_file_base_id(
+LANCE_API int32_t lance_data_file_base_id(
     const LanceDataFile* file,
     bool* out_is_set,
     uint32_t* out_base_id
@@ -7227,7 +7227,7 @@ typedef struct LanceUpdateConfigOperationOptions {
  *
  * Returns an owned map, or NULL on error.
  */
-LanceUpdateMap* lance_update_map_new(
+LANCE_NODISCARD LANCE_API LanceUpdateMap* lance_update_map_new(
     const char* const* keys,
     const char* const* values,
     size_t count,
@@ -7239,23 +7239,23 @@ LanceUpdateMap* lance_update_map_new(
  * The clone stays valid after the source is closed.
  * Returns NULL on error; close the result exactly once.
  */
-LanceUpdateMap* lance_update_map_clone(const LanceUpdateMap* map);
+LANCE_NODISCARD LANCE_API LanceUpdateMap* lance_update_map_clone(const LanceUpdateMap* map);
 
 /** Close an update map handle. NULL-safe. Close exactly once. */
-void lance_update_map_close(LanceUpdateMap* map);
+LANCE_API void lance_update_map_close(LanceUpdateMap* map);
 
 /**
  * Read the number of native update entries. Returns 0 on error; check
  * `lance_last_error_code()`. Zero is also a valid entry count.
  */
-size_t lance_update_map_count(const LanceUpdateMap* map);
+LANCE_API size_t lance_update_map_count(const LanceUpdateMap* map);
 
 /**
  * Read one borrowed entry key. The pointer remains valid until the map handle
  * is closed. Returns NULL on error, including a key that is not representable
  * as a C string.
  */
-const char* lance_update_map_key_at(const LanceUpdateMap* map, size_t index);
+LANCE_NODISCARD LANCE_API const char* lance_update_map_key_at(const LanceUpdateMap* map, size_t index);
 
 /**
  * Read one borrowed entry value. Both output pointers are required. On success
@@ -7263,7 +7263,7 @@ const char* lance_update_map_key_at(const LanceUpdateMap* map, size_t index);
  * pointer when present and NULL otherwise. Both outputs are unchanged on
  * error. Returns 0 on success, -1 on error.
  */
-int32_t lance_update_map_value_at(
+LANCE_API int32_t lance_update_map_value_at(
     const LanceUpdateMap* map,
     size_t index,
     bool* out_has_value,
@@ -7275,7 +7275,7 @@ int32_t lance_update_map_value_at(
  * applies entries incrementally. Returns false on error; check
  * `lance_last_error_code()`.
  */
-bool lance_update_map_replace(const LanceUpdateMap* map);
+LANCE_API bool lance_update_map_replace(const LanceUpdateMap* map);
 
 /**
  * Native operation variant. Discriminants are ABI-stable.
@@ -7419,7 +7419,7 @@ typedef struct LanceTransactionOptions {
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dataset_write_uncommitted_stream(
+LANCE_API int32_t lance_dataset_write_uncommitted_stream(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -7439,7 +7439,7 @@ int32_t lance_dataset_write_uncommitted_stream(
  * stream, validation and output semantics match the static-options entry
  * point.
  */
-int32_t lance_dataset_write_uncommitted_stream_with_accessor(
+LANCE_API int32_t lance_dataset_write_uncommitted_stream_with_accessor(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -7465,7 +7465,7 @@ int32_t lance_dataset_write_uncommitted_stream_with_accessor(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_write_uncommitted_stream_with_commit_lock(
+LANCE_API int32_t lance_dataset_write_uncommitted_stream_with_commit_lock(
     const char* uri,
     const struct ArrowSchema* schema,
     struct ArrowArrayStream* stream,
@@ -7478,13 +7478,13 @@ int32_t lance_dataset_write_uncommitted_stream_with_commit_lock(
 );
 
 /** Close a transaction handle. NULL-safe. Close exactly once. */
-void lance_transaction_close(LanceTransaction* transaction);
+LANCE_API void lance_transaction_close(LanceTransaction* transaction);
 
 /** Close an operation handle. NULL-safe. Close exactly once. */
-void lance_operation_close(LanceOperation* operation);
+LANCE_API void lance_operation_close(LanceOperation* operation);
 
 /** Close a data replacement group. NULL-safe. Close exactly once. */
-void lance_data_replacement_group_close(LanceDataReplacementGroup* group);
+LANCE_API void lance_data_replacement_group_close(LanceDataReplacementGroup* group);
 
 /**
  * Construct a native data replacement group.
@@ -7493,7 +7493,7 @@ void lance_data_replacement_group_close(LanceDataReplacementGroup* group);
  * fragment ID is copied unchanged. No binding-side ordering, uniqueness or
  * coverage policy is added. Returns NULL on error.
  */
-LanceDataReplacementGroup* lance_data_replacement_group_new(
+LANCE_NODISCARD LANCE_API LanceDataReplacementGroup* lance_data_replacement_group_new(
     uint64_t fragment_id,
     const LanceDataFile* new_file
 );
@@ -7502,7 +7502,7 @@ LanceDataReplacementGroup* lance_data_replacement_group_new(
  * Clone a data replacement group into an independent snapshot.
  * Returns NULL on error; close the result exactly once.
  */
-LanceDataReplacementGroup* lance_data_replacement_group_clone(
+LANCE_NODISCARD LANCE_API LanceDataReplacementGroup* lance_data_replacement_group_clone(
     const LanceDataReplacementGroup* group
 );
 
@@ -7510,7 +7510,7 @@ LanceDataReplacementGroup* lance_data_replacement_group_clone(
  * Read the native fragment ID. Returns 0 on error; check
  * `lance_last_error_code()`. Fragment ID 0 is a valid native value.
  */
-uint64_t lance_data_replacement_group_fragment_id(
+LANCE_API uint64_t lance_data_replacement_group_fragment_id(
     const LanceDataReplacementGroup* group
 );
 
@@ -7519,7 +7519,7 @@ uint64_t lance_data_replacement_group_fragment_id(
  * only on success and must be closed independently.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_data_replacement_group_file(
+LANCE_API int32_t lance_data_replacement_group_file(
     const LanceDataReplacementGroup* group,
     LanceDataFile** out_file
 );
@@ -7532,7 +7532,7 @@ int32_t lance_data_replacement_group_file(
  * because the native operation permits them. No sorting, deduplication,
  * non-empty, field-ID or coverage policy is added. Returns NULL on error.
  */
-LanceOperation* lance_operation_data_replacement_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_data_replacement_new(
     const LanceDataReplacementGroup* const* replacements,
     size_t replacement_count
 );
@@ -7564,7 +7564,7 @@ typedef enum LanceDataOverlayCoverageKind {
  * Returns an owned overlay, or NULL on error. Close it exactly once with
  * `lance_data_overlay_file_close`.
  */
-LanceDataOverlayFile* lance_data_overlay_file_new(
+LANCE_NODISCARD LANCE_API LanceDataOverlayFile* lance_data_overlay_file_new(
     const LanceDataFile* data_file,
     int32_t coverage_kind,
     const uint8_t* const* bitmaps,
@@ -7574,13 +7574,13 @@ LanceDataOverlayFile* lance_data_overlay_file_new(
 );
 
 /** Close a data overlay value. NULL-safe. */
-void lance_data_overlay_file_close(LanceDataOverlayFile* file);
+LANCE_API void lance_data_overlay_file_close(LanceDataOverlayFile* file);
 
 /**
  * Clone a data overlay value into an independent snapshot.
  * Returns NULL on error; close the result exactly once.
  */
-LanceDataOverlayFile* lance_data_overlay_file_clone(
+LANCE_NODISCARD LANCE_API LanceDataOverlayFile* lance_data_overlay_file_clone(
     const LanceDataOverlayFile* file
 );
 
@@ -7589,7 +7589,7 @@ LanceDataOverlayFile* lance_data_overlay_file_clone(
  * written only on success and must be closed independently.
  * Returns an owned data file, or NULL on error.
  */
-LanceDataFile* lance_data_overlay_file_data_file(
+LANCE_NODISCARD LANCE_API LanceDataFile* lance_data_overlay_file_data_file(
     const LanceDataOverlayFile* file
 );
 
@@ -7597,7 +7597,7 @@ LanceDataFile* lance_data_overlay_file_data_file(
  * Read the coverage kind (0 shared, 1 per-field). Returns 0 on success, -1 on
  * error; `out_kind` is unchanged on failure.
  */
-int32_t lance_data_overlay_file_coverage_kind(
+LANCE_API int32_t lance_data_overlay_file_coverage_kind(
     const LanceDataOverlayFile* file,
     int32_t* out_kind
 );
@@ -7606,7 +7606,7 @@ int32_t lance_data_overlay_file_coverage_kind(
  * Read the number of coverage bitmaps (1 for shared, field count for
  * per-field). Returns 0 on success, -1 on error.
  */
-int32_t lance_data_overlay_file_bitmap_count(
+LANCE_API int32_t lance_data_overlay_file_bitmap_count(
     const LanceDataOverlayFile* file,
     uint64_t* out_count
 );
@@ -7621,7 +7621,7 @@ int32_t lance_data_overlay_file_bitmap_count(
  * re-serialize with a different optimized container layout.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_data_overlay_file_bitmap_at(
+LANCE_API int32_t lance_data_overlay_file_bitmap_at(
     const LanceDataOverlayFile* file,
     size_t index,
     uint8_t** out_bytes,
@@ -7632,7 +7632,7 @@ int32_t lance_data_overlay_file_bitmap_at(
  * Read the overlay's committed-version stamp. Returns 0 on success, -1 on
  * error; zero is a valid pre-commit placeholder.
  */
-int32_t lance_data_overlay_file_committed_version(
+LANCE_API int32_t lance_data_overlay_file_committed_version(
     const LanceDataOverlayFile* file,
     uint64_t* out_version
 );
@@ -7644,20 +7644,20 @@ int32_t lance_data_overlay_file_committed_version(
  * accepted only with a zero count. Empty groups are retained because the
  * native operation permits them. Returns NULL on error.
  */
-LanceDataOverlayGroup* lance_data_overlay_group_new(
+LANCE_NODISCARD LANCE_API LanceDataOverlayGroup* lance_data_overlay_group_new(
     uint64_t fragment_id,
     const LanceDataOverlayFile* const* overlays,
     size_t overlay_count
 );
 
 /** Close a data overlay group. NULL-safe. */
-void lance_data_overlay_group_close(LanceDataOverlayGroup* group);
+LANCE_API void lance_data_overlay_group_close(LanceDataOverlayGroup* group);
 
 /**
  * Clone a data overlay group into an independent snapshot.
  * Returns NULL on error; close the result exactly once.
  */
-LanceDataOverlayGroup* lance_data_overlay_group_clone(
+LANCE_NODISCARD LANCE_API LanceDataOverlayGroup* lance_data_overlay_group_clone(
     const LanceDataOverlayGroup* group
 );
 
@@ -7665,7 +7665,7 @@ LanceDataOverlayGroup* lance_data_overlay_group_clone(
  * Read the target fragment ID. Returns 0 on success, -1 on error; fragment ID
  * 0 is valid.
  */
-int32_t lance_data_overlay_group_fragment_id(
+LANCE_API int32_t lance_data_overlay_group_fragment_id(
     const LanceDataOverlayGroup* group,
     uint64_t* out_fragment_id
 );
@@ -7673,7 +7673,7 @@ int32_t lance_data_overlay_group_fragment_id(
 /**
  * Read the number of overlays in the group. Returns 0 on success, -1 on error.
  */
-int32_t lance_data_overlay_group_overlay_count(
+LANCE_API int32_t lance_data_overlay_group_overlay_count(
     const LanceDataOverlayGroup* group,
     uint64_t* out_count
 );
@@ -7682,7 +7682,7 @@ int32_t lance_data_overlay_group_overlay_count(
  * Clone one overlay from the group. The output is written only on success and
  * must be closed independently. Returns 0 on success, -1 on error.
  */
-int32_t lance_data_overlay_group_overlay_at(
+LANCE_API int32_t lance_data_overlay_group_overlay_at(
     const LanceDataOverlayGroup* group,
     size_t index,
     LanceDataOverlayFile** out_overlay
@@ -7700,7 +7700,7 @@ int32_t lance_data_overlay_group_overlay_at(
  * `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1` in every process that reads or
  * modifies an overlay dataset, including before publication.
  */
-LanceOperation* lance_operation_data_overlay_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_data_overlay_new(
     const LanceDataOverlayGroup* const* groups,
     size_t group_count
 );
@@ -7709,7 +7709,7 @@ LanceOperation* lance_operation_data_overlay_new(
  * Read the native transaction read version.
  * Returns 0 on success, -1 on error. Zero is valid for an uncommitted create.
  */
-int32_t lance_transaction_read_version(
+LANCE_API int32_t lance_transaction_read_version(
     const LanceTransaction* transaction,
     uint64_t* out_read_version
 );
@@ -7726,7 +7726,7 @@ int32_t lance_transaction_read_version(
  * and predicate validation. This function adds no binding-side policy.
  * Returns an owned operation, or NULL on error.
  */
-LanceOperation* lance_operation_delete_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_delete_new(
     const LanceFragment* const* updated_fragments,
     size_t updated_fragment_count,
     const uint64_t* deleted_fragment_ids,
@@ -7747,7 +7747,7 @@ LanceOperation* lance_operation_delete_new(
  * unchanged; this constructor adds no binding-side policy. Returns an owned
  * operation, or NULL on error.
  */
-LanceOperation* lance_operation_append_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_append_new(
     const LanceFragment* const* fragments,
     size_t fragment_count
 );
@@ -7767,7 +7767,7 @@ LanceOperation* lance_operation_append_new(
  * Returns an owned operation, or NULL on error. Close it with
  * lance_operation_close().
  */
-LanceOperation* lance_operation_overwrite_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_overwrite_new(
     const LanceSchema* schema,
     const LanceFragment* const* fragments,
     size_t fragment_count,
@@ -7787,7 +7787,7 @@ LanceOperation* lance_operation_overwrite_new(
  * Native commit code owns schema-change and concurrent-nullability conflict
  * validation. Returns an owned operation, or NULL on error.
  */
-LanceOperation* lance_operation_merge_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_merge_new(
     const LanceSchema* schema,
     const LanceFragment* const* fragments,
     size_t fragment_count,
@@ -7806,7 +7806,7 @@ LanceOperation* lance_operation_merge_new(
  * unless the core copied the source files itself. This constructor adds no
  * binding-side policy. Returns an owned operation, or NULL on error.
  */
-LanceOperation* lance_operation_clone_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_clone_new(
     bool is_shallow,
     const char* ref_name,     /* NULL None, empty is Some("") */
     uint64_t ref_version,
@@ -7826,7 +7826,7 @@ LanceOperation* lance_operation_clone_new(
  * Native commit code owns replacement, incremental and `None`-entry semantics.
  * Returns an owned operation, or NULL on error.
  */
-LanceOperation* lance_operation_update_config_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_update_config_new(
     const LanceUpdateConfigOperationOptions* options
 );
 
@@ -7837,7 +7837,7 @@ LanceOperation* lance_operation_update_config_new(
  * version exists and is restorable. Returns an owned operation, or NULL on
  * error.
  */
-LanceOperation* lance_operation_restore_new(uint64_t version);
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_restore_new(uint64_t version);
 
 /**
  * Construct an owned native ReserveFragments operation.
@@ -7846,7 +7846,7 @@ LanceOperation* lance_operation_restore_new(uint64_t version);
  * manifest maximum fragment ID for later native allocation. Returns an owned
  * operation, or NULL on error.
  */
-LanceOperation* lance_operation_reserve_fragments_new(uint32_t num_fragments);
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_reserve_fragments_new(uint32_t num_fragments);
 
 /**
  * Construct an owned native UpdateBases operation.
@@ -7859,7 +7859,7 @@ LanceOperation* lance_operation_reserve_fragments_new(uint32_t num_fragments);
  * allocation. This constructor adds no binding-side policy. Returns an owned
  * operation, or NULL on error.
  */
-LanceOperation* lance_operation_update_bases_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_update_bases_new(
     const LanceBasePath* new_bases,
     size_t new_base_count
 );
@@ -7877,7 +7877,7 @@ LanceOperation* lance_operation_update_bases_new(
  * sorting, de-duplication, name or coverage checks. Returns an owned operation,
  * or NULL on error.
  */
-LanceOperation* lance_operation_create_index_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_create_index_new(
     const LanceIndexSegmentMetadata* const* new_indices,
     size_t new_index_count,
     const LanceIndexSegmentMetadata* const* removed_indices,
@@ -7893,7 +7893,7 @@ LanceOperation* lance_operation_create_index_new(
  * `TransactionBuilder` construction and later commit validation remain
  * authoritative. Returns an owned transaction, or NULL on error.
  */
-LanceTransaction* lance_transaction_new(
+LANCE_NODISCARD LANCE_API LanceTransaction* lance_transaction_new(
     uint64_t read_version,
     const LanceOperation* operation,
     const LanceTransactionOptions* options
@@ -7903,7 +7903,7 @@ LanceTransaction* lance_transaction_new(
  * Return a newly allocated copy of the native transaction UUID.
  * Caller frees with lance_free_string(). Returns NULL on error.
  */
-const char* lance_transaction_uuid(const LanceTransaction* transaction);
+LANCE_NODISCARD LANCE_API const char* lance_transaction_uuid(const LanceTransaction* transaction);
 
 /**
  * Copy the optional native transaction tag.
@@ -7913,7 +7913,7 @@ const char* lance_transaction_uuid(const LanceTransaction* transaction);
  * lance_free_string(). Absent and empty are distinct native Option values,
  * though native protobuf decoding normalizes an encoded empty tag to absent.
  */
-int32_t lance_transaction_tag(
+LANCE_API int32_t lance_transaction_tag(
     const LanceTransaction* transaction,
     const char** out_tag
 );
@@ -7923,7 +7923,7 @@ int32_t lance_transaction_tag(
  * An absent map is distinct from an empty map.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_transaction_has_properties(
+LANCE_API int32_t lance_transaction_has_properties(
     const LanceTransaction* transaction,
     bool* out_has_properties
 );
@@ -7933,7 +7933,7 @@ int32_t lance_transaction_has_properties(
  * Some(empty); use lance_transaction_has_properties() to distinguish.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_transaction_property_count(
+LANCE_API int32_t lance_transaction_property_count(
     const LanceTransaction* transaction,
     uint64_t* out_count
 );
@@ -7943,7 +7943,7 @@ int32_t lance_transaction_property_count(
  * Map order is unspecified but stable for the handle. Caller frees with
  * lance_free_string(). Returns NULL on error, including an out-of-range index.
  */
-const char* lance_transaction_property_key_at(
+LANCE_NODISCARD LANCE_API const char* lance_transaction_property_key_at(
     const LanceTransaction* transaction,
     size_t index
 );
@@ -7953,7 +7953,7 @@ const char* lance_transaction_property_key_at(
  * Map order is unspecified but stable for the handle. Caller frees with
  * lance_free_string(). Returns NULL on error, including an out-of-range index.
  */
-const char* lance_transaction_property_value_at(
+LANCE_NODISCARD LANCE_API const char* lance_transaction_property_value_at(
     const LanceTransaction* transaction,
     size_t index
 );
@@ -7962,7 +7962,7 @@ const char* lance_transaction_property_value_at(
  * Clone the transaction operation into an independent owned handle.
  * Returns 0 on success, -1 on error; the output slot is success-only.
  */
-int32_t lance_transaction_operation(
+LANCE_API int32_t lance_transaction_operation(
     const LanceTransaction* transaction,
     LanceOperation** out_operation
 );
@@ -7971,7 +7971,7 @@ int32_t lance_transaction_operation(
  * Read the operation variant.
  * Returns 0 on success, -1 on error; the output slot is success-only.
  */
-int32_t lance_operation_kind(
+LANCE_API int32_t lance_operation_kind(
     const LanceOperation* operation,
     LanceOperationKind* out_kind
 );
@@ -7981,7 +7981,7 @@ int32_t lance_operation_kind(
  * Returns 0 on success, -1 on error. Other variants return
  * LANCE_ERR_NOT_SUPPORTED; use the typed operation getters for other variants.
  */
-int32_t lance_operation_fragment_count(
+LANCE_API int32_t lance_operation_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -7991,7 +7991,7 @@ int32_t lance_operation_fragment_count(
  * Returns 0 on success, -1 on error; other variants return
  * LANCE_ERR_NOT_SUPPORTED.
  */
-int32_t lance_operation_append_fragment_count(
+LANCE_API int32_t lance_operation_append_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8004,7 +8004,7 @@ int32_t lance_operation_append_fragment_count(
  * inspection and operation construction but rejects dataset-dependent reads.
  * Returns 0 on success, -1 on error; the output slot is unchanged on error.
  */
-int32_t lance_operation_append_fragment_at(
+LANCE_API int32_t lance_operation_append_fragment_at(
     const LanceOperation* operation,
     size_t index,
     LanceFragment** out_fragment
@@ -8015,7 +8015,7 @@ int32_t lance_operation_append_fragment_at(
  * Returns 0 on success, -1 on error; other variants return
  * LANCE_ERR_NOT_SUPPORTED.
  */
-int32_t lance_operation_restore_version(
+LANCE_API int32_t lance_operation_restore_version(
     const LanceOperation* operation,
     uint64_t* out_version
 );
@@ -8025,7 +8025,7 @@ int32_t lance_operation_restore_version(
  * Returns 0 on success, -1 on error; other variants return
  * LANCE_ERR_NOT_SUPPORTED.
  */
-int32_t lance_operation_reserve_fragments_count(
+LANCE_API int32_t lance_operation_reserve_fragments_count(
     const LanceOperation* operation,
     uint32_t* out_count
 );
@@ -8035,7 +8035,7 @@ int32_t lance_operation_reserve_fragments_count(
  * Returns 0 on success, -1 on error; other variants return
  * LANCE_ERR_NOT_SUPPORTED.
  */
-int32_t lance_operation_update_bases_count(
+LANCE_API int32_t lance_operation_update_bases_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8048,7 +8048,7 @@ int32_t lance_operation_update_bases_count(
  * explicit empty name. Returns 0 on success, -1 on error; the output slot is
  * unchanged on error.
  */
-int32_t lance_operation_update_bases_at(
+LANCE_API int32_t lance_operation_update_bases_at(
     const LanceOperation* operation,
     size_t index,
     LanceBasePathView* out_base
@@ -8059,7 +8059,7 @@ int32_t lance_operation_update_bases_at(
  * return LANCE_ERR_NOT_SUPPORTED. The generic
  * lance_operation_fragment_count() keeps its Append/Overwrite behavior.
  */
-int32_t lance_operation_overwrite_fragment_count(
+LANCE_API int32_t lance_operation_overwrite_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8068,14 +8068,14 @@ int32_t lance_operation_overwrite_fragment_count(
  * Clone one Overwrite fragment as an independent detached handle carrying its
  * complete native metadata. The output slot is unchanged on error.
  */
-int32_t lance_operation_overwrite_fragment_at(
+LANCE_API int32_t lance_operation_overwrite_fragment_at(
     const LanceOperation* operation,
     size_t index,
     LanceFragment** out_fragment
 );
 
 /** Clone the in-memory native schema of an Overwrite operation. */
-int32_t lance_operation_overwrite_schema_clone(
+LANCE_API int32_t lance_operation_overwrite_schema_clone(
     const LanceOperation* operation,
     LanceSchema** out_schema
 );
@@ -8084,13 +8084,13 @@ int32_t lance_operation_overwrite_schema_clone(
  * Report whether the Overwrite carries native `Some` config upserts.
  * `Some(empty)` is distinct from `None`. Returns 0 on success, -1 on error.
  */
-int32_t lance_operation_overwrite_has_config_upsert_values(
+LANCE_API int32_t lance_operation_overwrite_has_config_upsert_values(
     const LanceOperation* operation,
     bool* out_has
 );
 
 /** Read the number of config upsert entries; native `None` reports 0. */
-int32_t lance_operation_overwrite_config_upsert_count(
+LANCE_API int32_t lance_operation_overwrite_config_upsert_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8099,7 +8099,7 @@ int32_t lance_operation_overwrite_config_upsert_count(
  * Read one borrowed config upsert key. The pointer remains valid until the
  * operation is closed. Returns NULL on error.
  */
-const char* lance_operation_overwrite_config_upsert_key_at(
+LANCE_NODISCARD LANCE_API const char* lance_operation_overwrite_config_upsert_key_at(
     const LanceOperation* operation,
     size_t index
 );
@@ -8108,7 +8108,7 @@ const char* lance_operation_overwrite_config_upsert_key_at(
  * Read one borrowed config upsert value. The pointer remains valid until the
  * operation is closed. Returns NULL on error.
  */
-const char* lance_operation_overwrite_config_upsert_value_at(
+LANCE_NODISCARD LANCE_API const char* lance_operation_overwrite_config_upsert_value_at(
     const LanceOperation* operation,
     size_t index
 );
@@ -8117,13 +8117,13 @@ const char* lance_operation_overwrite_config_upsert_value_at(
  * Report whether the Overwrite carries native `Some` initial bases.
  * `Some(empty)` is distinct from `None`.
  */
-int32_t lance_operation_overwrite_has_initial_bases(
+LANCE_API int32_t lance_operation_overwrite_has_initial_bases(
     const LanceOperation* operation,
     bool* out_has
 );
 
 /** Read the number of initial base paths; native `None` reports 0. */
-int32_t lance_operation_overwrite_initial_base_count(
+LANCE_API int32_t lance_operation_overwrite_initial_base_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8132,51 +8132,51 @@ int32_t lance_operation_overwrite_initial_base_count(
  * Read one borrowed initial base path view. `name == NULL` means native `None`.
  * The output slot is unchanged on error.
  */
-int32_t lance_operation_overwrite_initial_base_at(
+LANCE_API int32_t lance_operation_overwrite_initial_base_at(
     const LanceOperation* operation,
     size_t index,
     LanceBasePathView* out_base
 );
 
 /** Read the number of fragments in a Merge operation. */
-int32_t lance_operation_merge_fragment_count(
+LANCE_API int32_t lance_operation_merge_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
 
 /** Clone one Merge fragment as an independent detached handle. */
-int32_t lance_operation_merge_fragment_at(
+LANCE_API int32_t lance_operation_merge_fragment_at(
     const LanceOperation* operation,
     size_t index,
     LanceFragment** out_fragment
 );
 
 /** Clone the in-memory native schema of a Merge operation. */
-int32_t lance_operation_merge_schema_clone(
+LANCE_API int32_t lance_operation_merge_schema_clone(
     const LanceOperation* operation,
     LanceSchema** out_schema
 );
 
 /** Read the native `preserves_nullability` assertion from a Merge operation. */
-int32_t lance_operation_merge_preserves_nullability(
+LANCE_API int32_t lance_operation_merge_preserves_nullability(
     const LanceOperation* operation,
     bool* out_value
 );
 
 /** Clone the in-memory native schema of a Project operation. */
-int32_t lance_operation_project_schema_clone(
+LANCE_API int32_t lance_operation_project_schema_clone(
     const LanceOperation* operation,
     LanceSchema** out_schema
 );
 
 /** Read the native `preserves_nullability` assertion from a Project operation. */
-int32_t lance_operation_project_preserves_nullability(
+LANCE_API int32_t lance_operation_project_preserves_nullability(
     const LanceOperation* operation,
     bool* out_value
 );
 
 /** Read whether a Clone operation is shallow. */
-int32_t lance_operation_clone_is_shallow(
+LANCE_API int32_t lance_operation_clone_is_shallow(
     const LanceOperation* operation,
     bool* out_value
 );
@@ -8186,14 +8186,14 @@ int32_t lance_operation_clone_is_shallow(
  * from `Some`, including `Some("")`. Both output slots are unchanged on
  * error; the pointer remains valid until the operation is closed.
  */
-int32_t lance_operation_clone_ref_name(
+LANCE_API int32_t lance_operation_clone_ref_name(
     const LanceOperation* operation,
     bool* out_present,
     const char** out_value
 );
 
 /** Read the native `ref_version` of a Clone operation. */
-int32_t lance_operation_clone_ref_version(
+LANCE_API int32_t lance_operation_clone_ref_version(
     const LanceOperation* operation,
     uint64_t* out_version
 );
@@ -8202,13 +8202,13 @@ int32_t lance_operation_clone_ref_version(
  * Read the borrowed native `ref_path`. The pointer remains valid until the
  * operation is closed. Returns NULL on error.
  */
-const char* lance_operation_clone_ref_path(const LanceOperation* operation);
+LANCE_NODISCARD LANCE_API const char* lance_operation_clone_ref_path(const LanceOperation* operation);
 
 /**
  * Read the borrowed native `branch_name`. `*out_present` distinguishes `None`
  * from `Some`, including `Some("")`. Both output slots are unchanged on error.
  */
-int32_t lance_operation_clone_branch_name(
+LANCE_API int32_t lance_operation_clone_branch_name(
     const LanceOperation* operation,
     bool* out_present,
     const char** out_value
@@ -8219,25 +8219,25 @@ int32_t lance_operation_clone_branch_name(
  * `None`; an owned handle means `Some`, including `Some(empty)`. Close a
  * non-NULL result with lance_update_map_close().
  */
-int32_t lance_operation_update_config_config_updates(
+LANCE_API int32_t lance_operation_update_config_config_updates(
     const LanceOperation* operation,
     LanceUpdateMap** out_map
 );
 
 /** Same ownership as config_updates, for table metadata. */
-int32_t lance_operation_update_config_table_metadata_updates(
+LANCE_API int32_t lance_operation_update_config_table_metadata_updates(
     const LanceOperation* operation,
     LanceUpdateMap** out_map
 );
 
 /** Same ownership as config_updates, for schema metadata. */
-int32_t lance_operation_update_config_schema_metadata_updates(
+LANCE_API int32_t lance_operation_update_config_schema_metadata_updates(
     const LanceOperation* operation,
     LanceUpdateMap** out_map
 );
 
 /** Read the number of per-field UpdateMap entries. */
-int32_t lance_operation_update_config_field_metadata_count(
+LANCE_API int32_t lance_operation_update_config_field_metadata_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8246,7 +8246,7 @@ int32_t lance_operation_update_config_field_metadata_count(
  * Clone one per-field UpdateMap entry. On success both outputs are written; the
  * map must be closed independently. Both output slots are unchanged on error.
  */
-int32_t lance_operation_update_config_field_metadata_at(
+LANCE_API int32_t lance_operation_update_config_field_metadata_at(
     const LanceOperation* operation,
     size_t index,
     int32_t* out_field_id,
@@ -8257,7 +8257,7 @@ int32_t lance_operation_update_config_field_metadata_at(
  * Read the number of new metadata entries in a CreateIndex operation.
  * Returns 0 on success, -1 on error (including a different operation kind).
  */
-int32_t lance_operation_create_index_new_count(
+LANCE_API int32_t lance_operation_create_index_new_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8269,7 +8269,7 @@ int32_t lance_operation_create_index_new_count(
  * remains valid after the operation is closed. Returns 0 on success, -1 on
  * error; the output slot is unchanged on error.
  */
-int32_t lance_operation_create_index_new_at(
+LANCE_API int32_t lance_operation_create_index_new_at(
     const LanceOperation* operation,
     size_t index,
     LanceIndexSegmentMetadata** out_metadata
@@ -8279,7 +8279,7 @@ int32_t lance_operation_create_index_new_at(
  * Read the number of removed metadata entries in a CreateIndex operation.
  * Returns 0 on success, -1 on error (including a different operation kind).
  */
-int32_t lance_operation_create_index_removed_count(
+LANCE_API int32_t lance_operation_create_index_removed_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8291,7 +8291,7 @@ int32_t lance_operation_create_index_removed_count(
  * remains valid after the operation is closed. Returns 0 on success, -1 on
  * error; the output slot is unchanged on error.
  */
-int32_t lance_operation_create_index_removed_at(
+LANCE_API int32_t lance_operation_create_index_removed_at(
     const LanceOperation* operation,
     size_t index,
     LanceIndexSegmentMetadata** out_metadata
@@ -8301,7 +8301,7 @@ int32_t lance_operation_create_index_removed_at(
  * Read the number of updated fragments in a Delete operation.
  * Returns 0 on success, -1 on error (including wrong operation kind).
  */
-int32_t lance_operation_delete_updated_fragment_count(
+LANCE_API int32_t lance_operation_delete_updated_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8313,7 +8313,7 @@ int32_t lance_operation_delete_updated_fragment_count(
  * `lance_fragment_metadata_json()`. Caller frees with `lance_free_string()`.
  * Returns NULL on error, including a wrong operation kind or bad index.
  */
-const char* lance_operation_delete_updated_fragment_metadata_json_at(
+LANCE_NODISCARD LANCE_API const char* lance_operation_delete_updated_fragment_metadata_json_at(
     const LanceOperation* operation,
     size_t index
 );
@@ -8322,7 +8322,7 @@ const char* lance_operation_delete_updated_fragment_metadata_json_at(
  * Read the number of fully deleted fragment IDs in a Delete operation.
  * Returns 0 on success, -1 on error (including wrong operation kind).
  */
-int32_t lance_operation_delete_deleted_fragment_count(
+LANCE_API int32_t lance_operation_delete_deleted_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8331,7 +8331,7 @@ int32_t lance_operation_delete_deleted_fragment_count(
  * Read one fully deleted fragment ID from a Delete operation.
  * Returns 0 on success, -1 on error. `out_id` is unchanged on error.
  */
-int32_t lance_operation_delete_deleted_fragment_id_at(
+LANCE_API int32_t lance_operation_delete_deleted_fragment_id_at(
     const LanceOperation* operation,
     size_t index,
     uint64_t* out_id
@@ -8341,7 +8341,7 @@ int32_t lance_operation_delete_deleted_fragment_id_at(
  * Return a newly allocated copy of a Delete operation's predicate.
  * Caller frees with `lance_free_string()`. Returns NULL on error.
  */
-const char* lance_operation_delete_predicate(
+LANCE_NODISCARD LANCE_API const char* lance_operation_delete_predicate(
     const LanceOperation* operation
 );
 
@@ -8349,7 +8349,7 @@ const char* lance_operation_delete_predicate(
  * Read the number of data replacement groups. A non-DataReplacement operation
  * returns LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
  */
-int32_t lance_operation_data_replacement_count(
+LANCE_API int32_t lance_operation_data_replacement_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8360,7 +8360,7 @@ int32_t lance_operation_data_replacement_count(
  * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
  * be closed independently. Returns 0 on success, -1 on error.
  */
-int32_t lance_operation_data_replacement_at(
+LANCE_API int32_t lance_operation_data_replacement_at(
     const LanceOperation* operation,
     size_t index,
     LanceDataReplacementGroup** out_group
@@ -8370,7 +8370,7 @@ int32_t lance_operation_data_replacement_at(
  * Read the number of data overlay groups. A non-DataOverlay operation returns
  * LANCE_ERR_NOT_SUPPORTED. Returns 0 on success, -1 on error.
  */
-int32_t lance_operation_data_overlay_group_count(
+LANCE_API int32_t lance_operation_data_overlay_group_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8381,7 +8381,7 @@ int32_t lance_operation_data_overlay_group_count(
  * LANCE_ERR_INVALID_ARGUMENT. The output is written only on success and must
  * be closed independently. Returns 0 on success, -1 on error.
  */
-int32_t lance_operation_data_overlay_group_at(
+LANCE_API int32_t lance_operation_data_overlay_group_at(
     const LanceOperation* operation,
     size_t index,
     LanceDataOverlayGroup** out_group
@@ -8399,7 +8399,7 @@ int32_t lance_operation_data_overlay_group_at(
  * @return 0 on success, -1 on error. Close the result with
  *         lance_schema_close().
  */
-int32_t lance_operation_schema_clone(
+LANCE_API int32_t lance_operation_schema_clone(
     const LanceOperation* operation,
     LanceSchema** out_schema
 );
@@ -8416,7 +8416,7 @@ int32_t lance_operation_schema_clone(
  * On success writes `*out_operation` and returns 0. On error the output slot is
  * untouched. Close the result with lance_operation_close().
  */
-int32_t lance_operation_project_new(
+LANCE_API int32_t lance_operation_project_new(
     const LanceSchema* schema,
     bool preserves_nullability,
     LanceOperation** out_operation
@@ -8430,7 +8430,7 @@ int32_t lance_operation_project_new(
  * operation kinds return LANCE_ERR_NOT_SUPPORTED and leave the output
  * untouched.
  */
-int32_t lance_operation_preserves_nullability(
+LANCE_API int32_t lance_operation_preserves_nullability(
     const LanceOperation* operation,
     bool* out_preserves_nullability
 );
@@ -8444,7 +8444,7 @@ int32_t lance_operation_preserves_nullability(
  * schema; other variants return LANCE_ERR_NOT_SUPPORTED.
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_operation_schema(
+LANCE_API int32_t lance_operation_schema(
     const LanceOperation* operation,
     struct ArrowSchema* out
 );
@@ -8465,7 +8465,7 @@ int32_t lance_operation_schema(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_transaction_to_proto(
+LANCE_API int32_t lance_transaction_to_proto(
     const LanceTransaction* transaction,
     uint8_t** out_bytes,
     size_t* out_len
@@ -8482,7 +8482,7 @@ int32_t lance_transaction_to_proto(
  * committed. The returned handle must be closed exactly once. Returns NULL on
  * error.
  */
-LanceTransaction* lance_transaction_from_proto(
+LANCE_NODISCARD LANCE_API LanceTransaction* lance_transaction_from_proto(
     const uint8_t* bytes,
     size_t len
 );
@@ -8495,7 +8495,7 @@ LanceTransaction* lance_transaction_from_proto(
  * output slot is unchanged on error. The transaction remains valid after the
  * source dataset handle is closed.
  */
-int32_t lance_dataset_read_transaction(
+LANCE_API int32_t lance_dataset_read_transaction(
     const LanceDataset* dataset,
     LanceTransaction** out_transaction
 );
@@ -8508,7 +8508,7 @@ int32_t lance_dataset_read_transaction(
  * success writes a transaction handle or NULL when that version has no
  * transaction file. The output slot is unchanged on error.
  */
-int32_t lance_dataset_read_transaction_by_version(
+LANCE_API int32_t lance_dataset_read_transaction_by_version(
     const LanceDataset* dataset,
     uint64_t version,
     LanceTransaction** out_transaction
@@ -8566,7 +8566,7 @@ typedef enum LanceKeyExistenceFilterKind {
  *
  * @return the new value, or NULL on error.
  */
-LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_new(
+LANCE_NODISCARD LANCE_API LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_new(
     const LanceFragmentOffsetsView* entries,
     size_t entry_count
 );
@@ -8576,21 +8576,21 @@ LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_new(
  *
  * @return the new value, or NULL on error.
  */
-LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_clone(
+LANCE_NODISCARD LANCE_API LanceUpdatedFragmentOffsets* lance_updated_fragment_offsets_clone(
     const LanceUpdatedFragmentOffsets* offsets
 );
 
 /**
  * Free an `UpdatedFragmentOffsets` value. Safe to call with NULL.
  */
-void lance_updated_fragment_offsets_close(LanceUpdatedFragmentOffsets* offsets);
+LANCE_API void lance_updated_fragment_offsets_close(LanceUpdatedFragmentOffsets* offsets);
 
 /**
  * Read the number of fragment entries.
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_updated_fragment_offsets_count(
+LANCE_API int32_t lance_updated_fragment_offsets_count(
     const LanceUpdatedFragmentOffsets* offsets,
     uint64_t* out_count
 );
@@ -8600,7 +8600,7 @@ int32_t lance_updated_fragment_offsets_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_updated_fragment_offsets_fragment_id_at(
+LANCE_API int32_t lance_updated_fragment_offsets_fragment_id_at(
     const LanceUpdatedFragmentOffsets* offsets,
     size_t index,
     uint64_t* out_fragment_id
@@ -8611,7 +8611,7 @@ int32_t lance_updated_fragment_offsets_fragment_id_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_updated_fragment_offsets_offset_count_at(
+LANCE_API int32_t lance_updated_fragment_offsets_offset_count_at(
     const LanceUpdatedFragmentOffsets* offsets,
     size_t index,
     uint64_t* out_count
@@ -8629,7 +8629,7 @@ int32_t lance_updated_fragment_offsets_offset_count_at(
  *
  * @return 0 on success, -1 on error. The output buffer is unchanged on error.
  */
-int32_t lance_updated_fragment_offsets_copy_at(
+LANCE_API int32_t lance_updated_fragment_offsets_copy_at(
     const LanceUpdatedFragmentOffsets* offsets,
     size_t index,
     uint32_t* out_offsets,
@@ -8645,7 +8645,7 @@ int32_t lance_updated_fragment_offsets_copy_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_updated_fragment_offsets_offset_at(
+LANCE_API int32_t lance_updated_fragment_offsets_offset_at(
     const LanceUpdatedFragmentOffsets* offsets,
     size_t index,
     size_t position,
@@ -8663,7 +8663,7 @@ int32_t lance_updated_fragment_offsets_offset_at(
  *
  * @return 0 on success and writes `*out_filter`, -1 on error.
  */
-int32_t lance_key_existence_filter_from_proto(
+LANCE_API int32_t lance_key_existence_filter_from_proto(
     const uint8_t* bytes,
     size_t len,
     LanceKeyExistenceFilter** out_filter
@@ -8674,21 +8674,21 @@ int32_t lance_key_existence_filter_from_proto(
  *
  * @return the new value, or NULL on error.
  */
-LanceKeyExistenceFilter* lance_key_existence_filter_clone(
+LANCE_NODISCARD LANCE_API LanceKeyExistenceFilter* lance_key_existence_filter_clone(
     const LanceKeyExistenceFilter* filter
 );
 
 /**
  * Free a key-existence filter. Safe to call with NULL.
  */
-void lance_key_existence_filter_close(LanceKeyExistenceFilter* filter);
+LANCE_API void lance_key_existence_filter_close(LanceKeyExistenceFilter* filter);
 
 /**
  * Read the filter kind.
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_kind(
+LANCE_API int32_t lance_key_existence_filter_kind(
     const LanceKeyExistenceFilter* filter,
     LanceKeyExistenceFilterKind* out_kind
 );
@@ -8698,7 +8698,7 @@ int32_t lance_key_existence_filter_kind(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_field_id_count(
+LANCE_API int32_t lance_key_existence_filter_field_id_count(
     const LanceKeyExistenceFilter* filter,
     uint64_t* out_count
 );
@@ -8708,7 +8708,7 @@ int32_t lance_key_existence_filter_field_id_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_field_id_at(
+LANCE_API int32_t lance_key_existence_filter_field_id_at(
     const LanceKeyExistenceFilter* filter,
     size_t index,
     int32_t* out_field_id
@@ -8721,7 +8721,7 @@ int32_t lance_key_existence_filter_field_id_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_exact_count(
+LANCE_API int32_t lance_key_existence_filter_exact_count(
     const LanceKeyExistenceFilter* filter,
     uint64_t* out_count
 );
@@ -8735,7 +8735,7 @@ int32_t lance_key_existence_filter_exact_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_exact_key_at(
+LANCE_API int32_t lance_key_existence_filter_exact_key_at(
     const LanceKeyExistenceFilter* filter,
     size_t index,
     uint64_t* out_key
@@ -8751,7 +8751,7 @@ int32_t lance_key_existence_filter_exact_key_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_bloom(
+LANCE_API int32_t lance_key_existence_filter_bloom(
     const LanceKeyExistenceFilter* filter,
     uint8_t** out_bitmap,
     size_t* out_bitmap_len,
@@ -8770,7 +8770,7 @@ int32_t lance_key_existence_filter_bloom(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_key_existence_filter_to_proto(
+LANCE_API int32_t lance_key_existence_filter_to_proto(
     const LanceKeyExistenceFilter* filter,
     uint8_t** out_bytes,
     size_t* out_len
@@ -8821,7 +8821,7 @@ typedef struct LanceUpdateOperationOptions {
  *
  * @return the new operation, or NULL on error.
  */
-LanceOperation* lance_operation_update_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_update_new(
     const LanceUpdateOperationOptions* options
 );
 
@@ -8835,7 +8835,7 @@ LanceOperation* lance_operation_update_new(
  *
  * @return the new operation, or NULL on error.
  */
-LanceOperation* lance_operation_update_new_with_mem_wal_dir_id(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_update_new_with_mem_wal_dir_id(
     const LanceUpdateOperationOptions* options,
     const char* mem_wal_dir_id
 );
@@ -8845,7 +8845,7 @@ LanceOperation* lance_operation_update_new_with_mem_wal_dir_id(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_removed_fragment_count(
+LANCE_API int32_t lance_operation_update_removed_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8855,7 +8855,7 @@ int32_t lance_operation_update_removed_fragment_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_removed_fragment_id_at(
+LANCE_API int32_t lance_operation_update_removed_fragment_id_at(
     const LanceOperation* operation,
     size_t index,
     uint64_t* out_fragment_id
@@ -8866,7 +8866,7 @@ int32_t lance_operation_update_removed_fragment_id_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_updated_fragment_count(
+LANCE_API int32_t lance_operation_update_updated_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8879,7 +8879,7 @@ int32_t lance_operation_update_updated_fragment_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_updated_fragment_at(
+LANCE_API int32_t lance_operation_update_updated_fragment_at(
     const LanceOperation* operation,
     size_t index,
     LanceFragment** out_fragment
@@ -8890,7 +8890,7 @@ int32_t lance_operation_update_updated_fragment_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_new_fragment_count(
+LANCE_API int32_t lance_operation_update_new_fragment_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8900,7 +8900,7 @@ int32_t lance_operation_update_new_fragment_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_new_fragment_at(
+LANCE_API int32_t lance_operation_update_new_fragment_at(
     const LanceOperation* operation,
     size_t index,
     LanceFragment** out_fragment
@@ -8911,7 +8911,7 @@ int32_t lance_operation_update_new_fragment_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_fields_modified_count(
+LANCE_API int32_t lance_operation_update_fields_modified_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8921,7 +8921,7 @@ int32_t lance_operation_update_fields_modified_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_fields_modified_at(
+LANCE_API int32_t lance_operation_update_fields_modified_at(
     const LanceOperation* operation,
     size_t index,
     uint32_t* out_field_id
@@ -8932,7 +8932,7 @@ int32_t lance_operation_update_fields_modified_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_compacted_sstable_count(
+LANCE_API int32_t lance_operation_update_compacted_sstable_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8942,7 +8942,7 @@ int32_t lance_operation_update_compacted_sstable_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_compacted_sstable_at(
+LANCE_API int32_t lance_operation_update_compacted_sstable_at(
     const LanceOperation* operation,
     size_t index,
     LanceCompactedSsTable* out_sstable
@@ -8953,7 +8953,7 @@ int32_t lance_operation_update_compacted_sstable_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_fields_for_preserving_frag_bitmap_count(
+LANCE_API int32_t lance_operation_update_fields_for_preserving_frag_bitmap_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -8963,7 +8963,7 @@ int32_t lance_operation_update_fields_for_preserving_frag_bitmap_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_fields_for_preserving_frag_bitmap_at(
+LANCE_API int32_t lance_operation_update_fields_for_preserving_frag_bitmap_at(
     const LanceOperation* operation,
     size_t index,
     uint32_t* out_field_id
@@ -8976,7 +8976,7 @@ int32_t lance_operation_update_fields_for_preserving_frag_bitmap_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_mode(
+LANCE_API int32_t lance_operation_update_mode(
     const LanceOperation* operation,
     bool* out_present,
     int32_t* out_mode
@@ -8992,7 +8992,7 @@ int32_t lance_operation_update_mode(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_inserted_rows_filter(
+LANCE_API int32_t lance_operation_update_inserted_rows_filter(
     const LanceOperation* operation,
     bool* out_present,
     LanceKeyExistenceFilter** out_filter
@@ -9008,7 +9008,7 @@ int32_t lance_operation_update_inserted_rows_filter(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_updated_fragment_offsets(
+LANCE_API int32_t lance_operation_update_updated_fragment_offsets(
     const LanceOperation* operation,
     bool* out_present,
     LanceUpdatedFragmentOffsets** out_offsets
@@ -9024,7 +9024,7 @@ int32_t lance_operation_update_updated_fragment_offsets(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_mem_wal_dir_id(
+LANCE_API int32_t lance_operation_update_mem_wal_dir_id(
     const LanceOperation* operation,
     bool* out_present,
     const char** out_dir_id
@@ -9038,7 +9038,7 @@ int32_t lance_operation_update_mem_wal_dir_id(
  *
  * @return the new group, or NULL on error.
  */
-LanceRewriteGroup* lance_rewrite_group_new(
+LANCE_NODISCARD LANCE_API LanceRewriteGroup* lance_rewrite_group_new(
     const LanceFragment* const* old_fragments,
     size_t old_fragment_count,
     const LanceFragment* const* new_fragments,
@@ -9050,19 +9050,19 @@ LanceRewriteGroup* lance_rewrite_group_new(
  *
  * @return the new group, or NULL on error.
  */
-LanceRewriteGroup* lance_rewrite_group_clone(const LanceRewriteGroup* group);
+LANCE_NODISCARD LANCE_API LanceRewriteGroup* lance_rewrite_group_clone(const LanceRewriteGroup* group);
 
 /**
  * Free a `RewriteGroup`. Safe to call with NULL.
  */
-void lance_rewrite_group_close(LanceRewriteGroup* group);
+LANCE_API void lance_rewrite_group_close(LanceRewriteGroup* group);
 
 /**
  * Read the number of replaced fragments in a `RewriteGroup`.
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewrite_group_old_fragment_count(
+LANCE_API int32_t lance_rewrite_group_old_fragment_count(
     const LanceRewriteGroup* group,
     uint64_t* out_count
 );
@@ -9072,7 +9072,7 @@ int32_t lance_rewrite_group_old_fragment_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewrite_group_old_fragment_at(
+LANCE_API int32_t lance_rewrite_group_old_fragment_at(
     const LanceRewriteGroup* group,
     size_t index,
     LanceFragment** out_fragment
@@ -9083,7 +9083,7 @@ int32_t lance_rewrite_group_old_fragment_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewrite_group_new_fragment_count(
+LANCE_API int32_t lance_rewrite_group_new_fragment_count(
     const LanceRewriteGroup* group,
     uint64_t* out_count
 );
@@ -9093,7 +9093,7 @@ int32_t lance_rewrite_group_new_fragment_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewrite_group_new_fragment_at(
+LANCE_API int32_t lance_rewrite_group_new_fragment_at(
     const LanceRewriteGroup* group,
     size_t index,
     LanceFragment** out_fragment
@@ -9114,7 +9114,7 @@ int32_t lance_rewrite_group_new_fragment_at(
  *
  * @return the new value, or NULL on error.
  */
-LanceRewrittenIndex* lance_rewritten_index_new(
+LANCE_NODISCARD LANCE_API LanceRewrittenIndex* lance_rewritten_index_new(
     const uint8_t* old_id,
     const uint8_t* new_id,
     const char* details_type_url,
@@ -9131,19 +9131,19 @@ LanceRewrittenIndex* lance_rewritten_index_new(
  *
  * @return the new value, or NULL on error.
  */
-LanceRewrittenIndex* lance_rewritten_index_clone(const LanceRewrittenIndex* index);
+LANCE_NODISCARD LANCE_API LanceRewrittenIndex* lance_rewritten_index_clone(const LanceRewrittenIndex* index);
 
 /**
  * Free a `RewrittenIndex`. Safe to call with NULL.
  */
-void lance_rewritten_index_close(LanceRewrittenIndex* index);
+LANCE_API void lance_rewritten_index_close(LanceRewrittenIndex* index);
 
 /**
  * Copy the old index UUID as 16 bytes into `out_uuid`.
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewritten_index_old_id(
+LANCE_API int32_t lance_rewritten_index_old_id(
     const LanceRewrittenIndex* index,
     uint8_t* out_uuid
 );
@@ -9153,7 +9153,7 @@ int32_t lance_rewritten_index_old_id(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewritten_index_new_id(
+LANCE_API int32_t lance_rewritten_index_new_id(
     const LanceRewrittenIndex* index,
     uint8_t* out_uuid
 );
@@ -9165,7 +9165,7 @@ int32_t lance_rewritten_index_new_id(
  * `lance_free_string`. Returns NULL on error or when the URL contains a NUL
  * byte, which the native string can hold but a C string cannot.
  */
-const char* lance_rewritten_index_details_type_url(
+LANCE_NODISCARD LANCE_API const char* lance_rewritten_index_details_type_url(
     const LanceRewrittenIndex* index
 );
 
@@ -9177,7 +9177,7 @@ const char* lance_rewritten_index_details_type_url(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewritten_index_details_value(
+LANCE_API int32_t lance_rewritten_index_details_value(
     const LanceRewrittenIndex* index,
     uint8_t** out_bytes,
     size_t* out_len
@@ -9188,7 +9188,7 @@ int32_t lance_rewritten_index_details_value(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewritten_index_version(
+LANCE_API int32_t lance_rewritten_index_version(
     const LanceRewrittenIndex* index,
     uint32_t* out_version
 );
@@ -9198,7 +9198,7 @@ int32_t lance_rewritten_index_version(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewritten_index_has_files(
+LANCE_API int32_t lance_rewritten_index_has_files(
     const LanceRewrittenIndex* index,
     bool* out_present
 );
@@ -9211,7 +9211,7 @@ int32_t lance_rewritten_index_has_files(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_rewritten_index_file_count(
+LANCE_API int32_t lance_rewritten_index_file_count(
     const LanceRewrittenIndex* index,
     uint64_t* out_count
 );
@@ -9222,7 +9222,7 @@ int32_t lance_rewritten_index_file_count(
  * The string is allocated with `malloc` and must be released with
  * `lance_free_string`. Returns NULL on error or when the native list is `None`.
  */
-const char* lance_rewritten_index_file_path_at(
+LANCE_NODISCARD LANCE_API const char* lance_rewritten_index_file_path_at(
     const LanceRewrittenIndex* index,
     size_t position
 );
@@ -9232,7 +9232,7 @@ const char* lance_rewritten_index_file_path_at(
  *
  * @return 0 on success, -1 on error or when the native list is `None`.
  */
-int32_t lance_rewritten_index_file_size_at(
+LANCE_API int32_t lance_rewritten_index_file_size_at(
     const LanceRewrittenIndex* index,
     size_t position,
     uint64_t* out_size
@@ -9251,7 +9251,7 @@ int32_t lance_rewritten_index_file_size_at(
  *
  * @return the new operation, or NULL on error.
  */
-LanceOperation* lance_operation_rewrite_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_rewrite_new(
     const LanceRewriteGroup* const* groups,
     size_t group_count,
     const LanceRewrittenIndex* const* rewritten_indices,
@@ -9264,7 +9264,7 @@ LanceOperation* lance_operation_rewrite_new(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_rewrite_group_count(
+LANCE_API int32_t lance_operation_rewrite_group_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -9274,7 +9274,7 @@ int32_t lance_operation_rewrite_group_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_rewrite_group_at(
+LANCE_API int32_t lance_operation_rewrite_group_at(
     const LanceOperation* operation,
     size_t index,
     LanceRewriteGroup** out_group
@@ -9285,7 +9285,7 @@ int32_t lance_operation_rewrite_group_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_rewrite_rewritten_index_count(
+LANCE_API int32_t lance_operation_rewrite_rewritten_index_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -9295,7 +9295,7 @@ int32_t lance_operation_rewrite_rewritten_index_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_rewrite_rewritten_index_at(
+LANCE_API int32_t lance_operation_rewrite_rewritten_index_at(
     const LanceOperation* operation,
     size_t index,
     LanceRewrittenIndex** out_index
@@ -9311,7 +9311,7 @@ int32_t lance_operation_rewrite_rewritten_index_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_rewrite_frag_reuse_index(
+LANCE_API int32_t lance_operation_rewrite_frag_reuse_index(
     const LanceOperation* operation,
     bool* out_present,
     LanceIndexSegmentMetadata** out_metadata
@@ -9328,7 +9328,7 @@ int32_t lance_operation_rewrite_frag_reuse_index(
  *
  * @return the new operation, or NULL on error.
  */
-LanceOperation* lance_operation_update_mem_wal_state_new(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_update_mem_wal_state_new(
     const LanceCompactedSsTable* compacted_sstables,
     size_t compacted_sstable_count
 );
@@ -9342,7 +9342,7 @@ LanceOperation* lance_operation_update_mem_wal_state_new(
  *
  * @return the new operation, or NULL on error.
  */
-LanceOperation* lance_operation_update_mem_wal_state_new_with_dir_id(
+LANCE_NODISCARD LANCE_API LanceOperation* lance_operation_update_mem_wal_state_new_with_dir_id(
     const LanceCompactedSsTable* compacted_sstables,
     size_t compacted_sstable_count,
     const char* dir_id
@@ -9353,7 +9353,7 @@ LanceOperation* lance_operation_update_mem_wal_state_new_with_dir_id(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_mem_wal_state_compacted_sstable_count(
+LANCE_API int32_t lance_operation_update_mem_wal_state_compacted_sstable_count(
     const LanceOperation* operation,
     uint64_t* out_count
 );
@@ -9363,7 +9363,7 @@ int32_t lance_operation_update_mem_wal_state_compacted_sstable_count(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
+LANCE_API int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
     const LanceOperation* operation,
     size_t index,
     LanceCompactedSsTable* out_sstable
@@ -9377,7 +9377,7 @@ int32_t lance_operation_update_mem_wal_state_compacted_sstable_at(
  *
  * @return 0 on success, -1 on error or a different operation kind.
  */
-int32_t lance_operation_update_mem_wal_state_dir_id(
+LANCE_API int32_t lance_operation_update_mem_wal_state_dir_id(
     const LanceOperation* operation,
     const char** out_dir_id
 );
@@ -9388,7 +9388,7 @@ int32_t lance_operation_update_mem_wal_state_dir_id(
  * The handle owns complete native fragment metadata and remains valid after the
  * rewrite result is closed. Returns NULL on error.
  */
-LanceFragment* lance_rewrite_result_original_fragment_at(
+LANCE_NODISCARD LANCE_API LanceFragment* lance_rewrite_result_original_fragment_at(
     const LanceRewriteResult* result,
     size_t index
 );
@@ -9400,7 +9400,7 @@ LanceFragment* lance_rewrite_result_original_fragment_at(
  * build a Rewrite group from them. The handle owns complete native metadata and
  * remains valid after the rewrite result is closed. Returns NULL on error.
  */
-LanceFragment* lance_rewrite_result_new_fragment_at(
+LANCE_NODISCARD LANCE_API LanceFragment* lance_rewrite_result_new_fragment_at(
     const LanceRewriteResult* result,
     size_t index
 );
@@ -9424,7 +9424,7 @@ LanceFragment* lance_rewrite_result_new_fragment_at(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_transaction_commit(
+LANCE_API int32_t lance_transaction_commit(
     const char* uri,
     const LanceTransaction* transaction,
     const LanceCommitOptions* options,
@@ -9441,7 +9441,7 @@ int32_t lance_transaction_commit(
  * options belong in the accessor's initial options. Transaction ownership and
  * failure/rollback behavior match lance_transaction_commit.
  */
-int32_t lance_transaction_commit_with_accessor(
+LANCE_API int32_t lance_transaction_commit_with_accessor(
     const char* uri,
     const LanceTransaction* transaction,
     const LanceCommitOptions* options,
@@ -9464,7 +9464,7 @@ int32_t lance_transaction_commit_with_accessor(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_transaction_commit_with_commit_lock(
+LANCE_API int32_t lance_transaction_commit_with_commit_lock(
     const char* uri,
     const LanceTransaction* transaction,
     const LanceCommitOptions* options,
@@ -9497,7 +9497,7 @@ int32_t lance_transaction_commit_with_commit_lock(
  *                               NULL.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_transaction_commit_batch(
+LANCE_API int32_t lance_transaction_commit_batch(
     const char* uri,
     const LanceTransaction* const* transactions,
     size_t transaction_count,
@@ -9515,7 +9515,7 @@ int32_t lance_transaction_commit_batch(
  * transaction metadata only. A NULL accessor uses native defaults. All
  * eligibility, merge and output rules match lance_transaction_commit_batch.
  */
-int32_t lance_transaction_commit_batch_with_accessor(
+LANCE_API int32_t lance_transaction_commit_batch_with_accessor(
     const char* uri,
     const LanceTransaction* const* transactions,
     size_t transaction_count,
@@ -9535,7 +9535,7 @@ int32_t lance_transaction_commit_batch_with_accessor(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_transaction_commit_batch_with_commit_lock(
+LANCE_API int32_t lance_transaction_commit_batch_with_commit_lock(
     const char* uri,
     const LanceTransaction* const* transactions,
     size_t transaction_count,
@@ -9626,10 +9626,10 @@ typedef struct LanceStorageOptionsProviderSpec {
     const char* provider_id;
 } LanceStorageOptionsProviderSpec;
 
-LanceStorageOptionsProvider* lance_storage_options_provider_new(
+LANCE_NODISCARD LANCE_API LanceStorageOptionsProvider* lance_storage_options_provider_new(
     const LanceStorageOptionsProviderSpec* spec
 );
-void lance_storage_options_provider_close(LanceStorageOptionsProvider* provider);
+LANCE_API void lance_storage_options_provider_close(LanceStorageOptionsProvider* provider);
 
 /**
  * Return the native provider identity as a copied string.
@@ -9637,14 +9637,14 @@ void lance_storage_options_provider_close(LanceStorageOptionsProvider* provider)
  * Free with `lance_free_string`. Returns NULL on invalid input or allocation
  * failure.
  */
-char* lance_storage_options_provider_id(
+LANCE_NODISCARD LANCE_API char* lance_storage_options_provider_id(
     const LanceStorageOptionsProvider* provider);
 
-LanceStorageOptionsAccessor* lance_storage_options_accessor_new(
+LANCE_NODISCARD LANCE_API LanceStorageOptionsAccessor* lance_storage_options_accessor_new(
     const LanceStorageOptionsInput* initial,
     const LanceStorageOptionsProvider* provider
 );
-void lance_storage_options_accessor_close(LanceStorageOptionsAccessor* accessor);
+LANCE_API void lance_storage_options_accessor_close(LanceStorageOptionsAccessor* accessor);
 
 /**
  * Resolve and copy the accessor's current options.
@@ -9653,26 +9653,26 @@ void lance_storage_options_accessor_close(LanceStorageOptionsAccessor* accessor)
  * binding keeps no second refresh cache. A NULL accessor or provider error
  * returns NULL and sets the thread-local error.
  */
-LanceStorageOptionsSnapshot* lance_storage_options_accessor_snapshot(
+LANCE_NODISCARD LANCE_API LanceStorageOptionsSnapshot* lance_storage_options_accessor_snapshot(
     const LanceStorageOptionsAccessor* accessor
 );
 
 /** 1 = Some, 0 = None, -1 = invalid handle with thread-local error. */
-int32_t lance_storage_options_snapshot_has_options(
+LANCE_API int32_t lance_storage_options_snapshot_has_options(
     const LanceStorageOptionsSnapshot* snapshot
 );
-uint64_t lance_storage_options_snapshot_count(
+LANCE_API uint64_t lance_storage_options_snapshot_count(
     const LanceStorageOptionsSnapshot* snapshot
 );
-const char* lance_storage_options_snapshot_key_at(
+LANCE_NODISCARD LANCE_API const char* lance_storage_options_snapshot_key_at(
     const LanceStorageOptionsSnapshot* snapshot,
     size_t index
 );
-const char* lance_storage_options_snapshot_value_at(
+LANCE_NODISCARD LANCE_API const char* lance_storage_options_snapshot_value_at(
     const LanceStorageOptionsSnapshot* snapshot,
     size_t index
 );
-void lance_storage_options_snapshot_close(
+LANCE_API void lance_storage_options_snapshot_close(
     LanceStorageOptionsSnapshot* snapshot
 );
 /* ─── Native Lance namespaces ─────────────────────────────────────────────── */
@@ -9710,12 +9710,12 @@ typedef struct LanceNamespaceResult {
     char* namespace_error_message;
 } LanceNamespaceResult;
 
-void lance_namespace_result_close(LanceNamespaceResult* result);
+LANCE_API void lance_namespace_result_close(LanceNamespaceResult* result);
 
 /**
  * Copy the native namespace identifier. Free with lance_free_string().
  */
-char* lance_namespace_id(const LanceNamespace* ns);
+LANCE_NODISCARD LANCE_API char* lance_namespace_id(const LanceNamespace* ns);
 
 /**
  * Retrieve native operation counters as a JSON object of integer values.
@@ -9723,10 +9723,10 @@ char* lance_namespace_id(const LanceNamespace* ns);
  * native implementation's counters. Connected and custom handles return
  * LANCE_ERR_NOT_SUPPORTED because they have no concrete native counter store.
  */
-char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* ns);
+LANCE_NODISCARD LANCE_API char* lance_namespace_retrieve_ops_metrics(const LanceNamespace* ns);
 
 /** Reset the native operation counters. */
-int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* ns);
+LANCE_API int32_t lance_namespace_reset_ops_metrics(const LanceNamespace* ns);
 
 /**
  * Synchronous, infallible dynamic context provider. Native may invoke it
@@ -9771,7 +9771,7 @@ typedef struct LanceNamespaceContextProviderSpec {
  * uses native defaults. `session` may be NULL. Native keys, defaults and
  * validation follow the selected Lance core. `context_provider` may be NULL.
  */
-LanceNamespace* lance_namespace_directory_new(
+LANCE_NODISCARD LANCE_API LanceNamespace* lance_namespace_directory_new(
     const char* properties_json,
     const LanceSession* session,
     const LanceNamespaceContextProviderSpec* context_provider
@@ -9783,7 +9783,7 @@ LanceNamespace* lance_namespace_directory_new(
  * Native properties include uri, delimiter, header.*, tls.* and
  * ops_metrics_enabled. TLS and validation behavior are native.
  */
-LanceNamespace* lance_namespace_rest_new(
+LANCE_NODISCARD LANCE_API LanceNamespace* lance_namespace_rest_new(
     const char* properties_json,
     const LanceNamespaceContextProviderSpec* context_provider
 );
@@ -9792,7 +9792,7 @@ LanceNamespace* lance_namespace_rest_new(
  * Connect through native ConnectBuilder, for example impl_name "dir" or
  * "rest". The selected properties are native impl properties.
  */
-LanceNamespace* lance_namespace_connect_new(
+LANCE_NODISCARD LANCE_API LanceNamespace* lance_namespace_connect_new(
     const char* impl_name,
     const char* properties_json,
     const LanceSession* session,
@@ -9804,7 +9804,7 @@ LanceNamespace* lance_namespace_connect_new(
  * their own native Arc ownership; foreign contexts are released after the
  * final native owner drops.
  */
-void lance_namespace_close(LanceNamespace* ns);
+LANCE_API void lance_namespace_close(LanceNamespace* ns);
 
 /**
  * Invoke one of the 54 native namespace trait operations.
@@ -9822,7 +9822,7 @@ void lance_namespace_close(LanceNamespace* ns);
  * @return 0 on success, -1 on failure. `out_result` must not be NULL and must
  *         not already own resources.
  */
-int32_t lance_namespace_call(
+LANCE_API int32_t lance_namespace_call(
     const LanceNamespace* ns,
     const char* operation,
     const char* request_json,
@@ -9839,7 +9839,7 @@ int32_t lance_namespace_call(
  * lance_storage_options_provider_close. `table_id_json` is a JSON array of
  * strings.
  */
-LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
+LANCE_NODISCARD LANCE_API LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
     const LanceNamespace* ns,
     const char* table_id_json
 );
@@ -9851,7 +9851,7 @@ LanceStorageOptionsProvider* lance_namespace_storage_options_provider_new(
  * `storage_options_json` entries are merged over namespace initial options and
  * the native refresh provider stays attached. version 0 selects latest.
  */
-LanceDataset* lance_dataset_open_namespace(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_open_namespace(
     const LanceNamespace* ns,
     const char* table_id_json,
     const char* storage_options_json,
@@ -9870,7 +9870,7 @@ LanceDataset* lance_dataset_open_namespace(
  * namespace write logic. The stream is consumed on every return once it has
  * been accepted. `out_dataset` may be NULL to discard the result.
  */
-int32_t lance_dataset_write_namespace(
+LANCE_API int32_t lance_dataset_write_namespace(
     const LanceNamespace* ns,
     const char* table_id_json,
     const struct ArrowSchema* schema,
@@ -9893,7 +9893,7 @@ int32_t lance_dataset_write_namespace(
  * namespace open/write entry points for normal access; a namespace-opened
  * dataset keeps its native commit handler.
  */
-int32_t lance_transaction_commit_namespace_uri(
+LANCE_API int32_t lance_transaction_commit_namespace_uri(
     const LanceNamespace* ns,
     const char* table_id_json,
     const char* uri,
@@ -9911,7 +9911,7 @@ int32_t lance_transaction_commit_namespace_uri(
  * port; read it with lance_rest_adapter_port. The native adapter retains the
  * backend and its server task; close or shutdown releases them.
  */
-int32_t lance_rest_adapter_start(
+LANCE_API int32_t lance_rest_adapter_start(
     const LanceNamespace* ns,
     const char* host,
     uint16_t port,
@@ -9919,13 +9919,13 @@ int32_t lance_rest_adapter_start(
 );
 
 /** Bound port, or 0 when the adapter is not running. */
-uint16_t lance_rest_adapter_port(const LanceRestAdapter* adapter);
+LANCE_API uint16_t lance_rest_adapter_port(const LanceRestAdapter* adapter);
 
 /** Gracefully stop the server. Idempotent; in-flight requests complete. */
-void lance_rest_adapter_shutdown(LanceRestAdapter* adapter);
+LANCE_API void lance_rest_adapter_shutdown(LanceRestAdapter* adapter);
 
 /** Stop and destroy the adapter. */
-void lance_rest_adapter_close(LanceRestAdapter* adapter);
+LANCE_API void lance_rest_adapter_close(LanceRestAdapter* adapter);
 
 /**
  * Foreign client for the four managed table/version callbacks Python exposes.
@@ -9969,7 +9969,7 @@ typedef struct LanceNamespaceCustomClientSpec {
     const char* namespace_id;
 } LanceNamespaceCustomClientSpec;
 
-LanceNamespace* lance_namespace_custom_new(
+LANCE_NODISCARD LANCE_API LanceNamespace* lance_namespace_custom_new(
     const LanceNamespaceCustomClientSpec* spec
 );
 
@@ -10011,7 +10011,7 @@ typedef struct LanceNamespaceCustomClientDispatchSpec {
     const char* namespace_id;
 } LanceNamespaceCustomClientDispatchSpec;
 
-LanceNamespace* lance_namespace_custom_dispatch_new(
+LANCE_NODISCARD LANCE_API LanceNamespace* lance_namespace_custom_dispatch_new(
     const LanceNamespaceCustomClientDispatchSpec* spec
 );
 /* ─── Raw Lance-file session ──────────────────────────────────────────────── */
@@ -10138,23 +10138,23 @@ typedef struct LanceObjectStoreInfo {
  * existing object-store registry is shared. `scheduler_config` may be NULL,
  * which uses native SchedulerConfig::max_bandwidth for the resolved store.
  */
-LanceFileSession* lance_file_session_new(
+LANCE_NODISCARD LANCE_API LanceFileSession* lance_file_session_new(
     const char* base_uri,
     const LanceStorageOptionsAccessor* storage_options,
     const LanceSession* session,
     const LanceSchedulerConfig* scheduler_config
 );
-void lance_file_session_close(LanceFileSession* session);
+LANCE_API void lance_file_session_close(LanceFileSession* session);
 
 /** Release the returned string with lance_free_string(). */
-const char* lance_file_session_base_path(const LanceFileSession* session);
+LANCE_NODISCARD LANCE_API const char* lance_file_session_base_path(const LanceFileSession* session);
 
-LanceFileReader* lance_file_session_open_reader(
+LANCE_NODISCARD LANCE_API LanceFileReader* lance_file_session_open_reader(
     const LanceFileSession* session,
     const char* relative_path,
     const LanceFileReaderOptions* options
 );
-LanceFileWriter* lance_file_session_open_writer(
+LANCE_NODISCARD LANCE_API LanceFileWriter* lance_file_session_open_writer(
     const LanceFileSession* session,
     const char* relative_path,
     const struct ArrowSchema* schema,
@@ -10172,7 +10172,7 @@ LanceFileWriter* lance_file_session_open_writer(
  * Callers choose unique data-file names and blob IDs. No collision check or
  * ID allocation is added by the binding. Returns NULL on error.
  */
-LancePackedBlobWriter* lance_file_session_open_packed_blob_writer(
+LANCE_NODISCARD LANCE_API LancePackedBlobWriter* lance_file_session_open_packed_blob_writer(
     const LanceFileSession* session,
     const char* data_file_path,
     uint32_t blob_id
@@ -10184,7 +10184,7 @@ LancePackedBlobWriter* lance_file_session_open_packed_blob_writer(
  * Path derivation and ownership match the packed constructor. Returns NULL on
  * error.
  */
-LanceDedicatedBlobWriter* lance_file_session_open_dedicated_blob_writer(
+LANCE_NODISCARD LANCE_API LanceDedicatedBlobWriter* lance_file_session_open_dedicated_blob_writer(
     const LanceFileSession* session,
     const char* data_file_path,
     uint32_t blob_id
@@ -10196,7 +10196,7 @@ LanceDedicatedBlobWriter* lance_file_session_open_dedicated_blob_writer(
  * Returns 0 and sets the thread-local error for a NULL, finished, or otherwise
  * invalid handle. Blob ID zero is reserved, so 0 is never a success value.
  */
-uint32_t lance_packed_blob_writer_blob_id(
+LANCE_API uint32_t lance_packed_blob_writer_blob_id(
     const LancePackedBlobWriter* writer
 );
 
@@ -10205,7 +10205,7 @@ uint32_t lance_packed_blob_writer_blob_id(
  *
  * Release the returned string with lance_free_string(). Returns NULL on error.
  */
-const char* lance_packed_blob_writer_path(
+LANCE_NODISCARD LANCE_API const char* lance_packed_blob_writer_path(
     const LancePackedBlobWriter* writer
 );
 
@@ -10221,7 +10221,7 @@ const char* lance_packed_blob_writer_path(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_packed_blob_writer_write_blob(
+LANCE_API int32_t lance_packed_blob_writer_write_blob(
     LancePackedBlobWriter* writer,
     const uint8_t* data,
     size_t len
@@ -10241,7 +10241,7 @@ int32_t lance_packed_blob_writer_write_blob(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_packed_blob_writer_write_blobs(
+LANCE_API int32_t lance_packed_blob_writer_write_blobs(
     LancePackedBlobWriter* writer,
     struct ArrowArray* payloads,
     const struct ArrowSchema* schema
@@ -10261,7 +10261,7 @@ int32_t lance_packed_blob_writer_write_blobs(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_packed_blob_writer_finish_array(
+LANCE_API int32_t lance_packed_blob_writer_finish_array(
     LancePackedBlobWriter* writer,
     const char* field_name,
     struct ArrowArray* out_array,
@@ -10272,7 +10272,7 @@ int32_t lance_packed_blob_writer_finish_array(
  * Free a packed writer allocation. NULL is a no-op. Close never calls native
  * finish; an unfinished writer is dropped with native cleanup semantics.
  */
-void lance_packed_blob_writer_close(
+LANCE_API void lance_packed_blob_writer_close(
     LancePackedBlobWriter* writer
 );
 
@@ -10282,7 +10282,7 @@ void lance_packed_blob_writer_close(
  * Returns 0 and sets the thread-local error for a NULL, finished, or otherwise
  * invalid handle.
  */
-uint32_t lance_dedicated_blob_writer_blob_id(
+LANCE_API uint32_t lance_dedicated_blob_writer_blob_id(
     const LanceDedicatedBlobWriter* writer
 );
 
@@ -10291,7 +10291,7 @@ uint32_t lance_dedicated_blob_writer_blob_id(
  *
  * Release the returned string with lance_free_string(). Returns NULL on error.
  */
-const char* lance_dedicated_blob_writer_path(
+LANCE_NODISCARD LANCE_API const char* lance_dedicated_blob_writer_path(
     const LanceDedicatedBlobWriter* writer
 );
 
@@ -10303,7 +10303,7 @@ const char* lance_dedicated_blob_writer_path(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dedicated_blob_writer_write(
+LANCE_API int32_t lance_dedicated_blob_writer_write(
     LanceDedicatedBlobWriter* writer,
     const uint8_t* data,
     size_t len
@@ -10318,7 +10318,7 @@ int32_t lance_dedicated_blob_writer_write(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_dedicated_blob_writer_finish_array(
+LANCE_API int32_t lance_dedicated_blob_writer_finish_array(
     LanceDedicatedBlobWriter* writer,
     const char* field_name,
     struct ArrowArray* out_array,
@@ -10329,34 +10329,34 @@ int32_t lance_dedicated_blob_writer_finish_array(
  * Free a dedicated writer allocation. NULL is a no-op. Close never calls
  * native finish.
  */
-void lance_dedicated_blob_writer_close(
+LANCE_API void lance_dedicated_blob_writer_close(
     LanceDedicatedBlobWriter* writer
 );
 
-int32_t lance_file_session_contains(
+LANCE_API int32_t lance_file_session_contains(
     const LanceFileSession* session,
     const char* relative_path,
     int32_t* out_exists
 );
-LancePathList* lance_file_session_list(
+LANCE_NODISCARD LANCE_API LancePathList* lance_file_session_list(
     const LanceFileSession* session,
     const char* relative_path
 );
-LanceDelimitedList* lance_file_session_list_with_delimiter(
+LANCE_NODISCARD LANCE_API LanceDelimitedList* lance_file_session_list_with_delimiter(
     const LanceFileSession* session,
     const char* relative_path
 );
-LanceByteBuffer* lance_file_session_read_range(
+LANCE_NODISCARD LANCE_API LanceByteBuffer* lance_file_session_read_range(
     const LanceFileSession* session,
     const char* relative_path,
     uint64_t offset,
     uint64_t length
 );
-int32_t lance_file_session_delete_file(
+LANCE_API int32_t lance_file_session_delete_file(
     const LanceFileSession* session,
     const char* relative_path
 );
-int32_t lance_file_session_upload_file(
+LANCE_API int32_t lance_file_session_upload_file(
     const LanceFileSession* session,
     const char* local_path,
     const char* relative_remote_path
@@ -10365,24 +10365,24 @@ int32_t lance_file_session_upload_file(
  * Download through the native local writer. It publishes the destination only
  * after the source stream completes, including when both paths alias one file.
  */
-int32_t lance_file_session_download_file(
+LANCE_API int32_t lance_file_session_download_file(
     const LanceFileSession* session,
     const char* relative_remote_path,
     const char* local_path
 );
-int32_t lance_file_session_get_scheduler_stats(
+LANCE_API int32_t lance_file_session_get_scheduler_stats(
     const LanceFileSession* session,
     LanceScanStats* out_stats
 );
-int32_t lance_file_session_get_registry_stats(
+LANCE_API int32_t lance_file_session_get_registry_stats(
     const LanceFileSession* session,
     LanceObjectStoreRegistryStats* out_stats
 );
-int32_t lance_file_session_get_store_info(
+LANCE_API int32_t lance_file_session_get_store_info(
     const LanceFileSession* session,
     LanceObjectStoreInfo* out_info
 );
-int32_t lance_file_session_get_store_io_stats(
+LANCE_API int32_t lance_file_session_get_store_io_stats(
     const LanceFileSession* session,
     LanceObjectStoreIoStats* out_stats
 );
@@ -10396,7 +10396,7 @@ int32_t lance_file_session_get_store_io_stats(
  * overlap a call on the reader.
  */
 
-LanceFileReader* lance_file_reader_open(
+LANCE_NODISCARD LANCE_API LanceFileReader* lance_file_reader_open(
     const char* uri_or_path,
     const LanceStorageOptionsAccessor* storage_options,
     const LanceFileReaderOptions* options,
@@ -10404,19 +10404,19 @@ LanceFileReader* lance_file_reader_open(
     const LanceSchedulerConfig* scheduler_config
 );
 
-int32_t lance_file_reader_num_rows(
+LANCE_API int32_t lance_file_reader_num_rows(
     const LanceFileReader* reader,
     uint64_t* out_rows
 );
-int32_t lance_file_reader_get_metadata(
+LANCE_API int32_t lance_file_reader_get_metadata(
     const LanceFileReader* reader,
     LanceFileMetadata** out_metadata
 );
-int32_t lance_file_reader_get_statistics(
+LANCE_API int32_t lance_file_reader_get_statistics(
     const LanceFileReader* reader,
     LanceFileStatistics** out_statistics
 );
-int32_t lance_file_reader_read_global_buffer(
+LANCE_API int32_t lance_file_reader_read_global_buffer(
     const LanceFileReader* reader,
     uint32_t index,
     LanceByteBuffer** out_bytes
@@ -10428,7 +10428,7 @@ int32_t lance_file_reader_read_global_buffer(
  * value is rejected with LANCE_ERR_INVALID_ARGUMENT and does not select a
  * default. On error, `out` is unchanged.
  */
-int32_t lance_file_reader_read_all(
+LANCE_API int32_t lance_file_reader_read_all(
     const LanceFileReader* reader,
     uint32_t batch_size,
     uint32_t batch_readahead,
@@ -10442,7 +10442,7 @@ int32_t lance_file_reader_read_all(
  * default. The range is validated before the stream options. On error, `out`
  * is unchanged.
  */
-int32_t lance_file_reader_read_range(
+LANCE_API int32_t lance_file_reader_read_range(
     const LanceFileReader* reader,
     uint64_t offset,
     uint64_t num_rows,
@@ -10458,7 +10458,7 @@ int32_t lance_file_reader_read_range(
  * with LANCE_ERR_INVALID_ARGUMENT and does not select a default. On error,
  * `out` is unchanged.
  */
-int32_t lance_file_reader_read_indices(
+LANCE_API int32_t lance_file_reader_read_indices(
     const LanceFileReader* reader,
     const uint32_t* indices,
     size_t count,
@@ -10466,11 +10466,11 @@ int32_t lance_file_reader_read_indices(
     uint32_t batch_readahead,
     struct ArrowArrayStream* out
 );
-int32_t lance_file_reader_get_io_stats(
+LANCE_API int32_t lance_file_reader_get_io_stats(
     const LanceFileReader* reader,
     LanceScanStats* out_stats
 );
-void lance_file_reader_close(LanceFileReader* reader);
+LANCE_API void lance_file_reader_close(LanceFileReader* reader);
 /* ─── Raw Lance-file metadata snapshots ──────────────────────────────────── */
 
 typedef enum {
@@ -10533,37 +10533,37 @@ typedef struct LanceColumnMetadata {
     LanceEncodingDescriptor encoding;
 } LanceColumnMetadata;
 
-int32_t lance_file_metadata_get_info(
+LANCE_API int32_t lance_file_metadata_get_info(
     const LanceFileMetadata* metadata,
     LanceFileMetadataInfo* out_info
 );
-int32_t lance_file_metadata_get_schema(
+LANCE_API int32_t lance_file_metadata_get_schema(
     const LanceFileMetadata* metadata,
     struct ArrowSchema* out_schema
 );
-int32_t lance_file_metadata_get_global_buffers(
+LANCE_API int32_t lance_file_metadata_get_global_buffers(
     const LanceFileMetadata* metadata,
     const LanceBufferDescriptor** out_buffers,
     size_t* out_count
 );
-int32_t lance_file_metadata_get_columns(
+LANCE_API int32_t lance_file_metadata_get_columns(
     const LanceFileMetadata* metadata,
     const LanceColumnMetadata** out_columns,
     size_t* out_count
 );
-void lance_file_metadata_close(LanceFileMetadata* metadata);
+LANCE_API void lance_file_metadata_close(LanceFileMetadata* metadata);
 
 typedef struct LanceColumnStatistics {
     size_t num_pages;
     uint64_t size_bytes;
 } LanceColumnStatistics;
 
-int32_t lance_file_statistics_get_columns(
+LANCE_API int32_t lance_file_statistics_get_columns(
     const LanceFileStatistics* statistics,
     const LanceColumnStatistics** out_columns,
     size_t* out_count
 );
-void lance_file_statistics_close(LanceFileStatistics* statistics);
+LANCE_API void lance_file_statistics_close(LanceFileStatistics* statistics);
 /* ─── Raw Lance-file writer ───────────────────────────────────────────────── */
 
 /*
@@ -10574,7 +10574,7 @@ void lance_file_statistics_close(LanceFileStatistics* statistics);
  * returns. Different writers are independent.
  */
 
-LanceFileWriter* lance_file_writer_open(
+LANCE_NODISCARD LANCE_API LanceFileWriter* lance_file_writer_open(
     const char* uri_or_path,
     const struct ArrowSchema* schema,
     const LanceFileWriterOptions* options,
@@ -10583,16 +10583,16 @@ LanceFileWriter* lance_file_writer_open(
 );
 
 /** Write one borrowed LanceBatch. The writer may clone its Arrow arrays. */
-int32_t lance_file_writer_write_batch(
+LANCE_API int32_t lance_file_writer_write_batch(
     LanceFileWriter* writer,
     const LanceBatch* batch
 );
-int32_t lance_file_writer_add_schema_metadata(
+LANCE_API int32_t lance_file_writer_add_schema_metadata(
     LanceFileWriter* writer,
     const char* key,
     const char* value
 );
-int32_t lance_file_writer_add_global_buffer(
+LANCE_API int32_t lance_file_writer_add_global_buffer(
     LanceFileWriter* writer,
     const uint8_t* data,
     size_t len,
@@ -10606,7 +10606,7 @@ int32_t lance_file_writer_add_global_buffer(
  * writes after finish or abort, and failures retain the selected core's
  * behavior; this binding does not add terminal-state rejection.
  */
-int32_t lance_file_writer_finish(
+LANCE_API int32_t lance_file_writer_finish(
     LanceFileWriter* writer,
     LanceFileWriteSummary* out_summary
 );
@@ -10618,7 +10618,7 @@ int32_t lance_file_writer_finish(
  * native writer, which owns remaining object-writer cleanup. This call does not
  * implicitly destroy the allocation, and repeated calls are forwarded.
  */
-int32_t lance_file_writer_abort(LanceFileWriter* writer);
+LANCE_API int32_t lance_file_writer_abort(LanceFileWriter* writer);
 
 /**
  * Destroy the writer allocation.
@@ -10626,7 +10626,7 @@ int32_t lance_file_writer_abort(LanceFileWriter* writer);
  * Native drop performs object-writer cleanup. This is not a successful
  * finalization and does not replace an explicit fallible finish.
  */
-void lance_file_writer_close(LanceFileWriter* writer);
+LANCE_API void lance_file_writer_close(LanceFileWriter* writer);
 /* ─── Native diagnostics and FTS tokenization ─────────────────────────────── */
 
 /**
@@ -10660,22 +10660,22 @@ typedef struct LanceFtsTokenView {
  * `collect_query_tokens`; there is no binding-side tokenizer or position
  * algorithm.
  */
-LanceFtsTokenList* lance_fts_tokenize(
+LANCE_NODISCARD LANCE_API LanceFtsTokenList* lance_fts_tokenize(
     const char* text, size_t text_len, const char* params_json);
 
 /** Number of tokens in `tokens`. Returns 0 and sets an error for NULL. */
-uint64_t lance_fts_token_list_count(const LanceFtsTokenList* tokens);
+LANCE_API uint64_t lance_fts_token_list_count(const LanceFtsTokenList* tokens);
 
 /**
  * Borrow token `index` into `out`. Returns 0 on success or -1 on a NULL
  * handle/out pointer or an out-of-range index. `out` is written only on
  * success. The view remains valid until the list is closed.
  */
-int32_t lance_fts_token_list_get(
+LANCE_API int32_t lance_fts_token_list_get(
     const LanceFtsTokenList* tokens, size_t index, LanceFtsTokenView* out);
 
 /** Close and free a token list. Safe to call with NULL. */
-void lance_fts_token_list_close(LanceFtsTokenList* tokens);
+LANCE_API void lance_fts_token_list_close(LanceFtsTokenList* tokens);
 
 /**
  * Return native `lance_core::utils::cpu::simd_info()` as a JSON object with
@@ -10683,20 +10683,20 @@ void lance_fts_token_list_close(LanceFtsTokenList* tokens);
  * (native order). No C-side detection or cache is involved. The returned
  * string is owned by the caller; free it with `lance_free_string()`.
  */
-const char* lance_simd_info_json(void);
+LANCE_NODISCARD LANCE_API const char* lance_simd_info_json(void);
 
 /**
  * Native process-wide object-store IOPS counter. This reads the same native
  * counter as `lance::io::iops_counter()` and has no reset semantics.
  */
-uint64_t lance_process_iops_counter(void);
+LANCE_API uint64_t lance_process_iops_counter(void);
 
 /**
  * Native process-wide object-store bytes-read counter. This reads the same
  * native counter as `lance::io::bytes_read_counter()` and has no reset
  * semantics.
  */
-uint64_t lance_process_bytes_read_counter(void);
+LANCE_API uint64_t lance_process_bytes_read_counter(void);
 
 /**
  * Snapshot the dataset's native object-store I/O counters without resetting.
@@ -10707,7 +10707,7 @@ uint64_t lance_process_bytes_read_counter(void);
  * success or -1 on a NULL handle/out pointer or native failure. `out_stats`
  * is written only on success.
  */
-int32_t lance_dataset_io_stats_snapshot(
+LANCE_API int32_t lance_dataset_io_stats_snapshot(
     const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
 
 /**
@@ -10716,33 +10716,33 @@ int32_t lance_dataset_io_stats_snapshot(
  * delta baseline. Returns 0 on success or -1 on a NULL handle/out pointer or
  * native failure. `out_stats` is written only on success.
  */
-int32_t lance_dataset_io_stats_incremental(
+LANCE_API int32_t lance_dataset_io_stats_incremental(
     const LanceDataset* dataset, LanceObjectStoreIoStats* out_stats);
 /* ─── Owned raw-file path and byte snapshots ──────────────────────────────── */
 
-uint64_t lance_path_list_count(const LancePathList* list);
-const char* lance_path_list_at(const LancePathList* list, size_t index);
-void lance_path_list_close(LancePathList* list);
+LANCE_API uint64_t lance_path_list_count(const LancePathList* list);
+LANCE_NODISCARD LANCE_API const char* lance_path_list_at(const LancePathList* list, size_t index);
+LANCE_API void lance_path_list_close(LancePathList* list);
 
-uint64_t lance_delimited_list_common_prefix_count(
+LANCE_API uint64_t lance_delimited_list_common_prefix_count(
     const LanceDelimitedList* list
 );
-const char* lance_delimited_list_common_prefix_at(
+LANCE_NODISCARD LANCE_API const char* lance_delimited_list_common_prefix_at(
     const LanceDelimitedList* list,
     size_t index
 );
-uint64_t lance_delimited_list_object_count(
+LANCE_API uint64_t lance_delimited_list_object_count(
     const LanceDelimitedList* list
 );
-const char* lance_delimited_list_object_at(
+LANCE_NODISCARD LANCE_API const char* lance_delimited_list_object_at(
     const LanceDelimitedList* list,
     size_t index
 );
-void lance_delimited_list_close(LanceDelimitedList* list);
+LANCE_API void lance_delimited_list_close(LanceDelimitedList* list);
 
-const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
-size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
-void lance_byte_buffer_close(LanceByteBuffer* buffer);
+LANCE_NODISCARD LANCE_API const uint8_t* lance_byte_buffer_data(const LanceByteBuffer* buffer);
+LANCE_API size_t lance_byte_buffer_len(const LanceByteBuffer* buffer);
+LANCE_API void lance_byte_buffer_close(LanceByteBuffer* buffer);
 /* ─── Native dataset SQL ──────────────────────────────────────────────────── */
 
 /**
@@ -10753,7 +10753,7 @@ void lance_byte_buffer_close(LanceByteBuffer* buffer);
  *
  * Returns NULL on error, including a NULL dataset or NULL SQL pointer.
  */
-LanceSqlQueryBuilder* lance_dataset_sql_builder_new(
+LANCE_NODISCARD LANCE_API LanceSqlQueryBuilder* lance_dataset_sql_builder_new(
     const LanceDataset* dataset, const char* sql);
 
 /**
@@ -10761,14 +10761,14 @@ LanceSqlQueryBuilder* lance_dataset_sql_builder_new(
  * `lance_sql_query_builder_build` consumes the allocation, so a consumed
  * builder must not be closed.
  */
-void lance_sql_query_builder_close(LanceSqlQueryBuilder* builder);
+LANCE_API void lance_sql_query_builder_close(LanceSqlQueryBuilder* builder);
 
 /**
  * Close a SQL query handle. NULL-safe. Close exactly once.
  * `lance_sql_query_into_stream` consumes the allocation, so a consumed
  * query must not be closed.
  */
-void lance_sql_query_close(LanceSqlQuery* query);
+LANCE_API void lance_sql_query_close(LanceSqlQuery* query);
 
 /**
  * Name the table in the SELECT statement. The string is copied. An empty
@@ -10777,7 +10777,7 @@ void lance_sql_query_close(LanceSqlQuery* query);
  * Returns 0 on success, -1 on error. A NULL name is rejected and the builder
  * keeps its prior table name.
  */
-int32_t lance_sql_query_builder_set_table_name(
+LANCE_API int32_t lance_sql_query_builder_set_table_name(
     LanceSqlQueryBuilder* builder, const char* table_name);
 
 /**
@@ -10786,7 +10786,7 @@ int32_t lance_sql_query_builder_set_table_name(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_builder_set_with_row_id(
+LANCE_API int32_t lance_sql_query_builder_set_with_row_id(
     LanceSqlQueryBuilder* builder, bool enabled);
 
 /**
@@ -10796,7 +10796,7 @@ int32_t lance_sql_query_builder_set_with_row_id(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_builder_set_with_row_addr(
+LANCE_API int32_t lance_sql_query_builder_set_with_row_addr(
     LanceSqlQueryBuilder* builder, bool enabled);
 
 /**
@@ -10807,7 +10807,7 @@ int32_t lance_sql_query_builder_set_with_row_addr(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_builder_set_blob_handling(
+LANCE_API int32_t lance_sql_query_builder_set_blob_handling(
     LanceSqlQueryBuilder* builder, LanceBlobHandling handling);
 
 /**
@@ -10818,7 +10818,7 @@ int32_t lance_sql_query_builder_set_blob_handling(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_builder_set_batch_size(
+LANCE_API int32_t lance_sql_query_builder_set_batch_size(
     LanceSqlQueryBuilder* builder, uint64_t batch_size);
 
 /**
@@ -10828,7 +10828,7 @@ int32_t lance_sql_query_builder_set_batch_size(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_builder_set_batch_size_bytes(
+LANCE_API int32_t lance_sql_query_builder_set_batch_size_bytes(
     LanceSqlQueryBuilder* builder, uint64_t batch_size_bytes);
 
 /**
@@ -10843,7 +10843,7 @@ int32_t lance_sql_query_builder_set_batch_size_bytes(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_builder_build(
+LANCE_API int32_t lance_sql_query_builder_build(
     LanceSqlQueryBuilder* builder, LanceSqlQuery** out_query);
 
 /**
@@ -10860,7 +10860,7 @@ int32_t lance_sql_query_builder_build(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_sql_query_into_stream(
+LANCE_API int32_t lance_sql_query_into_stream(
     LanceSqlQuery* query, struct ArrowArrayStream* out_stream);
 /* ─── Native dataset delta ────────────────────────────────────────────────── */
 
@@ -10884,7 +10884,7 @@ typedef struct LanceDeltaTimestamp {
  *
  * Returns NULL on error, including a NULL dataset pointer.
  */
-LanceDatasetDeltaBuilder* lance_dataset_delta_builder_new(
+LANCE_NODISCARD LANCE_API LanceDatasetDeltaBuilder* lance_dataset_delta_builder_new(
     const LanceDataset* dataset);
 
 /**
@@ -10892,12 +10892,12 @@ LanceDatasetDeltaBuilder* lance_dataset_delta_builder_new(
  * `lance_dataset_delta_builder_build` consumes the allocation, so a consumed
  * builder must not be closed.
  */
-void lance_dataset_delta_builder_close(LanceDatasetDeltaBuilder* builder);
+LANCE_API void lance_dataset_delta_builder_close(LanceDatasetDeltaBuilder* builder);
 
 /**
  * Close a delta handle. NULL-safe. Close exactly once.
  */
-void lance_dataset_delta_close(LanceDatasetDelta* delta);
+LANCE_API void lance_dataset_delta_close(LanceDatasetDelta* delta);
 
 /**
  * Compare against the named version. Native build rejects combining this
@@ -10906,7 +10906,7 @@ void lance_dataset_delta_close(LanceDatasetDelta* delta);
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_builder_set_compared_against_version(
+LANCE_API int32_t lance_dataset_delta_builder_set_compared_against_version(
     LanceDatasetDeltaBuilder* builder, uint64_t version);
 
 /**
@@ -10915,7 +10915,7 @@ int32_t lance_dataset_delta_builder_set_compared_against_version(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_builder_set_begin_version(
+LANCE_API int32_t lance_dataset_delta_builder_set_begin_version(
     LanceDatasetDeltaBuilder* builder, uint64_t version);
 
 /**
@@ -10923,7 +10923,7 @@ int32_t lance_dataset_delta_builder_set_begin_version(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_builder_set_end_version(
+LANCE_API int32_t lance_dataset_delta_builder_set_end_version(
     LanceDatasetDeltaBuilder* builder, uint64_t version);
 
 /**
@@ -10934,7 +10934,7 @@ int32_t lance_dataset_delta_builder_set_end_version(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_builder_set_begin_timestamp(
+LANCE_API int32_t lance_dataset_delta_builder_set_begin_timestamp(
     LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
 
 /**
@@ -10943,7 +10943,7 @@ int32_t lance_dataset_delta_builder_set_begin_timestamp(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_builder_set_end_timestamp(
+LANCE_API int32_t lance_dataset_delta_builder_set_end_timestamp(
     LanceDatasetDeltaBuilder* builder, const LanceDeltaTimestamp* timestamp);
 
 /**
@@ -10958,7 +10958,7 @@ int32_t lance_dataset_delta_builder_set_end_timestamp(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_builder_build(
+LANCE_API int32_t lance_dataset_delta_builder_build(
     LanceDatasetDeltaBuilder* builder, LanceDatasetDelta** out_delta);
 
 /**
@@ -10972,7 +10972,7 @@ int32_t lance_dataset_delta_builder_build(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_list_transactions(
+LANCE_API int32_t lance_dataset_delta_list_transactions(
     const LanceDatasetDelta* delta,
     LanceTransaction*** out_transactions,
     size_t* out_count);
@@ -10983,7 +10983,7 @@ int32_t lance_dataset_delta_list_transactions(
  * and zero-length arrays are no-ops. Call exactly once with the exact
  * pointer and count returned by `list_transactions`.
  */
-void lance_transaction_array_free(
+LANCE_API void lance_transaction_array_free(
     LanceTransaction** transactions, size_t count);
 
 /**
@@ -10998,7 +10998,7 @@ void lance_transaction_array_free(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_get_inserted_rows(
+LANCE_API int32_t lance_dataset_delta_get_inserted_rows(
     const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
 
 /**
@@ -11007,7 +11007,7 @@ int32_t lance_dataset_delta_get_inserted_rows(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_get_updated_rows(
+LANCE_API int32_t lance_dataset_delta_get_updated_rows(
     const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
 
 /**
@@ -11016,7 +11016,7 @@ int32_t lance_dataset_delta_get_updated_rows(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_get_upserted_rows(
+LANCE_API int32_t lance_dataset_delta_get_upserted_rows(
     const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
 
 /**
@@ -11028,7 +11028,7 @@ int32_t lance_dataset_delta_get_upserted_rows(
  *
  * Returns 0 on success, -1 on error.
  */
-int32_t lance_dataset_delta_get_deleted_row_ids(
+LANCE_API int32_t lance_dataset_delta_get_deleted_row_ids(
     const LanceDatasetDelta* delta, struct ArrowArrayStream* out_stream);
 /* ─── MemWAL / LSM public workflow ────────────────────────────────────────── */
 
@@ -11232,7 +11232,7 @@ typedef struct LanceMemWalPlan LanceMemWalPlan;
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_mem_wal_initialize(
+LANCE_API int32_t lance_mem_wal_initialize(
     LanceDataset* dataset,
     LanceMemWalShardingMode mode,
     const char* column,
@@ -11250,13 +11250,13 @@ int32_t lance_mem_wal_initialize(
  * On success with a value, the caller owns `*out` and frees it with
  * lance_mem_wal_index_details_free().
  */
-int32_t lance_mem_wal_index_details(
+LANCE_API int32_t lance_mem_wal_index_details(
     LanceDataset* dataset,
     LanceMemWalIndexDetails** out
 );
 
 /** Free an index-details handle. Safe to call with NULL. */
-void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
+LANCE_API void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
 
 /**
  * Borrow the MemWAL directory identifier recorded in the index details.
@@ -11264,22 +11264,22 @@ void lance_mem_wal_index_details_free(LanceMemWalIndexDetails* details);
  * An empty string denotes the legacy `_mem_wal` directory. The string remains
  * valid until the details handle is freed.
  */
-const char* lance_mem_wal_index_details_dir_id(
+LANCE_NODISCARD LANCE_API const char* lance_mem_wal_index_details_dir_id(
     const LanceMemWalIndexDetails* details
 );
 
 /** Number of shards recorded for the MemWAL index. */
-uint32_t lance_mem_wal_index_details_num_shards(
+LANCE_API uint32_t lance_mem_wal_index_details_num_shards(
     const LanceMemWalIndexDetails* details
 );
 
 /** Whether the index maintains every dataset index: 1 or 0. */
-int32_t lance_mem_wal_index_details_maintain_all_indexes(
+LANCE_API int32_t lance_mem_wal_index_details_maintain_all_indexes(
     const LanceMemWalIndexDetails* details
 );
 
 /** Count of explicitly maintained index names. */
-size_t lance_mem_wal_index_details_maintained_index_count(
+LANCE_API size_t lance_mem_wal_index_details_maintained_index_count(
     const LanceMemWalIndexDetails* details
 );
 
@@ -11289,14 +11289,14 @@ size_t lance_mem_wal_index_details_maintained_index_count(
  * The name remains valid until the details handle is freed. Returns -1 on a
  * NULL handle or an out-of-range index.
  */
-int32_t lance_mem_wal_index_details_maintained_index_at(
+LANCE_API int32_t lance_mem_wal_index_details_maintained_index_at(
     const LanceMemWalIndexDetails* details,
     size_t index,
     const char** out_name
 );
 
 /** Count of sharding specs recorded for the index. */
-size_t lance_mem_wal_index_details_sharding_spec_count(
+LANCE_API size_t lance_mem_wal_index_details_sharding_spec_count(
     const LanceMemWalIndexDetails* details
 );
 
@@ -11304,14 +11304,14 @@ size_t lance_mem_wal_index_details_sharding_spec_count(
  * Clone one sharding spec. The caller owns `*out_spec` and frees it with
  * lance_mem_wal_sharding_spec_free().
  */
-int32_t lance_mem_wal_index_details_sharding_spec_at(
+LANCE_API int32_t lance_mem_wal_index_details_sharding_spec_at(
     const LanceMemWalIndexDetails* details,
     size_t index,
     LanceMemWalShardingSpec** out_spec
 );
 
 /** Count of recorded writer-configuration defaults. */
-size_t lance_mem_wal_index_details_writer_config_default_count(
+LANCE_API size_t lance_mem_wal_index_details_writer_config_default_count(
     const LanceMemWalIndexDetails* details
 );
 
@@ -11321,7 +11321,7 @@ size_t lance_mem_wal_index_details_writer_config_default_count(
  * Entries iterate in lexicographic key order. Both strings remain valid until
  * the details handle is freed.
  */
-int32_t lance_mem_wal_index_details_writer_config_default_at(
+LANCE_API int32_t lance_mem_wal_index_details_writer_config_default_at(
     const LanceMemWalIndexDetails* details,
     size_t index,
     const char** out_key,
@@ -11337,7 +11337,7 @@ int32_t lance_mem_wal_index_details_writer_config_default_at(
  * Parameters follow map last-write-wins. `source_ids` is required to be
  * non-NULL when `num_source_ids > 0`.
  */
-int32_t lance_mem_wal_sharding_field_new(
+LANCE_API int32_t lance_mem_wal_sharding_field_new(
     const char* field_id,
     const int32_t* source_ids,
     size_t num_source_ids,
@@ -11351,16 +11351,16 @@ int32_t lance_mem_wal_sharding_field_new(
 );
 
 /** Clone a sharding field. The caller owns the result. */
-int32_t lance_mem_wal_sharding_field_clone(
+LANCE_API int32_t lance_mem_wal_sharding_field_clone(
     const LanceMemWalShardingField* field,
     LanceMemWalShardingField** out
 );
 
 /** Free a sharding field handle. Safe to call with NULL. */
-void lance_mem_wal_sharding_field_free(LanceMemWalShardingField* field);
+LANCE_API void lance_mem_wal_sharding_field_free(LanceMemWalShardingField* field);
 
 /** Borrow the field id. */
-const char* lance_mem_wal_sharding_field_id(
+LANCE_NODISCARD LANCE_API const char* lance_mem_wal_sharding_field_id(
     const LanceMemWalShardingField* field
 );
 
@@ -11369,28 +11369,28 @@ const char* lance_mem_wal_sharding_field_id(
  * NULL when the count is zero. The pointer remains valid until the handle is
  * freed.
  */
-const int32_t* lance_mem_wal_sharding_field_source_ids(
+LANCE_NODISCARD LANCE_API const int32_t* lance_mem_wal_sharding_field_source_ids(
     const LanceMemWalShardingField* field,
     size_t* out_count
 );
 
 /** Borrow the transform name, or NULL when native holds None. */
-const char* lance_mem_wal_sharding_field_transform(
+LANCE_NODISCARD LANCE_API const char* lance_mem_wal_sharding_field_transform(
     const LanceMemWalShardingField* field
 );
 
 /** Borrow the transform expression, or NULL when native holds None. */
-const char* lance_mem_wal_sharding_field_expression(
+LANCE_NODISCARD LANCE_API const char* lance_mem_wal_sharding_field_expression(
     const LanceMemWalShardingField* field
 );
 
 /** Borrow the result type; never NULL for a valid handle (may be ""). */
-const char* lance_mem_wal_sharding_field_result_type(
+LANCE_NODISCARD LANCE_API const char* lance_mem_wal_sharding_field_result_type(
     const LanceMemWalShardingField* field
 );
 
 /** Count of transform parameters. */
-size_t lance_mem_wal_sharding_field_parameter_count(
+LANCE_API size_t lance_mem_wal_sharding_field_parameter_count(
     const LanceMemWalShardingField* field
 );
 
@@ -11398,7 +11398,7 @@ size_t lance_mem_wal_sharding_field_parameter_count(
  * Borrow one transform parameter in lexicographic key order. Both strings
  * remain valid until the field handle is freed.
  */
-int32_t lance_mem_wal_sharding_field_parameter_at(
+LANCE_API int32_t lance_mem_wal_sharding_field_parameter_at(
     const LanceMemWalShardingField* field,
     size_t index,
     const char** out_key,
@@ -11410,7 +11410,7 @@ int32_t lance_mem_wal_sharding_field_parameter_at(
  * keeps ownership of each input handle. `fields` is required to be non-NULL
  * when `num_fields > 0`.
  */
-int32_t lance_mem_wal_sharding_spec_new(
+LANCE_API int32_t lance_mem_wal_sharding_spec_new(
     uint32_t spec_id,
     const LanceMemWalShardingField* const* fields,
     size_t num_fields,
@@ -11418,21 +11418,21 @@ int32_t lance_mem_wal_sharding_spec_new(
 );
 
 /** Clone a sharding spec. The caller owns the result. */
-int32_t lance_mem_wal_sharding_spec_clone(
+LANCE_API int32_t lance_mem_wal_sharding_spec_clone(
     const LanceMemWalShardingSpec* spec,
     LanceMemWalShardingSpec** out
 );
 
 /** Free a sharding spec handle. Safe to call with NULL. */
-void lance_mem_wal_sharding_spec_free(LanceMemWalShardingSpec* spec);
+LANCE_API void lance_mem_wal_sharding_spec_free(LanceMemWalShardingSpec* spec);
 
 /** Native spec id. */
-uint32_t lance_mem_wal_sharding_spec_id(
+LANCE_API uint32_t lance_mem_wal_sharding_spec_id(
     const LanceMemWalShardingSpec* spec
 );
 
 /** Count of fields in the spec. */
-size_t lance_mem_wal_sharding_spec_field_count(
+LANCE_API size_t lance_mem_wal_sharding_spec_field_count(
     const LanceMemWalShardingSpec* spec
 );
 
@@ -11440,7 +11440,7 @@ size_t lance_mem_wal_sharding_spec_field_count(
  * Clone one field from the spec. The caller owns `*out_field` and frees it
  * with lance_mem_wal_sharding_field_free().
  */
-int32_t lance_mem_wal_sharding_spec_field_at(
+LANCE_API int32_t lance_mem_wal_sharding_spec_field_at(
     const LanceMemWalShardingSpec* spec,
     size_t index,
     LanceMemWalShardingField** out_field
@@ -11452,7 +11452,7 @@ int32_t lance_mem_wal_sharding_spec_field_at(
  * Adds a column named after the spec's `field_id` holding the native shard
  * value. The caller owns `*out_batch` and frees it with lance_batch_free().
  */
-int32_t lance_mem_wal_evaluate_sharding_spec(
+LANCE_API int32_t lance_mem_wal_evaluate_sharding_spec(
     LanceDataset* dataset,
     const LanceBatch* batch,
     const LanceMemWalShardingSpec* spec,
@@ -11465,7 +11465,7 @@ int32_t lance_mem_wal_evaluate_sharding_spec(
  * Uses the native schema value for field ids and source resolution instead of
  * the dataset schema. The caller owns `*out_batch`. A NULL schema is invalid.
  */
-int32_t lance_mem_wal_evaluate_sharding_spec_with_schema(
+LANCE_API int32_t lance_mem_wal_evaluate_sharding_spec_with_schema(
     const LanceBatch* batch,
     const LanceMemWalShardingSpec* spec,
     const LanceSchema* schema,
@@ -11478,43 +11478,43 @@ int32_t lance_mem_wal_evaluate_sharding_spec_with_schema(
  * `shard_id` is a canonical UUID string. Native starts with spec id 0 and
  * current generation 1, matching ShardSnapshot::new().
  */
-int32_t lance_mem_wal_shard_snapshot_new(
+LANCE_API int32_t lance_mem_wal_shard_snapshot_new(
     const char* shard_id,
     LanceMemWalShardSnapshot** out
 );
 
 /** Clone a shard snapshot. The clone is independently owned. */
-int32_t lance_mem_wal_shard_snapshot_clone(
+LANCE_API int32_t lance_mem_wal_shard_snapshot_clone(
     const LanceMemWalShardSnapshot* snapshot,
     LanceMemWalShardSnapshot** out
 );
 
 /** Free a shard snapshot. Safe to call with NULL. */
-void lance_mem_wal_shard_snapshot_free(LanceMemWalShardSnapshot* snapshot);
+LANCE_API void lance_mem_wal_shard_snapshot_free(LanceMemWalShardSnapshot* snapshot);
 
 /** Borrow the shard UUID string in canonical form. */
-const char* lance_mem_wal_shard_snapshot_shard_id(
+LANCE_NODISCARD LANCE_API const char* lance_mem_wal_shard_snapshot_shard_id(
     const LanceMemWalShardSnapshot* snapshot
 );
 
 /** Native spec id. */
-uint32_t lance_mem_wal_shard_snapshot_spec_id(
+LANCE_API uint32_t lance_mem_wal_shard_snapshot_spec_id(
     const LanceMemWalShardSnapshot* snapshot
 );
 
 /** Native current generation. */
-uint64_t lance_mem_wal_shard_snapshot_current_generation(
+LANCE_API uint64_t lance_mem_wal_shard_snapshot_current_generation(
     const LanceMemWalShardSnapshot* snapshot
 );
 
 /** Set the native spec id. */
-int32_t lance_mem_wal_shard_snapshot_with_spec_id(
+LANCE_API int32_t lance_mem_wal_shard_snapshot_with_spec_id(
     LanceMemWalShardSnapshot* snapshot,
     uint32_t spec_id
 );
 
 /** Set the native current generation. */
-int32_t lance_mem_wal_shard_snapshot_with_current_generation(
+LANCE_API int32_t lance_mem_wal_shard_snapshot_with_current_generation(
     LanceMemWalShardSnapshot* snapshot,
     uint64_t generation
 );
@@ -11526,14 +11526,14 @@ int32_t lance_mem_wal_shard_snapshot_with_current_generation(
  * measurements are left unmeasured, matching a snapshot built from an external
  * path. The caller owns the string for the duration of the call.
  */
-int32_t lance_mem_wal_shard_snapshot_with_sstable(
+LANCE_API int32_t lance_mem_wal_shard_snapshot_with_sstable(
     LanceMemWalShardSnapshot* snapshot,
     uint64_t generation,
     const char* path
 );
 
 /** Count of referenced SSTables. */
-size_t lance_mem_wal_shard_snapshot_sstable_count(
+LANCE_API size_t lance_mem_wal_shard_snapshot_sstable_count(
     const LanceMemWalShardSnapshot* snapshot
 );
 
@@ -11541,7 +11541,7 @@ size_t lance_mem_wal_shard_snapshot_sstable_count(
  * Borrow one SSTable reference: writes its generation and a borrowed path that
  * remains valid until the snapshot is freed or mutated.
  */
-int32_t lance_mem_wal_shard_snapshot_sstable_at(
+LANCE_API int32_t lance_mem_wal_shard_snapshot_sstable_at(
     const LanceMemWalShardSnapshot* snapshot,
     size_t index,
     uint64_t* out_generation,
@@ -11553,7 +11553,7 @@ int32_t lance_mem_wal_shard_snapshot_sstable_at(
  *
  * The resulting value is the shared 16-byte UUID plus generation value type.
  */
-int32_t lance_mem_wal_compacted_sstable_new(
+LANCE_API int32_t lance_mem_wal_compacted_sstable_new(
     const char* shard_id,
     uint64_t generation,
     LanceCompactedSsTable* out
@@ -11567,7 +11567,7 @@ int32_t lance_mem_wal_compacted_sstable_new(
  * ShardWriterConfig::default(). `out` is written only on success; the caller
  * owns the writer and frees it with lance_shard_writer_free().
  */
-int32_t lance_shard_writer_open(
+LANCE_API int32_t lance_shard_writer_open(
     LanceDataset* dataset,
     const char* shard_id,
     const LanceShardWriterConfig* config,
@@ -11575,7 +11575,7 @@ int32_t lance_shard_writer_open(
 );
 
 /** Borrow the writer's canonical shard UUID string. */
-const char* lance_shard_writer_shard_id(
+LANCE_NODISCARD LANCE_API const char* lance_shard_writer_shard_id(
     const LanceShardWriter* writer
 );
 
@@ -11586,7 +11586,7 @@ const char* lance_shard_writer_shard_id(
  * error paths. An empty stream is rejected by native code. `out_result` is
  * optional; when non-NULL it is written only on success.
  */
-int32_t lance_shard_writer_put(
+LANCE_API int32_t lance_shard_writer_put(
     LanceShardWriter* writer,
     struct ArrowArrayStream* stream,
     LanceShardWriteResult* out_result
@@ -11597,7 +11597,7 @@ int32_t lance_shard_writer_put(
  *
  * Same stream ownership and result rules as lance_shard_writer_put().
  */
-int32_t lance_shard_writer_delete(
+LANCE_API int32_t lance_shard_writer_delete(
     LanceShardWriter* writer,
     struct ArrowArrayStream* stream,
     LanceShardWriteResult* out_result
@@ -11609,7 +11609,7 @@ int32_t lance_shard_writer_delete(
  * Available after a successful close because the native SharedWriteStats
  * owner is retained by the handle.
  */
-int32_t lance_shard_writer_stats(
+LANCE_API int32_t lance_shard_writer_stats(
     const LanceShardWriter* writer,
     LanceShardWriterStats* out
 );
@@ -11621,7 +11621,7 @@ int32_t lance_shard_writer_stats(
  * LANCE_ERR_INVALID_ARGUMENT "ShardWriter is already closed". Unsupported in
  * WAL-only writers, where native returns its own error.
  */
-int32_t lance_shard_writer_memtable_stats(
+LANCE_API int32_t lance_shard_writer_memtable_stats(
     const LanceShardWriter* writer,
     LanceShardMemTableStats* out
 );
@@ -11632,7 +11632,7 @@ int32_t lance_shard_writer_memtable_stats(
  * Returns 0 with `*out == NULL` when the shard has no manifest yet. On success
  * with a value, the caller owns `*out`.
  */
-int32_t lance_shard_writer_snapshot(
+LANCE_API int32_t lance_shard_writer_snapshot(
     const LanceShardWriter* writer,
     LanceMemWalShardSnapshot** out
 );
@@ -11644,7 +11644,7 @@ int32_t lance_shard_writer_snapshot(
  * latest state. The scanner retains the captured native owners after the
  * writer closes.
  */
-int32_t lance_shard_writer_lsm_scanner(
+LANCE_API int32_t lance_shard_writer_lsm_scanner(
     LanceShardWriter* writer,
     const LanceMemWalShardSnapshot* const* snapshots,
     size_t num_snapshots,
@@ -11659,20 +11659,20 @@ int32_t lance_shard_writer_lsm_scanner(
  * Pending WAL and MemTable failures surface from this call. `stats` remains
  * available afterwards; MemTable-only operations do not.
  */
-int32_t lance_shard_writer_close(LanceShardWriter* writer);
+LANCE_API int32_t lance_shard_writer_close(LanceShardWriter* writer);
 
 /**
  * Stop a live writer's native background tasks and free its allocation.
  * Waits for in-progress native work to settle. Close first for durability;
  * free requests native abort without a final flush. NULL-safe.
  */
-void lance_shard_writer_free(LanceShardWriter* writer);
+LANCE_API void lance_shard_writer_free(LanceShardWriter* writer);
 
 /**
  * Create an LSM scanner over a dataset and snapshots, without an active
  * MemTable. Primary-key columns come from the dataset schema.
  */
-int32_t lance_lsm_scanner_from_snapshots(
+LANCE_API int32_t lance_lsm_scanner_from_snapshots(
     LanceDataset* dataset,
     const LanceMemWalShardSnapshot* const* snapshots,
     size_t num_snapshots,
@@ -11684,14 +11684,14 @@ int32_t lance_lsm_scanner_from_snapshots(
  * native code as an empty projection; `columns` may be NULL only when
  * `num_columns == 0`. The scanner is updated only on success.
  */
-int32_t lance_lsm_scanner_project(
+LANCE_API int32_t lance_lsm_scanner_project(
     LanceLsmScanner* scanner,
     const char* const* columns,
     size_t num_columns
 );
 
 /** Set a native SQL filter expression. The scanner is updated only on success. */
-int32_t lance_lsm_scanner_filter(
+LANCE_API int32_t lance_lsm_scanner_filter(
     LanceLsmScanner* scanner,
     const char* filter
 );
@@ -11701,7 +11701,7 @@ int32_t lance_lsm_scanner_filter(
  * a present negative value is rejected. The scanner is updated only on
  * success.
  */
-int32_t lance_lsm_scanner_limit(
+LANCE_API int32_t lance_lsm_scanner_limit(
     LanceLsmScanner* scanner,
     int64_t limit,
     int32_t has_limit,
@@ -11710,13 +11710,13 @@ int32_t lance_lsm_scanner_limit(
 );
 
 /** Include the `_rowaddr` internal column. */
-int32_t lance_lsm_scanner_with_row_address(LanceLsmScanner* scanner);
+LANCE_API int32_t lance_lsm_scanner_with_row_address(LanceLsmScanner* scanner);
 
 /** Include the `_memtable_gen` internal column. */
-int32_t lance_lsm_scanner_with_memtable_gen(LanceLsmScanner* scanner);
+LANCE_API int32_t lance_lsm_scanner_with_memtable_gen(LanceLsmScanner* scanner);
 
 /** Schema produced by the scanner's native composition. */
-int32_t lance_lsm_scanner_schema(
+LANCE_API int32_t lance_lsm_scanner_schema(
     const LanceLsmScanner* scanner,
     struct ArrowSchema* out_schema
 );
@@ -11725,7 +11725,7 @@ int32_t lance_lsm_scanner_schema(
  * Execute the scan and return one batch. The caller owns `*out` and closes it
  * with lance_batch_free().
  */
-int32_t lance_lsm_scanner_to_batch(
+LANCE_API int32_t lance_lsm_scanner_to_batch(
     const LanceLsmScanner* scanner,
     LanceBatch** out
 );
@@ -11734,19 +11734,19 @@ int32_t lance_lsm_scanner_to_batch(
  * Execute the scan and export an Arrow stream. The scanner is not consumed and
  * its native owners remain alive independently of the scan result.
  */
-int32_t lance_lsm_scanner_to_arrow_stream(
+LANCE_API int32_t lance_lsm_scanner_to_arrow_stream(
     const LanceLsmScanner* scanner,
     struct ArrowArrayStream* out
 );
 
 /** Count matching rows without materializing them. */
-int32_t lance_lsm_scanner_count_rows(
+LANCE_API int32_t lance_lsm_scanner_count_rows(
     const LanceLsmScanner* scanner,
     uint64_t* out_count
 );
 
 /** Free an LSM scanner. Safe to call with NULL. */
-void lance_lsm_scanner_free(LanceLsmScanner* scanner);
+LANCE_API void lance_lsm_scanner_free(LanceLsmScanner* scanner);
 
 /**
  * Create a point-lookup planner.
@@ -11756,7 +11756,7 @@ void lance_lsm_scanner_free(LanceLsmScanner* scanner);
  * planner captures the snapshots and dataset schema. `out` is written only on
  * success.
  */
-int32_t lance_lsm_point_lookup_planner_new(
+LANCE_API int32_t lance_lsm_point_lookup_planner_new(
     LanceDataset* dataset,
     const LanceMemWalShardSnapshot* const* snapshots,
     size_t num_snapshots,
@@ -11774,7 +11774,7 @@ int32_t lance_lsm_point_lookup_planner_new(
  * exactly one Struct column carrying one field per primary-key column.
  * `columns` is read only when `has_columns != 0`. The caller owns `*out_plan`.
  */
-int32_t lance_lsm_point_lookup_planner_plan(
+LANCE_API int32_t lance_lsm_point_lookup_planner_plan(
     LanceLsmPointLookupPlanner* planner,
     const LanceBatch* pk_value,
     int32_t has_columns,
@@ -11784,7 +11784,7 @@ int32_t lance_lsm_point_lookup_planner_plan(
 );
 
 /** Free a point-lookup planner. Safe to call with NULL. */
-void lance_lsm_point_lookup_planner_free(
+LANCE_API void lance_lsm_point_lookup_planner_free(
     LanceLsmPointLookupPlanner* planner
 );
 
@@ -11795,7 +11795,7 @@ void lance_lsm_point_lookup_planner_free(
  * optional native SQL filter expression. `pk_columns` follows the same rule as
  * the point-lookup planner. Distance values are this ABI's stable mapping.
  */
-int32_t lance_lsm_vector_search_planner_new(
+LANCE_API int32_t lance_lsm_vector_search_planner_new(
     LanceDataset* dataset,
     const LanceMemWalShardSnapshot* const* snapshots,
     size_t num_snapshots,
@@ -11816,7 +11816,7 @@ int32_t lance_lsm_vector_search_planner_new(
  * `overfetch_factor` are validated by native code. `columns` is read only when
  * `has_columns != 0`. The caller owns `*out_plan`.
  */
-int32_t lance_lsm_vector_search_planner_plan(
+LANCE_API int32_t lance_lsm_vector_search_planner_plan(
     LanceLsmVectorSearchPlanner* planner,
     const float* query,
     size_t query_len,
@@ -11831,7 +11831,7 @@ int32_t lance_lsm_vector_search_planner_plan(
 );
 
 /** Free a vector-search planner. Safe to call with NULL. */
-void lance_lsm_vector_search_planner_free(
+LANCE_API void lance_lsm_vector_search_planner_free(
     LanceLsmVectorSearchPlanner* planner
 );
 
@@ -11839,7 +11839,7 @@ void lance_lsm_vector_search_planner_free(
  * Export the plan's output schema as Arrow. `out` is caller-owned and its
  * non-NULL release callback must be invoked exactly once.
  */
-int32_t lance_mem_wal_plan_schema(
+LANCE_API int32_t lance_mem_wal_plan_schema(
     const LanceMemWalPlan* plan,
     struct ArrowSchema* out
 );
@@ -11848,7 +11848,7 @@ int32_t lance_mem_wal_plan_schema(
  * Export the dataset schema captured by the planner as Arrow. `out` is
  * caller-owned.
  */
-int32_t lance_mem_wal_plan_dataset_schema(
+LANCE_API int32_t lance_mem_wal_plan_dataset_schema(
     const LanceMemWalPlan* plan,
     struct ArrowSchema* out
 );
@@ -11858,7 +11858,7 @@ int32_t lance_mem_wal_plan_dataset_schema(
  * string is NUL-terminated, owned by the caller, and must be freed with
  * lance_free_string(). Returns -1 on error.
  */
-int32_t lance_mem_wal_plan_explain(
+LANCE_API int32_t lance_mem_wal_plan_explain(
     const LanceMemWalPlan* plan,
     char** out
 );
@@ -11867,7 +11867,7 @@ int32_t lance_mem_wal_plan_explain(
  * Execute the plan and concatenate its batches into one. The caller owns
  * `*out` and frees it with lance_batch_free().
  */
-int32_t lance_mem_wal_plan_to_batch(
+LANCE_API int32_t lance_mem_wal_plan_to_batch(
     const LanceMemWalPlan* plan,
     LanceBatch** out
 );
@@ -11876,13 +11876,13 @@ int32_t lance_mem_wal_plan_to_batch(
  * Execute the plan and export an Arrow stream. Execution errors are reported
  * with the prefix "Plan execution failed: ". The plan remains valid.
  */
-int32_t lance_mem_wal_plan_to_arrow_stream(
+LANCE_API int32_t lance_mem_wal_plan_to_arrow_stream(
     const LanceMemWalPlan* plan,
     struct ArrowArrayStream* out
 );
 
 /** Free an execution plan. Safe to call with NULL. */
-void lance_mem_wal_plan_free(LanceMemWalPlan* plan);
+LANCE_API void lance_mem_wal_plan_free(LanceMemWalPlan* plan);
 
 /**
  * Merge-insert with atomic MemWAL SSTable compaction progress.
@@ -11892,7 +11892,7 @@ void lance_mem_wal_plan_free(LanceMemWalPlan* plan);
  * pass of a multi-pass compaction. `compacted_sstables` is required to be
  * non-NULL when `num_compacted_sstables > 0`.
  */
-int32_t lance_dataset_merge_insert_with_compaction(
+LANCE_API int32_t lance_dataset_merge_insert_with_compaction(
     LanceDataset* dataset,
     const char* const* on_columns,
     size_t num_on_columns,

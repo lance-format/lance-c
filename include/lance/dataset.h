@@ -11,6 +11,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "lance/attributes.h"
 #include "lance/arrow_abi.h"
 #include "lance/fwd.h"
 
@@ -44,7 +46,7 @@ extern "C" {
  * @param version       Version to open (0 = latest)
  * @return Dataset handle, or NULL on error
  */
-LanceDataset* lance_dataset_open(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_open(
     const char* uri,
     const char* const* storage_opts,
     uint64_t version
@@ -62,7 +64,7 @@ LanceDataset* lance_dataset_open(
  * @param session       Shared session; must not be NULL
  * @return Dataset handle, or NULL on error
  */
-LanceDataset* lance_dataset_open_with_session(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_open_with_session(
     const char* uri,
     const char* const* storage_opts,
     uint64_t version,
@@ -99,7 +101,7 @@ typedef struct LanceDatasetOpenOptions {
  *
  * @return Dataset handle, or NULL on error.
  */
-LanceDataset* lance_dataset_open_with_options(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_open_with_options(
     const char* uri,
     const LanceDatasetOpenOptions* options,
     const LanceSession* session
@@ -144,7 +146,7 @@ LanceDataset* lance_dataset_open_with_options(
  * @param base_store_params Per-base bindings, or NULL for native None
  * @return Dataset handle, or NULL on error
  */
-LanceDataset* lance_dataset_open_with_base_store_params(
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_open_with_base_store_params(
     const char* uri,
     const LanceDatasetOpenOptions* options,
     const LanceSession* session,
@@ -174,7 +176,7 @@ LanceDataset* lance_dataset_open_with_base_store_params(
  *                          be NULL
  * @return 0 on success, -1 on error
  */
-int32_t lance_dataset_open_with_commit_lock(
+LANCE_API int32_t lance_dataset_open_with_commit_lock(
     const char* uri,
     const LanceStorageOptionsAccessor* storage_accessor,
     uint64_t version,
@@ -184,7 +186,7 @@ int32_t lance_dataset_open_with_commit_lock(
 );
 
 /** Close and free a dataset handle. Safe to call with NULL. */
-void lance_dataset_close(LanceDataset* dataset);
+LANCE_API void lance_dataset_close(LanceDataset* dataset);
 
 /**
  * Clone a dataset handle as an independent in-memory snapshot.
@@ -202,7 +204,7 @@ void lance_dataset_close(LanceDataset* dataset);
  * @param dataset Source handle; must not be NULL
  * @return New independent handle, or NULL on error
  */
-LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
 
 
 /* ─── Dataset metadata (sync, in-memory) ─── */
@@ -211,7 +213,7 @@ LanceDataset* lance_dataset_clone_handle(const LanceDataset* dataset);
  * Return the version number of this dataset snapshot.
  * @return version on success, or 0 on error (check lance_last_error_code())
  */
-uint64_t lance_dataset_version(const LanceDataset* dataset);
+LANCE_API uint64_t lance_dataset_version(const LanceDataset* dataset);
 
 /**
  * Return the fully qualified URI of this dataset snapshot.
@@ -224,13 +226,13 @@ uint64_t lance_dataset_version(const LanceDataset* dataset);
  * Caller must free the returned string with `lance_free_string()`.
  * Returns NULL on error, including a NULL dataset handle.
  */
-const char* lance_dataset_uri(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API const char* lance_dataset_uri(const LanceDataset* dataset);
 
 /**
  * Return the number of rows. Returns 0 on error; an empty dataset also returns
  * 0, so check lance_last_error_code().
  */
-uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
+LANCE_API uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
 
 /**
  * Return the number of rows matching an optional SQL filter.
@@ -243,7 +245,7 @@ uint64_t lance_dataset_count_rows(const LanceDataset* dataset);
  * Returns 0 on error; an empty match also returns 0, so check
  * lance_last_error_code().
  */
-uint64_t lance_dataset_count_rows_filtered(
+LANCE_API uint64_t lance_dataset_count_rows_filtered(
     const LanceDataset* dataset,
     const char* filter
 );
@@ -252,7 +254,7 @@ uint64_t lance_dataset_count_rows_filtered(
  * Return the latest version ID (I/O), or 0 on error (check
  * lance_last_error_code()).
  */
-uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
+LANCE_API uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
 
 
 /* ─── Version history ─── */
@@ -263,13 +265,13 @@ uint64_t lance_dataset_latest_version(const LanceDataset* dataset);
  * copied and remains valid after the dataset is closed.
  * @return handle on success, or NULL on error
  */
-LanceVersion* lance_dataset_current_version(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceVersion* lance_dataset_current_version(const LanceDataset* dataset);
 
 /**
  * Version id from a current-version or history snapshot.
  * Returns 0 on error (check lance_last_error_code()).
  */
-uint64_t lance_version_id(const LanceVersion* version);
+LANCE_API uint64_t lance_version_id(const LanceVersion* version);
 
 /**
  * Commit timestamp as Unix epoch nanoseconds. Returns 0 on error (check
@@ -280,20 +282,20 @@ uint64_t lance_version_id(const LanceVersion* version);
  * LANCE_ERR_INVALID_ARGUMENT. Snapshot creation and millisecond reads retain
  * the native timestamp range.
  */
-int64_t lance_version_timestamp_ns(const LanceVersion* version);
+LANCE_API int64_t lance_version_timestamp_ns(const LanceVersion* version);
 
 /**
  * Number of version metadata entries. Native version metadata is the manifest
  * summary map; it is empty only when the native map is empty. Returns 0 on
  * error, so check lance_last_error_code().
  */
-uint64_t lance_version_metadata_count(const LanceVersion* version);
+LANCE_API uint64_t lance_version_metadata_count(const LanceVersion* version);
 
 /**
  * Metadata key at `index`, borrowed until the version handle is closed.
  * Returns NULL on error (NULL handle or out-of-range index).
  */
-const char* lance_version_metadata_key_at(
+LANCE_NODISCARD LANCE_API const char* lance_version_metadata_key_at(
     const LanceVersion* version,
     size_t index
 );
@@ -302,13 +304,13 @@ const char* lance_version_metadata_key_at(
  * Metadata value at `index`, borrowed until the version handle is closed.
  * Returns NULL on error (NULL handle or out-of-range index).
  */
-const char* lance_version_metadata_value_at(
+LANCE_NODISCARD LANCE_API const char* lance_version_metadata_value_at(
     const LanceVersion* version,
     size_t index
 );
 
 /** Close and free a current-version snapshot. Safe to call with NULL. */
-void lance_version_close(LanceVersion* version);
+LANCE_API void lance_version_close(LanceVersion* version);
 
 /**
  * Snapshot the dataset's version history. Caller frees the returned handle
@@ -316,36 +318,36 @@ void lance_version_close(LanceVersion* version);
  * dataset is closed. Entries are ordered by version id.
  * @return handle on success, or NULL on error
  */
-LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceVersions* lance_dataset_versions(const LanceDataset* dataset);
 
 /**
  * Number of versions in the snapshot, or 0 on error (check
  * lance_last_error_code()).
  */
-uint64_t lance_versions_count(const LanceVersions* versions);
+LANCE_API uint64_t lance_versions_count(const LanceVersions* versions);
 
 /**
  * Borrowed version details at `index` (0 <= index < count), or NULL on error.
  * The pointer remains valid until lance_versions_close().
  */
-const LanceVersion* lance_versions_at(const LanceVersions* versions, size_t index);
+LANCE_NODISCARD LANCE_API const LanceVersion* lance_versions_at(const LanceVersions* versions, size_t index);
 
 /**
  * Monotonic version id at `index` (0 <= index < count).
  * Returns 0 on error (NULL handle or out-of-range index) — check
  * lance_last_error_code().
  */
-uint64_t lance_versions_id_at(const LanceVersions* versions, size_t index);
+LANCE_API uint64_t lance_versions_id_at(const LanceVersions* versions, size_t index);
 
 /**
  * Version timestamp at `index`, as Unix epoch milliseconds.
  * Returns 0 on error (NULL handle or out-of-range index) — check
  * lance_last_error_code().
  */
-int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t index);
+LANCE_API int64_t lance_versions_timestamp_ms_at(const LanceVersions* versions, size_t index);
 
 /** Close and free a versions handle. Safe to call with NULL. */
-void lance_versions_close(LanceVersions* versions);
+LANCE_API void lance_versions_close(LanceVersions* versions);
 
 /**
  * Snapshot the lightweight attached-version references. Unlike full version
@@ -354,22 +356,22 @@ void lance_versions_close(LanceVersions* versions);
  * is closed. Entries are ordered by version id.
  * @return handle on success, or NULL on error
  */
-LanceVersionRefs* lance_dataset_version_refs(const LanceDataset* dataset);
+LANCE_NODISCARD LANCE_API LanceVersionRefs* lance_dataset_version_refs(const LanceDataset* dataset);
 
 /** Number of lightweight version refs, or 0 on error. */
-uint64_t lance_version_refs_count(const LanceVersionRefs* refs);
+LANCE_API uint64_t lance_version_refs_count(const LanceVersionRefs* refs);
 
 /**
  * Version id at `index`, or 0 on error (NULL handle or out-of-range index).
  * Check lance_last_error_code() to distinguish an error.
  */
-uint64_t lance_version_refs_id_at(
+LANCE_API uint64_t lance_version_refs_id_at(
     const LanceVersionRefs* refs,
     size_t index
 );
 
 /** Close and free a lightweight version-ref snapshot. Safe to call with NULL. */
-void lance_version_refs_close(LanceVersionRefs* refs);
+LANCE_API void lance_version_refs_close(LanceVersionRefs* refs);
 
 #ifdef __cplusplus
 } /* extern "C" */

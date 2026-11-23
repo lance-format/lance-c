@@ -102,7 +102,9 @@ jobs:
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
-        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance linux
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance linux .github/abi-baseline/v0.2.0-exports.txt
+      - name: Test export baseline verification
+        run: bash .github/scripts/test-shared-exports-baseline.sh linux
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
@@ -143,7 +145,9 @@ jobs:
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
-        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance macos
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance macos .github/abi-baseline/v0.2.0-exports.txt
+      - name: Test export baseline verification
+        run: bash .github/scripts/test-shared-exports-baseline.sh macos
       - name: Report and free cached test build headroom
         run: bash .github/scripts/free-macos-consumer-space.sh target/debug
       - name: Run tests
@@ -200,6 +204,8 @@ jobs:
           pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -File .github/scripts/test-windows-import-exports.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File .github/scripts/test-windows-export-baseline.ps1
       - name: Test Windows export linker
         run: >
           pwsh -File .github/scripts/test-windows-export-linker.ps1
@@ -223,6 +229,7 @@ jobs:
           pwsh -File .github/scripts/verify-windows-staging.ps1
           -Prefix stage -SourceRoot .
           -WorkDir "$env:RUNNER_TEMP\lance-c-windows-acceptance"
+          -AbiBaseline ".github/abi-baseline/v0.2.0-exports.txt"
       - name: Upload staged package
         uses: actions/upload-artifact@v4
         with:
@@ -275,6 +282,8 @@ jobs:
           pwsh -File .github/scripts/test-windows-runtime-dependencies.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -File .github/scripts/test-windows-import-exports.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File .github/scripts/test-windows-export-baseline.ps1
       - name: Test Windows export linker
         run: >
           pwsh -File .github/scripts/test-windows-export-linker.ps1
@@ -333,6 +342,7 @@ jobs:
           -WorkDir "$env:RUNNER_TEMP\lance-c-windows-arm64-acceptance"
           -Architecture ARM64 -CMakeGenerator "Visual Studio 18 2026"
           -CMakeToolset ClangCL
+          -AbiBaseline ".github/abi-baseline/v0.2.0-exports.txt"
       - name: Upload staged package
         uses: actions/upload-artifact@v4
         with:

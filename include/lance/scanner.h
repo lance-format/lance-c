@@ -12,6 +12,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "lance/attributes.h"
 #include "lance/arrow_abi.h"
 #include "lance/fwd.h"
 
@@ -38,15 +40,15 @@ extern "C" {
  * @param filter   SQL filter expression, or NULL
  * @return Scanner handle, or NULL on error
  */
-LanceScanner* lance_scanner_new(
+LANCE_NODISCARD LANCE_API LanceScanner* lance_scanner_new(
     const LanceDataset* dataset,
     const char* const* columns,
     const char* filter
 );
 
-int32_t lance_scanner_set_limit(LanceScanner* scanner, int64_t limit);
-int32_t lance_scanner_set_offset(LanceScanner* scanner, int64_t offset);
-int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
+LANCE_API int32_t lance_scanner_set_limit(LanceScanner* scanner, int64_t limit);
+LANCE_API int32_t lance_scanner_set_offset(LanceScanner* scanner, int64_t offset);
+LANCE_API int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
 
 /**
  * Set the target output batch size in bytes.
@@ -55,7 +57,7 @@ int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
  * must be greater than zero and must be set before scanning starts. The call
  * is rejected without changing scanner state if strict batch sizing is enabled.
  */
-int32_t lance_scanner_set_batch_size_bytes(
+LANCE_API int32_t lance_scanner_set_batch_size_bytes(
     LanceScanner* scanner,
     uint64_t batch_size_bytes
 );
@@ -71,7 +73,7 @@ int32_t lance_scanner_set_batch_size_bytes(
  * @param io_buffer_size_bytes  I/O buffer size in bytes, in the range [1, INT64_MAX].
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_set_io_buffer_size(
+LANCE_API int32_t lance_scanner_set_io_buffer_size(
     LanceScanner* scanner,
     uint64_t io_buffer_size_bytes
 );
@@ -83,7 +85,7 @@ int32_t lance_scanner_set_io_buffer_size(
  * @param batch_readahead  Number of in-flight batch decode tasks. Must be greater than zero.
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_batch_readahead(
+LANCE_API int32_t lance_scanner_set_batch_readahead(
     LanceScanner* scanner,
     size_t batch_readahead
 );
@@ -94,7 +96,7 @@ int32_t lance_scanner_set_batch_readahead(
  * This setting is only used when scan-in-order is disabled. The value must be
  * greater than zero.
  */
-int32_t lance_scanner_set_fragment_readahead(
+LANCE_API int32_t lance_scanner_set_fragment_readahead(
     LanceScanner* scanner,
     size_t fragment_readahead
 );
@@ -106,7 +108,7 @@ int32_t lance_scanner_set_fragment_readahead(
  * used to bound scan CPU parallelism. The value must be greater than zero and
  * must be set before scanning starts.
  */
-int32_t lance_scanner_set_target_parallelism(
+LANCE_API int32_t lance_scanner_set_target_parallelism(
     LanceScanner* scanner,
     size_t target_parallelism
 );
@@ -117,7 +119,7 @@ int32_t lance_scanner_set_target_parallelism(
  * Disabling ordering can improve throughput by returning batches as soon as
  * they are ready.
  */
-int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_order);
+LANCE_API int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_order);
 
 /**
  * Configure whether scalar indices may be used to optimize filters.
@@ -129,7 +131,7 @@ int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_orde
  * `lance_scanner_set_use_index`, which controls vector ANN index usage.
  * Must be set before scanning starts.
  */
-int32_t lance_scanner_set_use_scalar_index(
+LANCE_API int32_t lance_scanner_set_use_scalar_index(
     LanceScanner* scanner,
     bool use_scalar_index
 );
@@ -142,7 +144,7 @@ int32_t lance_scanner_set_use_scalar_index(
  * batch-size limit. The call is rejected without changing scanner state if a
  * byte limit is already set. Must be set before scanning starts.
  */
-int32_t lance_scanner_set_strict_batch_size(
+LANCE_API int32_t lance_scanner_set_strict_batch_size(
     LanceScanner* scanner,
     bool strict_batch_size
 );
@@ -152,7 +154,7 @@ int32_t lance_scanner_set_strict_batch_size(
  * Intended primarily for debugging and benchmarking. Must be set before
  * scanning starts.
  */
-int32_t lance_scanner_set_use_stats(LanceScanner* scanner, bool use_stats);
+LANCE_API int32_t lance_scanner_set_use_stats(LanceScanner* scanner, bool use_stats);
 
 /** Sort direction for one scanner ordering key. */
 typedef enum {
@@ -221,7 +223,7 @@ typedef struct LanceProjectionColumn {
  * @param len      Number of projection entries.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_set_projection(
+LANCE_API int32_t lance_scanner_set_projection(
     LanceScanner* scanner,
     const LanceProjectionColumn* columns,
     size_t len
@@ -241,7 +243,7 @@ int32_t lance_scanner_set_projection(
  * @param scanner  Scanner handle. Must not be NULL.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_disable_scoring_autoprojection(LanceScanner* scanner);
+LANCE_API int32_t lance_scanner_disable_scoring_autoprojection(LanceScanner* scanner);
 
 /**
  * Replace the scanner's native result ordering.
@@ -273,16 +275,16 @@ int32_t lance_scanner_disable_scoring_autoprojection(LanceScanner* scanner);
  * @param len        Number of ordering keys.
  * @return 0 on success, -1 on error.
  */
-int32_t lance_scanner_set_order_by(
+LANCE_API int32_t lance_scanner_set_order_by(
     LanceScanner* scanner,
     const LanceColumnOrdering* orderings,
     size_t len
 );
 
-int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
+LANCE_API int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
 
 /** Include or omit the `_rowaddr` metadata column. Must be set before scanning. */
-int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
+LANCE_API int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
 
 /**
  * Configure whether deleted rows still present in storage are returned.
@@ -293,7 +295,7 @@ int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
  * Fragments removed from the current snapshot are not scanned.
  * Must be set before scanning starts.
  */
-int32_t lance_scanner_set_include_deleted_rows(
+LANCE_API int32_t lance_scanner_set_include_deleted_rows(
     LanceScanner* scanner,
     bool include_deleted_rows
 );
@@ -328,7 +330,7 @@ typedef enum {
  * Must be set before scanning starts; values outside the enum are rejected.
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
+LANCE_API int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
 
 /**
  * Materialization style for ordinary scanner payload columns.
@@ -373,7 +375,7 @@ typedef enum {
  * @param early_except_column_count Number of column path pointers.
  * @return 0 on success, -1 on error (check `lance_last_error_*`).
  */
-int32_t lance_scanner_set_materialization_style(
+LANCE_API int32_t lance_scanner_set_materialization_style(
     LanceScanner* scanner,
     LanceMaterializationStyle style,
     const char* const* early_except_columns,
@@ -395,7 +397,7 @@ int32_t lance_scanner_set_materialization_style(
  * @param len     Number of fragment IDs
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_fragment_ids(
+LANCE_API int32_t lance_scanner_set_fragment_ids(
     LanceScanner* scanner,
     const uint64_t* ids,
     size_t len
@@ -418,7 +420,7 @@ int32_t lance_scanner_set_fragment_ids(
  * @param len      Number of ids; 0 allows no rows
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_row_addr_allowlist(
+LANCE_API int32_t lance_scanner_set_row_addr_allowlist(
     LanceScanner* scanner,
     const uint64_t* row_ids,
     size_t len
@@ -433,7 +435,7 @@ int32_t lance_scanner_set_row_addr_allowlist(
  * @param len      Number of ids; 0 blocks no rows
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_row_addr_blocklist(
+LANCE_API int32_t lance_scanner_set_row_addr_blocklist(
     LanceScanner* scanner,
     const uint64_t* row_ids,
     size_t len
@@ -457,7 +459,7 @@ int32_t lance_scanner_set_row_addr_blocklist(
  * @param len     Length of the byte buffer (must be > 0)
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_substrait_filter(
+LANCE_API int32_t lance_scanner_set_substrait_filter(
     LanceScanner* scanner,
     const uint8_t* bytes,
     size_t len
@@ -493,7 +495,7 @@ int32_t lance_scanner_set_substrait_filter(
  * @param len     Length of the byte buffer
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_substrait_aggregate(
+LANCE_API int32_t lance_scanner_set_substrait_aggregate(
     LanceScanner* scanner,
     const uint8_t* bytes,
     size_t len
@@ -511,7 +513,7 @@ int32_t lance_scanner_set_substrait_aggregate(
  * @param filter  Non-NULL, non-empty SQL filter expression
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_additional_sql_filter(
+LANCE_API int32_t lance_scanner_additional_sql_filter(
     LanceScanner* scanner,
     const char* filter
 );
@@ -614,7 +616,7 @@ typedef void (*LanceScanStatisticsCallback)(
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_set_statistics_callback(
+LANCE_API int32_t lance_scanner_set_statistics_callback(
     LanceScanner* scanner,
     LanceScanStatisticsCallback callback,
     void* callback_ctx
@@ -630,7 +632,7 @@ int32_t lance_scanner_set_statistics_callback(
  * scanner. Do not call this function from one of the scanner's own waker
  * callbacks, because close must wait for that callback to return.
  */
-void lance_scanner_close(LanceScanner* scanner);
+LANCE_API void lance_scanner_close(LanceScanner* scanner);
 
 /* ─── Scanner planning, introspection and count ─── */
 
@@ -653,7 +655,7 @@ void lance_scanner_close(LanceScanner* scanner);
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_schema(
+LANCE_API int32_t lance_scanner_schema(
     const LanceScanner* scanner,
     struct ArrowSchema* out
 );
@@ -672,7 +674,7 @@ int32_t lance_scanner_schema(
  * The returned string is owned by the caller and must be freed with
  * lance_free_string(). Returns NULL on error.
  */
-const char* lance_scanner_explain_plan(
+LANCE_NODISCARD LANCE_API const char* lance_scanner_explain_plan(
     const LanceScanner* scanner,
     bool verbose
 );
@@ -688,7 +690,7 @@ const char* lance_scanner_explain_plan(
  * The returned string is owned by the caller and must be freed with
  * lance_free_string(). Returns NULL on error.
  */
-const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
+LANCE_NODISCARD LANCE_API const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
 
 /**
  * Count rows matched by the configured scanner.
@@ -708,7 +710,7 @@ const char* lance_scanner_analyze_plan(const LanceScanner* scanner);
  * Returns 0 on error; an empty match also returns 0, so check
  * lance_last_error_code().
  */
-uint64_t lance_scanner_count_rows(const LanceScanner* scanner);
+LANCE_API uint64_t lance_scanner_count_rows(const LanceScanner* scanner);
 
 /**
  * Execute and format the configured native `COUNT(*)` plan.
@@ -721,7 +723,7 @@ uint64_t lance_scanner_count_rows(const LanceScanner* scanner);
  * The returned string is owned by the caller and must be freed with
  * lance_free_string(). Returns NULL on error.
  */
-const char* lance_scanner_analyze_count_plan(const LanceScanner* scanner);
+LANCE_NODISCARD LANCE_API const char* lance_scanner_analyze_count_plan(const LanceScanner* scanner);
 
 /* ─── Sync scan: ArrowArrayStream ─── */
 
@@ -740,7 +742,7 @@ const char* lance_scanner_analyze_count_plan(const LanceScanner* scanner);
  *
  * @return 0 on success, -1 on error
  */
-int32_t lance_scanner_to_arrow_stream(
+LANCE_API int32_t lance_scanner_to_arrow_stream(
     LanceScanner* scanner,
     struct ArrowArrayStream* out
 );
@@ -753,7 +755,7 @@ int32_t lance_scanner_to_arrow_stream(
  * @param out      Set to a LanceBatch* on success, NULL on end/error
  * @return 0 = batch available, 1 = end of stream, -1 = error
  */
-int32_t lance_scanner_next(
+LANCE_API int32_t lance_scanner_next(
     LanceScanner* scanner,
     LanceBatch** out
 );
@@ -806,7 +808,7 @@ typedef void (*LanceCallback)(void* ctx, int32_t status, void* result);
  * A panic in the scan task also yields status -1 with LANCE_ERR_PANIC and
  * poisons the scanner handle.
  */
-void lance_scanner_scan_async(
+LANCE_API void lance_scanner_scan_async(
     const LanceScanner* scanner,
     LanceCallback callback,
     void* callback_ctx
@@ -823,7 +825,7 @@ void lance_scanner_scan_async(
  * pointer delivered by lance_scanner_scan_async(); using this function for a
  * caller-allocated ArrowArrayStream is invalid.
  */
-void lance_scanner_async_stream_free(struct ArrowArrayStream* stream);
+LANCE_API void lance_scanner_async_stream_free(struct ArrowArrayStream* stream);
 
 /* ─── Poll-based scan (for cooperative async runtimes) ─── */
 
@@ -855,7 +857,7 @@ typedef void (*LanceWaker)(void* ctx);
  * LanceBatch only for LANCE_POLL_READY and is set to NULL for
  * LANCE_POLL_PENDING, LANCE_POLL_FINISHED, and LANCE_POLL_ERROR.
  */
-LancePollStatus lance_scanner_poll_next(
+LANCE_API LancePollStatus lance_scanner_poll_next(
     LanceScanner* scanner,
     LanceWaker waker,
     void* waker_ctx,

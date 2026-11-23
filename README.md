@@ -52,7 +52,7 @@ C and C++ applications using `<lance/lance.h>` link `LanceC::lance_c`.
 For the C++20 wrapper `<lance/lance.hpp>`, link `LanceC::lance_cpp` instead;
 it selects the required C++ standard and links the C library.
 
-CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules).
+CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules). The public C ABI is checked against the v0.2.0 export baseline; see [ABI compatibility](docs/building-and-packaging.md#abi-compatibility).
 
 With pkg-config, point `PKG_CONFIG_PATH` at the archive's `lib/pkgconfig`:
 

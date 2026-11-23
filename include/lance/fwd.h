@@ -9,6 +9,8 @@
 #ifndef LANCE_FWD_H
 #define LANCE_FWD_H
 
+#include "lance/attributes.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

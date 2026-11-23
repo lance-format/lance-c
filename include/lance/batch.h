@@ -10,6 +10,8 @@
 #define LANCE_BATCH_H
 
 #include <stdint.h>
+
+#include "lance/attributes.h"
 #include "lance/arrow_abi.h"
 #include "lance/fwd.h"
 
@@ -23,7 +25,7 @@ extern "C" {
  * Export a batch as Arrow C Data Interface structs.
  * @return 0 on success, -1 on error
  */
-int32_t lance_batch_to_arrow(
+LANCE_API int32_t lance_batch_to_arrow(
     const LanceBatch* batch,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
@@ -42,14 +44,14 @@ int32_t lance_batch_to_arrow(
  *
  * @return 0 on success, -1 on error.
  */
-int32_t lance_batch_from_arrow(
+LANCE_API int32_t lance_batch_from_arrow(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     LanceBatch** out
 );
 
 /** Free a batch handle. */
-void lance_batch_free(LanceBatch* batch);
+LANCE_API void lance_batch_free(LanceBatch* batch);
 
 #ifdef __cplusplus
 } /* extern "C" */
