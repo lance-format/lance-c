@@ -11,7 +11,10 @@ read_cargo_version("${CMAKE_CURRENT_LIST_DIR}/Cargo.toml" LANCE_C_VERSION)
 
 lance_c_load_baseline_env("${CMAKE_CURRENT_LIST_DIR}/.github/baseline.env")
 
-if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+# Deployment defaults must precede project() / compiler detection. This is
+# the pre-project equivalent of PROJECT_IS_TOP_LEVEL.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
+        AND APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "${MACOSX_DEPLOYMENT_TARGET}" CACHE STRING "Minimum macOS deployment target" FORCE)
 endif()
 
@@ -19,24 +22,30 @@ project(LanceC
     VERSION ${LANCE_C_VERSION}
     DESCRIPTION "C/C++ bindings for the Lance columnar data format"
     HOMEPAGE_URL "https://github.com/lance-format/lance-c"
-    LANGUAGES C CXX
+    LANGUAGES NONE
 )
 
-if(NOT DEFINED CMAKE_C_STANDARD OR CMAKE_C_STANDARD LESS 11)
-    set(CMAKE_C_STANDARD 11)
-endif()
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
+# Embedded builds use the parent's enabled languages. Enabling another language
+# only in this directory leaves its compiler features unavailable to targets in
+# the parent directory that consume our imported targets.
+if(PROJECT_IS_TOP_LEVEL)
+    enable_language(C CXX)
+    if(NOT DEFINED CMAKE_C_STANDARD OR CMAKE_C_STANDARD LESS 11)
+        set(CMAKE_C_STANDARD 11)
+    endif()
+    set(CMAKE_C_STANDARD_REQUIRED ON)
+    set(CMAKE_C_EXTENSIONS OFF)
 
-if(NOT DEFINED CMAKE_CXX_STANDARD OR CMAKE_CXX_STANDARD LESS 20)
-    set(CMAKE_CXX_STANDARD 20)
-endif()
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+    if(NOT DEFINED CMAKE_CXX_STANDARD OR CMAKE_CXX_STANDARD LESS 20)
+        set(CMAKE_CXX_STANDARD 20)
+    endif()
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_C_VISIBILITY_PRESET hidden)
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+    set(CMAKE_C_VISIBILITY_PRESET hidden)
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+endif()
 
 include(GNUInstallDirs)
 
@@ -76,13 +85,18 @@ set(LanceC_STATIC_CRT "${LANCE_C_CRT_STATIC}")
 
 # ─── Build via Corrosion (or skip for prebuilt mode) ─────────────────────────
 if(NOT LANCE_C_USE_PREBUILT)
-    include(FetchContent)
-    FetchContent_Declare(
-        Corrosion
-        GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-        GIT_TAG v0.5.1
-    )
-    FetchContent_MakeAvailable(Corrosion)
+    # Explicit lookup also works on CMake 3.22/3.23, before FetchContent's
+    # FIND_PACKAGE_ARGS support. Offline builds can supply Corrosion locally.
+    find_package(Corrosion 0.5 QUIET CONFIG)
+    if(NOT Corrosion_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+            Corrosion
+            GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+            GIT_TAG v0.5.1
+        )
+        FetchContent_MakeAvailable(Corrosion)
+    endif()
 
     corrosion_import_crate(
         MANIFEST_PATH "${CMAKE_CURRENT_LIST_DIR}/Cargo.toml"
@@ -142,8 +156,6 @@ if(NOT LANCE_C_USE_PREBUILT)
     endif()
 endif()
 
-# Imported targets and install rules are added in subsequent tasks.
-
 # ─── Build-tree imported targets ─────────────────────────────────────────────
 # These are for consumers using add_subdirectory(lance-c). Install-tree
 # consumers get equivalent targets re-created in LanceCConfig.cmake.
@@ -170,9 +182,9 @@ else()
     set(_lance_c_include_dirs "${CMAKE_CURRENT_LIST_DIR}/include")
 endif()
 
-# Platform link requirements declared once. INTERFACE library so we can attach
-# it to multiple consumer targets without duplication. The same list is
-# installed in LanceCConfig.cmake and formatted into lance-c.pc below.
+# Static consumers need the platform link requirements. Shared libraries
+# resolve these dependencies themselves. The same list is installed in
+# LanceCConfig.cmake and formatted into lance-c.pc below.
 lance_c_platform_dependencies(LANCE_C_PLATFORM_DEPS "${CMAKE_SYSTEM_NAME}")
 lance_c_pkg_config_private_libs(LANCE_C_PC_LIBS_PRIVATE "${CMAKE_SYSTEM_NAME}")
 add_library(LanceC_platform_deps INTERFACE)
@@ -184,20 +196,27 @@ target_link_libraries(LanceC_platform_deps INTERFACE ${LANCE_C_PLATFORM_DEPS})
 add_library(LanceC::lance_c_static INTERFACE IMPORTED GLOBAL)
 set_target_properties(LanceC::lance_c_static PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
-    INTERFACE_COMPILE_FEATURES cxx_std_20
+    INTERFACE_COMPILE_FEATURES c_std_11
     INTERFACE_LINK_LIBRARIES "${_lance_c_static_real};LanceC_platform_deps")
 
 add_library(LanceC::lance_c_shared INTERFACE IMPORTED GLOBAL)
 set_target_properties(LanceC::lance_c_shared PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${_lance_c_include_dirs}"
-    INTERFACE_COMPILE_FEATURES cxx_std_20
-    INTERFACE_LINK_LIBRARIES "${_lance_c_shared_real};LanceC_platform_deps")
+    INTERFACE_COMPILE_FEATURES c_std_11
+    INTERFACE_LINK_LIBRARIES "${_lance_c_shared_real}")
 
 if(LANCE_C_LINK STREQUAL "shared")
     add_library(LanceC::lance_c ALIAS LanceC::lance_c_shared)
 else()
     add_library(LanceC::lance_c ALIAS LanceC::lance_c_static)
 endif()
+
+# Header-only C++ wrappers add their language requirement to the selected C
+# library. C and C++ applications using only lance.h keep the C target.
+add_library(LanceC::lance_cpp INTERFACE IMPORTED GLOBAL)
+set_target_properties(LanceC::lance_cpp PROPERTIES
+    INTERFACE_COMPILE_FEATURES cxx_std_20
+    INTERFACE_LINK_LIBRARIES LanceC::lance_c)
 
 # ─── Install rules ───────────────────────────────────────────────────────────
 include(CMakePackageConfigHelpers)
@@ -295,3 +314,16 @@ configure_file(
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/lance-c.pc"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Do not introduce BUILD_TESTING or enable testing in an embedding project.
+if(PROJECT_IS_TOP_LEVEL)
+    include(CTest)
+    if(BUILD_TESTING)
+        foreach(_test cargo_version consumer_version package_metadata target_interfaces)
+            add_test(NAME cmake.${_test}
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/tests/${_test}"
+                    -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_${_test}.cmake")
+        endforeach()
+    endif()
+endif()
