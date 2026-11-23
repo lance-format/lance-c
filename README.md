@@ -64,7 +64,7 @@ Add `--static` and link `liblance_c.a` explicitly when using the static archive;
 
 ## Documentation
 
-- [C and C++ API guide](docs/api-guide.md) for scans, vector search, writes, transactions, dataset maintenance, [opt-in diagnostic logging](docs/api-guide.md#diagnostic-logging), and [Tokio worker-thread configuration](docs/api-guide.md#tokio-runtime-worker-threads).
+- [C and C++ API guide](docs/api-guide.md) for scans, vector search, writes, transactions, dataset maintenance, [opt-in diagnostic logging](docs/api-guide.md#diagnostic-logging), [Tokio worker-thread configuration](docs/api-guide.md#tokio-runtime-worker-threads), and [process lifetime during embedding](docs/api-guide.md#process-lifetime-and-embedding).
 - [Segment-scoped scalar scans](docs/scalar-segment-scans.md) and [publishing blob data](docs/blob-writer-dataset-publication.md) for specialized workflows.
 - [Building and packaging](docs/building-and-packaging.md) for platform toolchains, source builds, and releases.
 
