@@ -9,6 +9,8 @@
 #ifndef LANCE_VERSION_H
 #define LANCE_VERSION_H
 
+#include "lance/attributes.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -45,7 +47,7 @@ extern "C" {
  * This reports the lance-c binding release, not the Lance core writer version
  * or a Git revision.
  */
-const char* lance_c_version(void);
+LANCE_NODISCARD LANCE_API const char* lance_c_version(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

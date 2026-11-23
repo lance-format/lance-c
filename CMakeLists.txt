@@ -205,6 +205,13 @@ set_target_properties(LanceC::lance_c_shared PROPERTIES
     INTERFACE_COMPILE_FEATURES c_std_11
     INTERFACE_LINK_LIBRARIES "${_lance_c_shared_real}")
 
+# The header works with the static archive by default. Windows DLL consumers
+# can optimize through the import library with __declspec(dllimport).
+if(WIN32)
+    set_target_properties(LanceC::lance_c_shared PROPERTIES
+        INTERFACE_COMPILE_DEFINITIONS LANCE_C_SHARED)
+endif()
+
 if(LANCE_C_LINK STREQUAL "shared")
     add_library(LanceC::lance_c ALIAS LanceC::lance_c_shared)
 else()

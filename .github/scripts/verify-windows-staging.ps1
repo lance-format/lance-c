@@ -13,7 +13,10 @@ param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
     [ValidateSet('x64', 'ARM64')][string]$Architecture = 'x64',
     [string]$CMakeGenerator = 'Visual Studio 17 2022',
-    [string]$CMakeToolset = ''
+    [string]$CMakeToolset = '',
+    # Repo-relative or absolute path to a published export baseline. When set,
+    # removing one of its symbols fails the build.
+    [string]$AbiBaseline = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +24,7 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'windows-runtime-dependencies.ps1')
 . (Join-Path $PSScriptRoot 'windows-import-exports.ps1')
+. (Join-Path $PSScriptRoot 'windows-export-baseline.ps1')
 
 function Invoke-Dumpbin {
     param([string[]]$Arguments)
@@ -174,6 +178,22 @@ if ($actualExports.Count -ne $expectedExports.Count) {
     throw "staged DLL has $($actualExports.Count) exports, expected $($expectedExports.Count)"
 }
 Write-Host "==> Verified $($expectedExports.Count) public lance_* exports ($($actualExports.Count) total exports)"
+
+if (-not [string]::IsNullOrWhiteSpace($AbiBaseline)) {
+    $baselineFile = if ([System.IO.Path]::IsPathRooted($AbiBaseline)) {
+        $AbiBaseline
+    } else {
+        Join-Path $sourcePath $AbiBaseline
+    }
+    if (-not (Test-Path -LiteralPath $baselineFile -PathType Leaf)) {
+        throw "published export baseline is missing: $baselineFile"
+    }
+    $baselineExports = @(Get-Content -LiteralPath $baselineFile)
+    Assert-WindowsExportBaseline `
+        -BaselineExports $baselineExports `
+        -ActualExports $actualExports `
+        -BaselineDescription $AbiBaseline
+}
 
 $importText = (Invoke-Dumpbin @('/exports', $importLibrary)) -join "`n"
 $importExports = @(Get-WindowsImportLibraryExports -Text $importText | Sort-Object -Unique)
@@ -417,6 +437,102 @@ function Test-InstalledConsumer {
     $loadedModules | ForEach-Object { Write-Host "    $_" }
 }
 
+# Compile the same no-macro consumer source against the raw static archive and
+# the raw import library. This is deliberately independent of find_package: a
+# header that assumes dllimport would fail the static link with __imp_ symbols.
+function Test-DirectLibraryLinkage {
+    $linkageDir = Join-Path $workPath 'direct-linkage'
+    $sourceDir = Join-Path $linkageDir 'source'
+    $buildDir = Join-Path $linkageDir 'build'
+    New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+
+    $consumerSource = @'
+#include <lance/lance.h>
+
+int main(void) {
+    const char* version = lance_c_version();
+    return version == 0;
+}
+'@
+    Set-Content -LiteralPath (Join-Path $sourceDir 'consumer.c') `
+        -Value $consumerSource -NoNewline
+
+    $projectSource = @'
+cmake_minimum_required(VERSION 3.22)
+project(lance_c_direct_linkage LANGUAGES C)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+find_package(LanceC CONFIG REQUIRED)
+
+get_target_property(_shared_definitions LanceC::lance_c_shared
+    INTERFACE_COMPILE_DEFINITIONS)
+if(NOT _shared_definitions OR NOT "LANCE_C_SHARED" IN_LIST _shared_definitions)
+    message(FATAL_ERROR
+        "LanceC::lance_c_shared does not define LANCE_C_SHARED: ${_shared_definitions}")
+endif()
+get_target_property(_static_definitions LanceC::lance_c_static
+    INTERFACE_COMPILE_DEFINITIONS)
+if(_static_definitions AND "LANCE_C_SHARED" IN_LIST _static_definitions)
+    message(FATAL_ERROR
+        "LanceC::lance_c_static must not define LANCE_C_SHARED")
+endif()
+
+add_executable(direct_static consumer.c)
+target_include_directories(direct_static PRIVATE "${LANCE_C_INCLUDE_DIR}")
+target_link_libraries(direct_static PRIVATE
+    "${LANCE_C_ARCHIVE}" ${_lance_c_platform_deps})
+
+add_executable(direct_shared consumer.c)
+target_include_directories(direct_shared PRIVATE "${LANCE_C_INCLUDE_DIR}")
+target_link_libraries(direct_shared PRIVATE "${LANCE_C_IMPORT_LIBRARY}")
+'@
+    Set-Content -LiteralPath (Join-Path $sourceDir 'CMakeLists.txt') `
+        -Value $projectSource -NoNewline
+
+    $includeDir = Join-Path $prefixPath 'include'
+    $configureArguments = @(
+        '-S', $sourceDir,
+        '-B', $buildDir,
+        '-G', $CMakeGenerator,
+        '-A', $Architecture,
+        "-DCMAKE_PREFIX_PATH=$($prefixPath -replace '\\', '/')",
+        "-DLANCE_C_INCLUDE_DIR=$($includeDir -replace '\\', '/')",
+        "-DLANCE_C_ARCHIVE=$($staticLibrary -replace '\\', '/')",
+        "-DLANCE_C_IMPORT_LIBRARY=$($importLibrary -replace '\\', '/')",
+        '-DCMAKE_BUILD_TYPE=Release'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($CMakeToolset)) {
+        $configureArguments += @('-T', $CMakeToolset)
+    }
+    & cmake @configureArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "direct-linkage cmake configure failed with exit code $LASTEXITCODE"
+    }
+    & cmake --build $buildDir --config Release --parallel 4
+    if ($LASTEXITCODE -ne 0) {
+        throw "direct-linkage cmake build failed with exit code $LASTEXITCODE"
+    }
+
+    $staticExecutable = Join-Path $buildDir 'Release\direct_static.exe'
+    $sharedExecutable = Join-Path $buildDir 'Release\direct_shared.exe'
+    foreach ($executable in @($staticExecutable, $sharedExecutable)) {
+        if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "direct-linkage executable was not built: $executable"
+        }
+    }
+
+    & $staticExecutable
+    if ($LASTEXITCODE -ne 0) {
+        throw "direct static consumer failed with exit code $LASTEXITCODE"
+    }
+    Copy-Item -LiteralPath $dll -Destination (Split-Path -Parent $sharedExecutable) -Force
+    & $sharedExecutable
+    if ($LASTEXITCODE -ne 0) {
+        throw "direct import-library consumer failed with exit code $LASTEXITCODE"
+    }
+    Write-Host '==> Verified no-macro direct static and import-library linkage'
+}
+
+Test-DirectLibraryLinkage
 Test-InstalledConsumer -Linkage static
 Test-InstalledConsumer -Linkage shared
 

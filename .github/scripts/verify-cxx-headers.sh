@@ -81,7 +81,7 @@ check_c_header_sources() {
         "${c_flags[@]}" -I"$include_dir" -I"$arrow_abi_dir"
     run_check "$compiler" C11 "$tests_dir/header_data_only_before_lance.c" \
         "${c_flags[@]}" -I"$include_dir" -I"$arrow_abi_data_dir"
-    for header in version error arrow_abi fwd dataset scanner batch; do
+    for header in version error arrow_abi fwd attributes dataset scanner batch; do
         source="$work_dir/${header}.c"
         printf '#include <lance/%s.h>\nint main(void) { return 0; }\n' "$header" >"$source"
         run_check "$compiler" C11 "$source" "${c_flags[@]}" -I"$include_dir"
@@ -97,7 +97,7 @@ check_cpp_header_sources() {
         "${cpp_flags[@]}" -I"$include_dir" -I"$arrow_abi_dir"
     run_check "$compiler" C++20 "$tests_dir/header_data_only_before_lance.cpp" \
         "${cpp_flags[@]}" -I"$include_dir" -I"$arrow_abi_data_dir"
-    for header in version error arrow_abi fwd dataset scanner batch; do
+    for header in version error arrow_abi fwd attributes dataset scanner batch; do
         source="$work_dir/${header}.cpp"
         printf '#include <lance/%s.h>\nint main() { return 0; }\n' "$header" >"$source"
         run_check "$compiler" C++20 "$source" "${cpp_flags[@]}" -I"$include_dir"

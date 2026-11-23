@@ -9,6 +9,8 @@
 #ifndef LANCE_ERROR_H
 #define LANCE_ERROR_H
 
+#include "lance/attributes.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -67,13 +69,13 @@ typedef enum {
 
 
 /** Return the error code from the last failed operation on this thread. */
-LanceErrorCode lance_last_error_code(void);
+LANCE_API LanceErrorCode lance_last_error_code(void);
 
 /** Return the error message. Caller must free with lance_free_string(). */
-const char* lance_last_error_message(void);
+LANCE_NODISCARD LANCE_API const char* lance_last_error_message(void);
 
 /** Free a string returned by lance_last_error_message(). */
-void lance_free_string(const char* s);
+LANCE_API void lance_free_string(const char* s);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -1280,6 +1280,33 @@ fn compile_cpp_header_test(source: &Path, include_dirs: &[&Path]) -> bool {
         .success()
 }
 
+/// Compile a header-only consumer with extra compiler arguments and return
+/// whether it succeeded together with its stderr diagnostics.
+fn compile_header_with_args(
+    compiler: &str,
+    std_flag: &str,
+    extra_args: &[&str],
+    source: &Path,
+    include_dirs: &[&Path],
+) -> (bool, String) {
+    let output = Command::new(compiler)
+        .args([std_flag, "-Wall", "-Wextra", "-fsyntax-only"])
+        .args(extra_args)
+        .arg(source)
+        .args(
+            include_dirs
+                .iter()
+                .map(|dir| format!("-I{}", dir.display())),
+        )
+        .output()
+        .expect("C and C++ compilers are required for this ignored test");
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 /// Run a compiled test binary with the source dataset URI, a destination URI
 /// for the write test, the Blob v2 and ordering datasets, the indexed session
 /// cache dataset, separate non-stable/stable fragment-deletion datasets, the
@@ -2264,6 +2291,7 @@ fn test_arrow_header_include_orders() {
 /// Public headers callers may include directly, including the umbrella header.
 const PUBLIC_HEADERS: &[&str] = &[
     "arrow_abi.h",
+    "attributes.h",
     "batch.h",
     "dataset.h",
     "error.h",
@@ -2361,5 +2389,73 @@ fn test_domain_header_arrow_include_orders() {
                 "C++20 {case} consumer for <lance/{header}> failed to compile"
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_api_attribute_contract"]
+fn test_api_attribute_contract() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let include_dir = manifest_dir.join("include");
+    let consumer_dir = manifest_dir.join("tests").join("cpp");
+    let arrow_include_dir = consumer_dir.join("arrow_abi");
+    let include_dirs = [include_dir.as_path(), arrow_include_dir.as_path()];
+
+    // Warning-as-error consumers accept the annotated header.
+    for (compiler, std_flag, source_name) in [
+        ("clang", "-std=c11", "header_attributes.c"),
+        ("clang++", "-std=c++20", "header_attributes.cpp"),
+    ] {
+        let source = consumer_dir.join(source_name);
+        let (success, stderr) =
+            compile_header_with_args(compiler, std_flag, &["-Werror"], &source, &include_dirs);
+        assert!(
+            success,
+            "warning-as-error consumer {source_name} failed to compile:\n{stderr}"
+        );
+    }
+
+    // Ignoring a LANCE_NODISCARD result is rejected under -Werror.
+    for (compiler, std_flag, source_name) in [
+        ("clang", "-std=c11", "header_nodiscard.c"),
+        ("clang++", "-std=c++20", "header_nodiscard.cpp"),
+    ] {
+        let source = consumer_dir.join(source_name);
+        let (success, stderr) = compile_header_with_args(
+            compiler,
+            std_flag,
+            &["-Werror=unused-result"],
+            &source,
+            &include_dirs,
+        );
+        assert!(
+            !success,
+            "ignored LANCE_NODISCARD result compiled in {source_name}"
+        );
+        assert!(
+            stderr.contains("unused-result") || stderr.contains("nodiscard"),
+            "{source_name} failed without the unused-result diagnostic:\n{stderr}"
+        );
+    }
+
+    // Calling the deprecated API is rejected under
+    // -Werror=deprecated-declarations.
+    for (compiler, std_flag, source_name) in [
+        ("clang", "-std=c11", "header_deprecated_api.c"),
+        ("clang++", "-std=c++20", "header_deprecated_api.cpp"),
+    ] {
+        let source = consumer_dir.join(source_name);
+        let (success, stderr) = compile_header_with_args(
+            compiler,
+            std_flag,
+            &["-Werror=deprecated-declarations"],
+            &source,
+            &include_dirs,
+        );
+        assert!(!success, "deprecated API call compiled in {source_name}");
+        assert!(
+            stderr.contains("deprecated"),
+            "{source_name} failed without the deprecation diagnostic:\n{stderr}"
+        );
     }
 }

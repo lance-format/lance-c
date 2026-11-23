@@ -5,6 +5,7 @@ This document provides platform-specific build instructions, binary packaging co
 ## Contents
 
 - [Published prebuilt archives](#published-prebuilt-archives)
+- [ABI compatibility](#abi-compatibility)
 - [Linux runtime requirements](#linux-baseline-for-future-packages)
 - [Try the published package](#try-the-published-package)
 - [Choosing static or shared linkage](#choosing-static-or-shared-linkage)
@@ -40,6 +41,17 @@ In the published archives, Linux and macOS release shared libraries (`liblance_c
 | Windows `ARM64` | `lance-c-v0.2.0-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 
 The 0.2.x prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
+
+<a id="abi-compatibility"></a>
+
+## ABI compatibility
+
+The public C ABI is the `lance_*` function set declared by the installed `include/lance/` headers. The 0.2.x line preserves it: releases may add entry points, but must not remove or change an existing one.
+
+- Release and CI builds compare each staged Linux, macOS, and Windows shared library with [`.github/abi-baseline/v0.2.0-exports.txt`](../.github/abi-baseline/v0.2.0-exports.txt), the export names published by the verified `v0.2.0` release. Dropping a published name fails the build even when the declaration and the library are changed together; new exports are allowed and reported. This is an export-name comparison only: it does not detect changed signatures, struct or enum layouts, or changed behavior. The same build still requires the library to match the installed header set exactly, and `tests/support/abi_layout.rs` checks struct sizes, alignments, field offsets and enum values against the current Rust definitions.
+- `LANCE_API`, `LANCE_DEPRECATED(message)` and `LANCE_NODISCARD` are defined in `include/lance/attributes.h`, which every public declaration header includes. On Windows, declarations are ordinary by default, so one header works with both the static archive and the DLL import library. The installed CMake shared target (`LanceC::lance_c_shared`, or `LanceC::lance_c` with `-DLanceC_LINK=shared`) defines `LANCE_C_SHARED`, which opts into `__declspec(dllimport)`; direct DLL consumers may define it themselves. Static consumers need no macro.
+- The shared-library file names stay unversioned (`liblance_c.so`, `liblance_c.dylib`, `lance_c.dll`) in the 0.2.x line. A versioned SONAME or install name changes a loader contract that published archives and downstream native modules currently pin, so it needs its own migration plan.
+- The Go bindings already parse declaration attributes and modular headers (lance-go #120, #132 and #129). A production repin still needs the published archive identities for the split header set; this repository does not publish a native pin.
 
 <a id="linux-baseline-for-future-packages"></a>
 
