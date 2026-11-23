@@ -112,6 +112,40 @@ jobs:
       - name: Verify CMake package and consumer linkage
         run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
 
+  test-sanitizers:
+    name: Tests (Linux, sanitizers)
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
+    # Run the two core native consumer suites under sanitizers in their own job
+    # so setup and failures stay isolated from test-linux.
+    timeout-minutes: 60
+    env:
+      CC: clang
+      CXX: clang++
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      LANCE_C_SANITIZERS: address,undefined
+      # AddressSanitizer includes LeakSanitizer on Linux. These settings apply
+      # to the native consumer binaries; the Rust library is not instrumented.
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # test-linux saves the shared target cache on main.
+          save-if: false
+      - name: Install Clang 20
+        run: manylinux-install-clang -v 20.1.8.0
+      - name: Ensure pkg-config
+        run: command -v pkg-config >/dev/null || dnf install -y pkgconf-pkg-config
+      - uses: ./.github/actions/setup-protoc
+      - name: Run C consumer under sanitizers
+        run: cargo test --test compile_and_run_test -- --ignored test_c_compilation_and_execution
+      - name: Run C++ consumer under sanitizers
+        run: cargo test --test compile_and_run_test -- --ignored test_cpp_compilation_and_execution
+
   test-macos:
     name: Tests (macOS)
     runs-on: macos-15
