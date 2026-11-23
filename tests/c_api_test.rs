@@ -50151,6 +50151,110 @@ fn test_dataset_open_with_dynamic_accessor_refreshes_later_io_and_reports_failur
     );
 }
 
+struct SessionOwnedProviderContext {
+    session: *mut LanceSession,
+    releases: Arc<AtomicUsize>,
+}
+
+unsafe extern "C" fn session_owned_provider_fetch(
+    _provider_ctx: *mut c_void,
+    out: *mut LanceStorageOptionsFetchResult,
+    _error: *mut LanceCallbackError,
+) -> i32 {
+    if !out.is_null() {
+        unsafe {
+            (*out).has_options = 0;
+            (*out).keys = ptr::null();
+            (*out).values = ptr::null();
+            (*out).count = 0;
+            (*out).snapshot_ctx = ptr::null_mut();
+            (*out).release_snapshot = None;
+        }
+    }
+    0
+}
+
+unsafe extern "C" fn release_session_owned_provider(provider_ctx: *mut c_void) {
+    let context = unsafe { Box::from_raw(provider_ctx as *mut SessionOwnedProviderContext) };
+    context.releases.fetch_add(1, AtomicOrdering::SeqCst);
+    if !context.session.is_null() {
+        unsafe { lance_session_close(context.session) };
+    }
+}
+
+#[test]
+fn test_session_registry_cache_does_not_retain_dynamic_provider() {
+    let _guard = DATASET_PROVIDER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("session-provider")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let c_uri = c_str(&uri);
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+    let mut written = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lance_dataset_write(
+                c_uri.as_ptr(),
+                &ffi_schema,
+                &mut stream,
+                LanceWriteMode::Create as i32,
+                ptr::null(),
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(written) };
+
+    let session = lance_session_new(0, 0);
+    assert!(!session.is_null(), "{}", take_last_error_message());
+    let releases = Arc::new(AtomicUsize::new(0));
+    let context = Box::new(SessionOwnedProviderContext {
+        // The provider context owns the session like a credential client that
+        // reads through the same session. Releasing the provider closes it.
+        session,
+        releases: releases.clone(),
+    });
+    let provider_id = c_str("session-owned-dynamic-provider");
+    let spec = LanceStorageOptionsProviderSpec {
+        fetch: Some(session_owned_provider_fetch),
+        force_fetch: None,
+        release: Some(release_session_owned_provider),
+        provider_ctx: Box::into_raw(context) as *mut c_void,
+        provider_id: provider_id.as_ptr(),
+    };
+    let provider = unsafe { lance_storage_options_provider_new(&spec) };
+    assert!(!provider.is_null(), "{}", take_last_error_message());
+    let accessor = unsafe { lance_storage_options_accessor_new(ptr::null(), provider) };
+    assert!(!accessor.is_null(), "{}", take_last_error_message());
+    let options = LanceDatasetOpenOptions {
+        version: 0,
+        storage_options_accessor: accessor,
+    };
+    let dataset = unsafe { lance_dataset_open_with_options(c_uri.as_ptr(), &options, session) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    assert_eq!(unsafe { lance_dataset_count_rows(dataset) }, 3);
+
+    unsafe {
+        lance_storage_options_accessor_close(accessor);
+        lance_storage_options_provider_close(provider);
+        lance_dataset_close(dataset);
+    }
+    assert!(
+        wait_for_dataset_counter(&releases, 1),
+        "the session object-store registry cache must not retain the provider context"
+    );
+}
+
 #[test]
 fn test_dataset_write_and_commit_propagate_dynamic_provider_failure() {
     let _guard = DATASET_PROVIDER_TEST_LOCK

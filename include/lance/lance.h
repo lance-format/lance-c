@@ -34,9 +34,9 @@
 #define LANCE_C_VERSION_MINOR 2
 #define LANCE_C_VERSION_PATCH 1
 /* Pre-release suffix without the leading '-'; empty for a stable release. */
-#define LANCE_C_VERSION_PRE "beta.2"
+#define LANCE_C_VERSION_PRE "beta.3"
 /* Full Cargo package version, including any pre-release or build suffix. */
-#define LANCE_C_VERSION_STRING "0.2.1-beta.2"
+#define LANCE_C_VERSION_STRING "0.2.1-beta.3"
 #define LANCE_C_VERSION_ENCODE(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
 /* Numeric form for #if comparisons. The pre-release suffix is not encoded, so
@@ -11032,8 +11032,10 @@ typedef void (*LanceStorageOptionsProviderReleaseFn)(void* provider_ctx);
  *
  * Ownership of `provider_ctx` and `release` transfers only when
  * lance_storage_options_provider_new succeeds. The library retains the context
- * through every native Arc owner, including accessor and registry cache keys,
- * and calls `release(provider_ctx)` exactly once when the final owner drops.
+ * through every native owner that still needs its credentials, including
+ * accessors and datasets, and calls `release(provider_ctx)` exactly once when
+ * the final owner drops. Object-store registry cache entries do not keep the
+ * context alive.
  */
 typedef struct LanceStorageOptionsProviderSpec {
     LanceStorageOptionsFetchFn fetch;
