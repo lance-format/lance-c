@@ -54,8 +54,8 @@ pub struct LanceIndexSegmentBuildOptions {
 
 /// Raw-discriminant vector parameters for the segment-builder ABI.
 ///
-/// Unlike the legacy one-shot parameter struct, enum-like fields are i32 so
-/// arbitrary C input can be validated before constructing Rust enums.
+/// `index_type` and `metric` stay i32 across the FFI so arbitrary C input can
+/// be validated before constructing Rust enums.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LanceVectorIndexSegmentParams {
@@ -71,10 +71,13 @@ pub struct LanceVectorIndexSegmentParams {
 }
 
 impl LanceVectorIndexSegmentParams {
-    fn parse(self) -> Result<LanceVectorIndexParams> {
-        Ok(LanceVectorIndexParams {
-            index_type: LanceVectorIndexType::from_c(self.index_type)?,
-            metric: crate::index::LanceMetricType::from_c(self.metric)?,
+    /// Copy the raw FFI fields into the legacy parameter struct. Enum-like
+    /// fields stay raw i32 and are validated with `from_c`; the caller keeps
+    /// the validated Rust enums for its own checks.
+    fn into_legacy_params(self) -> LanceVectorIndexParams {
+        LanceVectorIndexParams {
+            index_type: self.index_type,
+            metric: self.metric,
             num_partitions: self.num_partitions,
             num_sub_vectors: self.num_sub_vectors,
             num_bits: self.num_bits,
@@ -82,7 +85,7 @@ impl LanceVectorIndexSegmentParams {
             hnsw_m: self.hnsw_m,
             hnsw_ef_construction: self.hnsw_ef_construction,
             sample_rate: self.sample_rate,
-        })
+        }
     }
 }
 
@@ -1027,7 +1030,12 @@ unsafe fn new_vector_builder_inner(
         .ok_or_else(|| invalid_input("column must not be NULL or empty"))?
         .to_string();
     let index_name = unsafe { helpers::parse_c_string(index_name)? }.map(str::to_string);
-    let params = unsafe { *params }.parse()?;
+    let params = unsafe { *params }.into_legacy_params();
+    // Validate the raw enum-like fields here as well so the segment builder
+    // reports the same errors with the same precedence as before the legacy
+    // struct switched to raw i32 fields.
+    let index_type = LanceVectorIndexType::from_c(params.index_type)?;
+    let metric = LanceMetricType::from_c(params.metric)?;
     let dataset = unsafe { &*dataset }.snapshot().as_ref().clone();
     let parsed = unsafe { parse_options(options, &dataset, false)? };
 
@@ -1081,12 +1089,12 @@ unsafe fn new_vector_builder_inner(
     match &centroid_provenance {
         Some(provenance)
             if provenance.kind != "ivf"
-                || provenance.metric != params.metric as i32
+                || provenance.metric != metric as i32
                 || provenance.dimension != dim =>
         {
             return Err(invalid_input(format!(
                 "ivf_centroids provenance must be kind=ivf, metric={}, dimension={dim}; got kind={}, metric={}, dimension={}",
-                params.metric as i32, provenance.kind, provenance.metric, provenance.dimension
+                metric as i32, provenance.kind, provenance.metric, provenance.dimension
             )));
         }
         _ => {}
@@ -1098,14 +1106,14 @@ unsafe fn new_vector_builder_inner(
             params.num_bits
         };
         if provenance.kind != "pq"
-            || provenance.metric != params.metric as i32
+            || provenance.metric != metric as i32
             || provenance.dimension != dim
             || provenance.num_sub_vectors != Some(params.num_sub_vectors)
             || provenance.num_bits != Some(expected_bits)
         {
             return Err(invalid_input(format!(
                 "pq_codebook provenance does not match metric {}, dimension {dim}, num_sub_vectors {}, num_bits {expected_bits}",
-                params.metric as i32, params.num_sub_vectors
+                metric as i32, params.num_sub_vectors
             )));
         }
         if centroid_provenance.as_ref().map(|model| model.ivf_id) != Some(provenance.ivf_id) {
@@ -1133,7 +1141,7 @@ unsafe fn new_vector_builder_inner(
     }
 
     let is_pq = matches!(
-        params.index_type,
+        index_type,
         LanceVectorIndexType::IvfPq | LanceVectorIndexType::IvfHnswPq
     );
     let effective_num_bits = if params.num_bits == 0 {
@@ -1149,7 +1157,7 @@ unsafe fn new_vector_builder_inner(
     if !is_pq && codebook.is_some() {
         return Err(invalid_input(format!(
             "pq_codebook is not valid for vector index type {:?}",
-            params.index_type
+            index_type
         )));
     }
     if is_pq && (centroids.is_some() != codebook.is_some()) {

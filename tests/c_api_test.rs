@@ -17661,8 +17661,8 @@ fn test_ordinary_vector_index_progress_replaces_nulls_and_reopens() {
     let column = c_str("embedding");
     let index_name = c_str("ordinary_vector_progress");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 2,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -20038,8 +20038,8 @@ fn test_create_vector_index_ivf_flat() {
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 8,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -20065,8 +20065,8 @@ fn test_create_vector_index_ivf_pq() {
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfPq,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 8,
         num_sub_vectors: 4,
         num_bits: 8,
@@ -20085,14 +20085,61 @@ fn test_create_vector_index_ivf_pq() {
 }
 
 #[test]
+fn test_legacy_vector_index_params_reject_out_of_range_raw_enums() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null(), "{}", take_last_error_message());
+    let column = c_str("embedding");
+
+    let cases = [
+        (
+            999,
+            LanceMetricType::L2 as i32,
+            "invalid vector index type: 999",
+        ),
+        (
+            LanceVectorIndexType::IvfFlat as i32,
+            7,
+            "metric must be one of 0 (L2), 1 (Cosine), 2 (Dot), or 3 (Hamming); got 7",
+        ),
+    ];
+    for (index_type, metric, expected) in cases {
+        let params = LanceVectorIndexParams {
+            index_type,
+            metric,
+            num_partitions: 1,
+            num_sub_vectors: 0,
+            num_bits: 0,
+            max_iterations: 0,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 0,
+        };
+        let rc = unsafe {
+            lance_dataset_create_vector_index(ds, column.as_ptr(), ptr::null(), &params, false)
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
+        );
+    }
+    assert_eq!(unsafe { lance_dataset_index_count(ds) }, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_legacy_vector_entrypoints_support_ivf_rq_default_bits() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(1, 64, 8, false);
     let uri_c = c_str(&uri);
     let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfRq,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfRq as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 2,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -20208,8 +20255,8 @@ fn test_create_vector_index_ivf_hnsw_sq() {
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfHnswSq,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfHnswSq as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 8,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -21416,8 +21463,8 @@ fn test_vector_index_num_bits_validation_for_sq_and_pq() {
     let column = c_str("embedding");
 
     let sq_params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfSq,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfSq as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 2,
         num_sub_vectors: 0,
         num_bits: 4,
@@ -21498,8 +21545,8 @@ fn test_vector_index_missing_required_param() {
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfPq,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 8,
         num_sub_vectors: 0, // missing!
         num_bits: 0,
@@ -21651,8 +21698,8 @@ fn test_scanner_distance_range_flat_and_indexed_boundaries() {
     let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null());
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 2,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -22024,8 +22071,8 @@ fn test_scanner_nearest_with_ivf_pq_index() {
     let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfPq,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 8,
         num_sub_vectors: 4,
         num_bits: 8,
@@ -22090,8 +22137,8 @@ fn test_scanner_nearest_4bit_pq_prefilter_consistency() {
         let column = c_str("embedding");
         let name = c_str("pq_idx");
         let params = LanceVectorIndexParams {
-            index_type: LanceVectorIndexType::IvfPq,
-            metric,
+            index_type: LanceVectorIndexType::IvfPq as i32,
+            metric: metric as i32,
             num_partitions: 1,
             num_sub_vectors: 8,
             num_bits: 4,
@@ -22454,8 +22501,8 @@ fn test_scanner_nearest_full_snapshot_prefilter_statistics() {
         assert!(!dataset.is_null());
         let column = c_str("embedding");
         let params = LanceVectorIndexParams {
-            index_type: LanceVectorIndexType::IvfFlat,
-            metric: LanceMetricType::L2,
+            index_type: LanceVectorIndexType::IvfFlat as i32,
+            metric: LanceMetricType::L2 as i32,
             num_partitions: 1,
             num_sub_vectors: 0,
             num_bits: 0,
@@ -22572,8 +22619,8 @@ fn test_scanner_nearest_indexed_fragment_scope_with_prefilter_disabled() {
 
     let column = c_str("embedding");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 1,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -36624,8 +36671,8 @@ fn test_optimize_indices_retrain_rebuilds_vector_index() {
     let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
     assert!(!dataset.is_null(), "{}", take_last_error_message());
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 2,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -37189,8 +37236,8 @@ fn test_index_segment_count_and_list() {
     let column = c_str("embedding");
     let name = c_str("emb_idx");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 4,
         num_sub_vectors: 0,
         num_bits: 0,
@@ -37252,8 +37299,8 @@ fn test_scanner_set_index_segments_with_listed_uuids() {
     let column = c_str("embedding");
     let name = c_str("idx");
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 4,
         num_sub_vectors: 0,
         num_bits: 0,
