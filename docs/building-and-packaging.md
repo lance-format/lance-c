@@ -226,7 +226,7 @@ When staging existing Windows libraries with `-DLANCE_C_USE_PREBUILT=ON`, you mu
 
 ### Running the native test suite on Windows
 
-`cargo test` runs the Rust suite, and `cargo test --test compile_and_run_test -- --ignored` compiles every C and C++ consumer under `tests/cpp/` against the freshly built `lance_c.dll` and runs it. Both work from a plain PowerShell window: when `cl.exe` is not on `PATH`, the harness asks `vswhere.exe` for the Visual Studio installation and reads the `vcvarsall.bat` environment for the native architecture, links `lance_c.dll.lib`, and copies the DLL beside each test binary. Set `CC` and `CXX` to use another MSVC-compatible compiler such as `clang-cl`. CI runs both commands on Windows x64 and Windows ARM64.
+`cargo test` runs the Rust suite, and `cargo test --test compile_and_run_test -- --ignored` compiles every C and C++ consumer under `tests/cpp/` against the freshly built `lance_c.dll` and runs it. The harness resolves `cl.exe` with the same target-aware MSVC lookup that `build.rs` uses for the export library and keeps the tool environment that lookup returns (`INCLUDE`, `LIB`, and `PATH`), so both commands work from a plain PowerShell window without a developer prompt and never depend on a `cl.exe` from `PATH` that targets another architecture. It links `lance_c.dll.lib` and copies the DLL beside each test binary. This applies to `cargo test`; the CMake build commands above choose their own generator and toolset, including `-T ClangCL` for ARM64. CI runs both test commands on Windows x64 and Windows ARM64.
 
 ### Consuming the Windows package and `/MT` CRT rules
 
