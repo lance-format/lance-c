@@ -4636,16 +4636,19 @@ static void test_cleanup_and_lifecycle(const char *uri) {
     CHECK_OK();
     ASSERT(deleted == 1, "cleanup fixture deleted-row count mismatch");
 
-    uint64_t small = UINT64_MAX;
-    ASSERT(lance_dataset_num_small_files(ds, 0, &small) == 0,
+    /* `small` is a Windows SDK macro (`#define small char`), so the fixture
+       variable uses a name the headers cannot rewrite. */
+    uint64_t small_file_count = UINT64_MAX;
+    ASSERT(lance_dataset_num_small_files(ds, 0, &small_file_count) == 0,
            "zero small-file threshold failed");
-    ASSERT(small == 0, "native zero threshold must return zero");
-    ASSERT(lance_dataset_num_small_files(ds, 5, &small) == 0,
+    ASSERT(small_file_count == 0, "native zero threshold must return zero");
+    ASSERT(lance_dataset_num_small_files(ds, 5, &small_file_count) == 0,
            "small-file count failed");
-    ASSERT(small == 4, "small-file count mismatch");
-    ASSERT(lance_dataset_num_small_files(ds, 4, &small) == 0,
+    ASSERT(small_file_count == 4, "small-file count mismatch");
+    ASSERT(lance_dataset_num_small_files(ds, 4, &small_file_count) == 0,
            "strict small-file boundary failed");
-    ASSERT(small == 0, "physical rows equal to threshold are not small");
+    ASSERT(small_file_count == 0,
+           "physical rows equal to threshold are not small");
 
     const uint64_t selected[] = {2, 3};
     LanceCleanupPolicy policy = {0};

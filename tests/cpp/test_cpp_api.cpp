@@ -6039,6 +6039,9 @@ static void test_binding_version() {
 }
 
 int main(int argc, char** argv) {
+    /* Keep progress visible when the process dies without unwinding: stdout to
+       a pipe is otherwise block-buffered and the last TEST() marker is lost. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 13) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "

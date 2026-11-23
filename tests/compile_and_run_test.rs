@@ -1358,12 +1358,24 @@ fn run_test_binary(
 
     assert!(
         output.status.success(),
-        "Test binary {} failed with exit code {:?}\nstdout: {}\nstderr: {}",
+        "Test binary {} failed with exit status {}\nstdout: {}\nstderr: {}",
         binary.display(),
-        output.status.code(),
+        describe_exit_status(output.status),
         stdout,
         stderr
     );
+}
+
+/// Describe a child exit status so a Windows fail-fast code is readable.
+///
+/// Windows reports large exception codes such as `0xC0000409` as negative
+/// `i32` values, which read as `-1073740791` without the hexadecimal form.
+fn describe_exit_status(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) if code < 0 => format!("{code} (0x{:08X})", code as u32),
+        Some(code) => code.to_string(),
+        None => "terminated by signal".to_string(),
+    }
 }
 
 fn write_ordering_aggregate_plan(directory: &Path) -> PathBuf {
@@ -1399,9 +1411,9 @@ fn run_test_binary_with_dataset(binary: &Path, dataset_uri: &str) {
 
     assert!(
         output.status.success(),
-        "Test binary {} failed with exit code {:?}\nstdout: {}\nstderr: {}",
+        "Test binary {} failed with exit status {}\nstdout: {}\nstderr: {}",
         binary.display(),
-        output.status.code(),
+        describe_exit_status(output.status),
         stdout,
         stderr
     );
@@ -1421,9 +1433,9 @@ fn run_test_binary_with_args(binary: &Path, args: &[&str]) {
     }
     assert!(
         output.status.success(),
-        "Test binary {} failed with exit code {:?}\nstdout: {}\nstderr: {}",
+        "Test binary {} failed with exit status {}\nstdout: {}\nstderr: {}",
         binary.display(),
-        output.status.code(),
+        describe_exit_status(output.status),
         stdout,
         stderr
     );
