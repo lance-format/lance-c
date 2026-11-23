@@ -654,6 +654,12 @@ unsafe fn file_session_download_file_inner(
                 ))
             })?;
         }
+        // Close the source reader before publishing the destination. When the
+        // destination is the source object itself, Windows refuses to replace a
+        // file that is still open ("Access is denied", os error 5), while the
+        // download has already read every chunk.
+        drop(stream);
+        drop(reader);
         file.flush().await.map_err(|error| {
             Error::io(format!(
                 "failed to flush local file {local_path:?}: {error}"
