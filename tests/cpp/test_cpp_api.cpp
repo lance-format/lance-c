@@ -1890,6 +1890,23 @@ static void test_error_exception(const std::string& /*uri*/) {
     }
     assert(caught);
 
+    // check_error() is a poll: the failed call above consumed its pending
+    // error, so it must return normally here.
+    lance::check_error();
+
+    // A failure branch without a pending native error must not fall through.
+    bool internal = false;
+    try {
+        lance::detail::throw_error();
+    } catch (const lance::Error& e) {
+        internal = true;
+        assert(e.code == LANCE_ERR_INTERNAL);
+        assert(std::string(e.what()).find(
+                   "without setting a thread-local error") !=
+               std::string::npos);
+    }
+    assert(internal);
+
     PASS();
 }
 
