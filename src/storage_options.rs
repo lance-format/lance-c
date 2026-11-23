@@ -234,10 +234,11 @@ impl StorageOptionsProvider for FfiStorageOptionsProvider {
 /// Create a foreign storage-options provider.
 ///
 /// On success, ownership of `provider_ctx` and its optional `release` callback
-/// transfers to the returned provider and ultimately to the native accessor or
-/// registry entry that retains the provider. `release(provider_ctx)` is called
-/// exactly once when the final native owner is dropped. On failure, ownership
-/// remains with the caller. `provider_id` is copied and must be non-empty.
+/// transfers to the returned provider. Native accessors, datasets, and other
+/// owners that still need its credentials retain the provider;
+/// `release(provider_ctx)` is called exactly once when the final such owner is
+/// dropped. On failure, ownership remains with the caller. `provider_id` is
+/// copied and must be non-empty.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_storage_options_provider_new(
     spec: *const LanceStorageOptionsProviderSpec,
@@ -278,8 +279,9 @@ unsafe fn storage_options_provider_new_inner(
 
 /// Close a storage-options provider handle.
 ///
-/// Accessors and object-store registry entries retain their own native Arc
-/// references. The caller's context is released only when the final owner is
+/// This drops the handle's own native reference. Accessors, datasets, and other
+/// native owners that still need the credentials retain their own references;
+/// `release(provider_ctx)` is called exactly once when the final such owner is
 /// dropped, not necessarily by this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lance_storage_options_provider_close(
