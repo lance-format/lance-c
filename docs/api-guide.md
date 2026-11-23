@@ -1,6 +1,6 @@
 # C and C++ API guide
 
-See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
+See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function; see [Generated C/C++ API reference](api-reference.md) to render the headers as searchable HTML.
 
 The core workflows use public calls present in v0.2.0 and current source, and were exercised against the published 0.2.0 library. That release pins Lance 15.0.0-beta.25; a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Behavior that requires a newer Lance core is not part of the 0.2.0 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
 
