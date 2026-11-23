@@ -67,8 +67,8 @@ def main() -> int:
     parser.add_argument(
         "header",
         nargs="?",
-        default="include/lance/lance.h",
-        help="header to update (default: include/lance/lance.h)",
+        default="include/lance/version.h",
+        help="header to update (default: include/lance/version.h)",
     )
     parser.add_argument(
         "--check",

@@ -112,10 +112,10 @@ jobs:
         run: bash .github/scripts/strip-release-shared.sh stage "${{ runner.os }}"
       - name: Verify Linux shared-library exports
         if: runner.os == 'Linux'
-        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance/lance.h linux
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.so stage/include/lance linux
       - name: Verify macOS shared-library exports
         if: runner.os == 'macOS'
-        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance/lance.h macos
+        run: bash .github/scripts/verify-shared-exports.sh stage/lib/liblance_c.dylib stage/include/lance macos
       - name: Verify Linux staged runtime dependencies
         if: runner.os == 'Linux'
         run: bash .github/scripts/verify-linux-staging.sh stage ${{ matrix.target }}

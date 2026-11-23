@@ -322,8 +322,8 @@ fn batch_nearest_indexed_shared_and_refined_fallback() {
     let (_dir, uri) = fixture();
     let data = Data::open(&uri);
     let params = LanceVectorIndexParams {
-        index_type: LanceVectorIndexType::IvfFlat,
-        metric: LanceMetricType::L2,
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
         num_partitions: 2,
         num_sub_vectors: 0,
         num_bits: 0,

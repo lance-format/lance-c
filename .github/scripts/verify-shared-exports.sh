@@ -3,26 +3,52 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 #
 # Verify that a staged release shared library exports exactly the public C ABI
-# declared by the installed header.
+# declared by the installed headers. <header-or-dir> accepts an installed
+# include/lance directory or any public header inside it. A header that
+# includes sibling domain headers is resolved to its installed header set; a
+# standalone pre-split single header is scanned as-is.
 
 set -euo pipefail
 export LC_ALL=C
 
 if [ "$#" -ne 3 ]; then
-    echo "usage: $0 <library> <header> <linux|macos>" >&2
+    echo "usage: $0 <library> <header-or-dir> <linux|macos>" >&2
     exit 2
 fi
 
 library=$1
-header=$2
+header_source=$2
 platform=$3
 
 if [ ! -f "$library" ]; then
     echo "shared library is missing: $library" >&2
     exit 1
 fi
-if [ ! -f "$header" ]; then
-    echo "public C header is missing: $header" >&2
+
+header_files=()
+if [ -d "$header_source" ]; then
+    header_dir=$header_source
+    while IFS= read -r -d '' header_file; do
+        header_files+=("$header_file")
+    done < <(find "$header_dir" -maxdepth 1 -type f -name '*.h' -print0 | sort -z)
+elif [ -f "$header_source" ]; then
+    if grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"lance/[^"]+\.h"' "$header_source"; then
+        # The modular umbrella (or a domain header) names sibling headers, so
+        # the installed set beside it is the expected public ABI.
+        header_dir=$(dirname "$header_source")
+        while IFS= read -r -d '' header_file; do
+            header_files+=("$header_file")
+        done < <(find "$header_dir" -maxdepth 1 -type f -name '*.h' -print0 | sort -z)
+    else
+        # Pre-split artifacts shipped one self-contained header.
+        header_files=("$header_source")
+    fi
+else
+    echo "public C headers are missing: $header_source" >&2
+    exit 1
+fi
+if [ "${#header_files[@]}" -eq 0 ]; then
+    echo "no public headers found: $header_source" >&2
     exit 1
 fi
 
@@ -32,7 +58,9 @@ trap 'rm -rf "$work_dir"' EXIT
 expected="$work_dir/expected"
 actual="$work_dir/actual"
 
-sed '/^[[:space:]]*\*/d' "$header" |
+for header in "${header_files[@]}"; do
+    sed '/^[[:space:]]*\*/d' "$header"
+done |
     grep -oE 'lance_[A-Za-z0-9_]+[[:space:]]*\(' |
     sed 's/[[:space:]]*($//' |
     sort -u >"$expected"

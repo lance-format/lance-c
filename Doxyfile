@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+# Doxygen configuration for the public lance-c headers.
+#
+# This renders the public C headers in include/lance/ and the C++ RAII wrappers
+# in include/lance/lance.hpp into HTML under build/doxygen/html. It does not
+# read any other source file and does not publish the result.
+#
+# CI runs .github/scripts/check-doxygen.sh, which renders this configuration
+# with warnings treated as errors. Doxygen 1.12.0 is pinned by
+# .github/scripts/install-doxygen.sh so local and CI diagnostics match; bump
+# both scripts and this file together.
+
+PROJECT_NAME           = "Lance C/C++ Bindings"
+PROJECT_BRIEF          = "C ABI and header-only C++ RAII wrappers for the Lance columnar data format"
+
+OUTPUT_DIRECTORY       = build/doxygen
+QUIET                  = YES
+
+INPUT                  = include/lance/lance.h \
+                         include/lance/version.h \
+                         include/lance/error.h \
+                         include/lance/arrow_abi.h \
+                         include/lance/fwd.h \
+                         include/lance/dataset.h \
+                         include/lance/scanner.h \
+                         include/lance/batch.h \
+                         include/lance/lance.hpp
+RECURSIVE              = NO
+EXCLUDE_SYMLINKS       = YES
+STRIP_FROM_PATH        = include
+STRIP_FROM_INC_PATH    = include
+
+# Document every entity in the public headers so the reference can be used for
+# discovery, but only demand documentation for parameters that a documented
+# function already names. WARN_IF_INCOMPLETE_DOC is what reports a documented
+# parameter without a description.
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+HIDE_UNDOC_CLASSES     = NO
+HIDE_UNDOC_MEMBERS     = NO
+SORT_MEMBER_DOCS       = YES
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+VERBATIM_HEADERS       = YES
+GENERATE_TREEVIEW      = YES
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+SEARCHENGINE           = YES
+GENERATE_LATEX         = NO
+
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
+WARN_FORMAT            = "$file:$line: $text"
+WARN_LOGFILE           = build/doxygen/warnings.log

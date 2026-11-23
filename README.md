@@ -48,6 +48,10 @@ find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
+C and C++ applications using `<lance/lance.h>` link `LanceC::lance_c`.
+For the C++20 wrapper `<lance/lance.hpp>`, link `LanceC::lance_cpp` instead;
+it selects the required C++ standard and links the C library.
+
 CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules).
 
 With pkg-config, point `PKG_CONFIG_PATH` at the archive's `lib/pkgconfig`:
@@ -64,7 +68,8 @@ Add `--static` and link `liblance_c.a` explicitly when using the static archive;
 
 ## Documentation
 
-- [C and C++ API guide](docs/api-guide.md) for scans, vector search, writes, transactions, dataset maintenance, [opt-in diagnostic logging](docs/api-guide.md#diagnostic-logging), and [Tokio worker-thread configuration](docs/api-guide.md#tokio-runtime-worker-threads).
+- [C and C++ API guide](docs/api-guide.md) for scans, vector search, writes, transactions, dataset maintenance, [opt-in diagnostic logging](docs/api-guide.md#diagnostic-logging), [Tokio worker-thread configuration](docs/api-guide.md#tokio-runtime-worker-threads), and [process lifetime during embedding](docs/api-guide.md#process-lifetime-and-embedding).
+- [Generated API reference](docs/api-reference.md) for the Doxygen HTML render and the documentation checks CI runs.
 - [Segment-scoped scalar scans](docs/scalar-segment-scans.md) and [publishing blob data](docs/blob-writer-dataset-publication.md) for specialized workflows.
 - [Building and packaging](docs/building-and-packaging.md) for platform toolchains, source builds, and releases.
 

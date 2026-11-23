@@ -19,7 +19,7 @@ This document provides platform-specific build instructions, binary packaging co
 
 Each release `.tar.xz` archive unpacks an install prefix containing:
 
-- `include/lance/lance.h` and `include/lance/lance.hpp`
+- `include/lance/lance.h` (umbrella), `include/lance/lance.hpp`, and the domain headers under `include/lance/`
 - Static and shared libraries under `lib/` (plus `lib/lance_c.dll.lib` on Windows)
 - `lib/cmake/LanceC/` (`LanceCConfig.cmake` and `LanceCConfigVersion.cmake`)
 - `lib/pkgconfig/lance-c.pc`
@@ -57,7 +57,7 @@ Follow the [quickstart](../README.md#quickstart) to verify the archive and open 
 
 Every package installs both the static archive and the shared library, and the two differ in what they define and what they need at load time.
 
-| | Static (`LanceC_LINK=static`, default) | Shared (`LanceC_LINK=shared`) |
+| | Static (default) | Shared |
 | --- | --- | --- |
 | Link input | `liblance_c.a` / `lance_c.lib` | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll.lib` |
 | Runtime file | none; the executable carries the pulled archive members | `liblance_c.so` / `liblance_c.dylib` / `lance_c.dll` |
@@ -68,7 +68,7 @@ The release static archive is deliberately unstripped: it keeps the symbol table
 
 Use shared linkage when the host itself links zstd, LZ4 or another library that exports the same symbol names, or when several components in one process link lance-c. The shared library exports only the `lance_*` C ABI; its embedded native symbols are hidden from those public exports and do not appear in its dynamic symbol table. Make the installed shared library available to the loader through the system library path, an `$ORIGIN`-based RUNPATH, `LD_LIBRARY_PATH`, or the local equivalent. Copying it next to an ELF executable does not make it loadable unless the loader also searches that directory.
 
-Use static linkage when the host does not link libraries exporting those names and should not depend on the lance-c shared library. A static consumer is still subject to the platform system libraries recorded in the package metadata, such as `-lpthread -ldl -lm` on Linux.
+Use static linkage when the host does not link libraries exporting those names and should not depend on the lance-c shared library. Static targets propagate the required platform system libraries, such as `-lpthread -ldl -lm` on Linux; shared linkage resolves those dependencies through the shared library.
 
 With CMake, set `LanceC_LINK` before `find_package`:
 
@@ -78,7 +78,11 @@ find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
-The C++ wrapper is header-only, so its linkage follows the C library. On Windows, shared linkage also removes the `/MT` static-CRT requirement for consumers; see [Windows linking](#consuming-the-windows-package-and-mt-crt-rules). pkg-config already selects the shared library when both are installed; [Using pkg-config](#using-pkg-config) shows the explicit static invocation.
+For an embedded build (`add_subdirectory()` or `FetchContent_MakeAvailable()`), set `LANCE_C_LINK` to `shared` before adding the subdirectory; the same `LanceC::` targets are created.
+
+C applications and C++ applications that use only `<lance/lance.h>` link `LanceC::lance_c`. For `<lance/lance.hpp>`, link `LanceC::lance_cpp`; it adds the C++20 compile feature and links `LanceC::lance_c`, so the same linkage selection applies to the wrapper. The [CMake source build section](#from-source-via-cmake-cc-developers-and-packagers) lists the targets and the C++17/C++20 migration.
+
+On Windows, shared linkage also removes the `/MT` static-CRT requirement for consumers; see [Windows linking](#consuming-the-windows-package-and-mt-crt-rules). pkg-config already selects the shared library when both are installed; [Using pkg-config](#using-pkg-config) shows the explicit static invocation.
 
 <a id="from-source-via-cargo-rust-developers"></a>
 ## Building from source via Cargo
@@ -110,6 +114,17 @@ cmake --build build --parallel
 cmake --install build --prefix /your/prefix
 ```
 
+An installed Corrosion 0.5 package in `CMAKE_PREFIX_PATH` is used before
+fetching the pinned Corrosion 0.5.1 sources. This also works on CMake 3.22;
+offline builds must provide the Rust dependencies separately.
+
+The equivalent preset commands are `cmake --preset release`,
+`cmake --build --preset release`, and `ctest --preset release`.
+Standalone builds enable `BUILD_TESTING` by default. CTest runs the CMake
+metadata and consumer compilation tests without rebuilding Rust; use
+`-DBUILD_TESTING=OFF` to omit them. Embedded builds leave testing and compiler
+defaults under the parent project's control.
+
 On macOS, export `MACOSX_DEPLOYMENT_TARGET` in the environment that invokes CMake. With the pinned Corrosion 0.5.1, setting only `CMAKE_OSX_DEPLOYMENT_TARGET` does not propagate to Cargo build scripts:
 
 ```bash
@@ -126,6 +141,27 @@ cmake --install build --prefix /your/prefix
 find_package(LanceC CONFIG REQUIRED)
 target_link_libraries(myapp PRIVATE LanceC::lance_c)
 ```
+
+`LanceC::lance_c`, `LanceC::lance_c_static`, and `LanceC::lance_c_shared`
+expose the C11 API in `<lance/lance.h>`. They also support C++ applications
+using that header without raising the application's C++ standard.
+For the header-only C++20 wrappers in `<lance/lance.hpp>`, use:
+
+```cmake
+target_link_libraries(myapp PRIVATE LanceC::lance_cpp)
+```
+
+`LanceC::lance_cpp` links the default C target, so `LanceC_LINK=shared` selects
+shared linkage for the wrapper too. Static targets propagate the required
+platform system libraries; shared targets keep those dependencies private.
+The same targets are available through `add_subdirectory()` and `FetchContent`;
+set `LANCE_C_LINK` for their default linkage.
+
+Migration: C++ consumers that previously relied on `LanceC::lance_c` to enable
+C++20 should switch to `LanceC::lance_cpp`, or explicitly request
+`target_compile_features(myapp PRIVATE cxx_std_20)` while linking their chosen
+C target. Older release packages without `LanceC::lance_cpp` still need that
+explicit C++ standard.
 
 An unversioned `find_package(LanceC CONFIG REQUIRED)` accepts the package in the selected prefix. Pass a version number only to require a specific minor release line; `SameMinorVersion` compatibility rejects a `0.1` request against a `0.2` package.
 
@@ -205,7 +241,7 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
    - **release_type**: `patch` / `minor` / `major`. Use `current` to keep the version in `Cargo.toml`: with `stable` after the release PR has set the baseline version, or with `preview` to cut another beta on the same base version.
    - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
    - **dry_run**: leave on for the first run to preview the computed tag and version without pushing.
-3. Re-run with **dry_run** off. When the version changes, the workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/lance.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref. With `release_type: current`, it tags the current release commit without another version commit.
+3. Re-run with **dry_run** off. When the version changes, the workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/version.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref. With `release_type: current`, it tags the current release commit without another version commit.
 4. Verify that the release page contains all expected platform archives and checksums. Download an archive and run the consumer from the same tag.
 
 > **Branch protection:** If `main` is protected, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or configure `create-release.yml` with a PAT that has `contents: write`.

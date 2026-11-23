@@ -4,9 +4,9 @@
 //! Tests for the CMake helpers under `cmake/` that aren't directly exercised by
 //! Rust code but are critical to the `find_package(LanceC)` consumer story.
 //!
-//! These tests `cmake -P` standalone CMake scripts that assert on version
-//! parsing and package selection. CMake is pre-installed on every GitHub-hosted
-//! runner, so this runs in the standard CI lane (no `--ignored` gate).
+//! These tests run standalone CMake scripts that assert on version parsing,
+//! package selection and consumer compilation. CMake is pre-installed on every
+//! GitHub-hosted runner, so this runs in the standard CI lane (no `--ignored` gate).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -50,5 +50,13 @@ fn consumer_requests_the_version_from_its_source_tree() {
     run_cmake_script(
         "test_consumer_version.cmake",
         "All consumer version tests passed.",
+    );
+}
+
+#[test]
+fn targets_preserve_consumer_language_and_link_requirements() {
+    run_cmake_script(
+        "test_target_interfaces.cmake",
+        "All target interface tests passed.",
     );
 }

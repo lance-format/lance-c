@@ -1,6 +1,6 @@
 # C and C++ API guide
 
-See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function.
+See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function; see [Generated C/C++ API reference](api-reference.md) to render the headers as searchable HTML.
 
 The core workflows use public calls present in v0.2.0 and current source, and were exercised against the published 0.2.0 library. That release pins Lance 15.0.0-beta.25; a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Behavior that requires a newer Lance core is not part of the 0.2.0 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
 
@@ -90,6 +90,23 @@ const uint64_t offsets[] = {0, 4, 9};
 ArrowArrayStream raw{};
 dataset.take(offsets, 3, &raw);  /* the overload accepts a column list */
 lance::ArrowStream rows(raw);
+```
+
+`take_rows` also has a borrowing overload that takes
+`std::span<const uint64_t>`. `std::vector`, `std::array` and C arrays convert
+to it directly. The range is read only during the call, and an empty range
+(even one with a null data pointer) reads zero rows. The pointer/count
+overloads keep working.
+
+```cpp
+std::vector<uint64_t> row_ids{0, 4, 9};
+ArrowArrayStream raw{};
+dataset.take_rows(row_ids, &raw);  /* all columns */
+lance::ArrowStream all_columns(raw);
+
+ArrowArrayStream projected_raw{};
+dataset.take_rows(row_ids, {"id", "name"}, &projected_raw);
+lance::ArrowStream projected(projected_raw);
 ```
 
 ## Vector and full-text search
@@ -421,14 +438,42 @@ try {
 }
 ```
 
-A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in the [C header](../include/lance/lance.h) for the complete boundary.
+A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in [error.h](../include/lance/error.h) for the complete boundary.
 
 ## Header inclusion
 
-The C++ wrapper `<lance/lance.hpp>` is a large header-only interface. Include
-it only in the `.cpp` translation units that use the C++ API, rather than in
-widely included project headers, to limit compile time and rebuild scope where
-practical. C callers include `<lance/lance.h>` directly.
+`<lance/lance.h>` is the umbrella C header and keeps the complete 0.2 public
+ABI. C callers that use only the dataset read path can include the focused
+domain headers instead:
+
+- `<lance/dataset.h>` — dataset open and close, snapshots, metadata and version history
+- `<lance/scanner.h>` — scanner configuration, planning and iteration
+- `<lance/batch.h>` — `LanceBatch` conversion to and from the Arrow C Data Interface
+
+Each domain header includes `<lance/arrow_abi.h>` and `<lance/fwd.h>`.
+Include `<lance/error.h>` as well when calling `lance_last_error_code()`,
+`lance_last_error_message()` or `lance_free_string()`, and
+`<lance/version.h>` for the version macros or `lance_c_version()`. The umbrella
+already brings in every header. For example, a read consumer that reports
+errors includes:
+
+```c
+#include <lance/dataset.h>
+#include <lance/scanner.h>
+#include <lance/error.h>
+```
+
+Every public header is self-contained: it can be the first include in a C11 or
+C++20 translation unit.
+
+Selective includes change neither the ABI nor the behavior, and the umbrella
+remains the safe choice for code that uses several domains. Existing code does
+not need to change.
+
+The C++ wrapper `<lance/lance.hpp>` is a large header-only interface and still
+includes the umbrella C header. Include it only in the `.cpp` translation units
+that use the C++ API, rather than in widely included project headers, to limit
+compile time and rebuild scope where practical.
 
 ## Binding version
 
@@ -1125,7 +1170,7 @@ approximate and may change as cache maintenance runs.
 ## Thread safety
 
 The C pointer is a lifetime token, not a lock, and a `const` qualifier does not
-by itself permit concurrent calls. The [header](../include/lance/lance.h)
+by itself permit concurrent calls. The [umbrella header](../include/lance/lance.h)
 defines the complete contract; the main cases are:
 
 - `LanceDataset` handles are shareable. Snapshot reads and in-place mutations
@@ -1414,3 +1459,39 @@ This variable controls the runtime's core worker threads only. Tokio's blocking
 pool cap is `max_blocking_threads + worker_threads` (512 plus the worker count
 by default), and the async callback dispatcher uses its own thread. So
 `TOKIO_WORKER_THREADS` does not bound every thread the library may create.
+
+## Process lifetime and embedding
+
+The process-global state described above lasts for the whole process: the
+shared runtime and the diagnostic globals installed by `lance_init_logging`
+are created lazily and are never taken down. The callback dispatcher is
+attempted on the first callback dispatch and, if its thread starts, normally
+remains for the process lifetime. The C API exposes no shutdown, reset, or
+reinitialization call for any of them.
+
+- The runtime is built on first use and reused by every later call. Its core
+  worker threads stay alive until process exit, including while the library is
+  idle. Blocking-pool threads are separate: Tokio retires them after an idle
+  keep-alive (10 seconds by default), and they can be recreated later.
+- The async callback dispatcher is started on demand: the binding attempts to
+  start its thread on the first callback dispatch. If the thread starts, it
+  normally remains for the process lifetime. If startup fails or a completion
+  cannot be queued, that completion is delivered on the thread attempting to
+  dispatch it, which is not necessarily the thread that made the original API
+  call.
+- `lance_init_logging` installs its globals once. There is no API to remove or
+  reload them, and later calls are no-ops, so the configuration from the first
+  successful call lasts until process exit.
+
+Hosts that manage process lifetime themselves should account for this state:
+
+- **`fork()`**: `lance-c` provides no post-fork reset or reinitialization API
+  and registers no `pthread_atfork` handler of its own. Behavior of inherited
+  runtime, dispatcher, or logging state in a forked child is not part of the
+  documented contract. A host that forks after its first runtime-backed call or
+  after `lance_init_logging` has no binding API that restores a clean state in
+  the child.
+- **`dlopen`/`dlclose`**: because there is no shutdown call, an unload path has
+  no supported way to stop the runtime or dispatcher or to uninstall the
+  logging globals before the library is unloaded. Unloading the library after
+  it has used the runtime is not a documented support path.

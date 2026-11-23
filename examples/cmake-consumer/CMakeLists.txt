@@ -31,10 +31,10 @@ if(WIN32 AND LanceC_STATIC_CRT)
 endif()
 
 add_executable(consumer main.cpp)
-target_link_libraries(consumer PRIVATE LanceC::lance_c)
+target_link_libraries(consumer PRIVATE LanceC::lance_cpp)
 
 add_executable(acceptance acceptance.cpp)
-target_link_libraries(acceptance PRIVATE LanceC::lance_c)
+target_link_libraries(acceptance PRIVATE LanceC::lance_cpp)
 
 add_executable(workflow workflow.cpp)
-target_link_libraries(workflow PRIVATE LanceC::lance_c)
+target_link_libraries(workflow PRIVATE LanceC::lance_cpp)

@@ -246,3 +246,58 @@ fn prewarm_colliding_segments_preserves_sdk_fallback() {
         );
     });
 }
+
+#[test]
+fn vector_index_type_from_c_accepts_documented_raw_values() {
+    for (raw, expected) in [
+        (101, LanceVectorIndexType::IvfFlat),
+        (102, LanceVectorIndexType::IvfSq),
+        (103, LanceVectorIndexType::IvfPq),
+        (104, LanceVectorIndexType::IvfHnswSq),
+        (105, LanceVectorIndexType::IvfHnswPq),
+        (106, LanceVectorIndexType::IvfHnswFlat),
+        (107, LanceVectorIndexType::IvfRq),
+    ] {
+        assert_eq!(
+            LanceVectorIndexType::from_c(raw).unwrap(),
+            expected,
+            "raw {raw}"
+        );
+    }
+}
+
+#[test]
+fn vector_index_type_from_c_rejects_out_of_range_raw_values() {
+    for raw in [0, 100, 108, -1, i32::MAX, i32::MIN] {
+        let error = LanceVectorIndexType::from_c(raw).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("invalid vector index type: {raw}")),
+            "raw {raw}: {error}"
+        );
+    }
+}
+
+#[test]
+fn metric_type_from_c_accepts_documented_raw_values() {
+    for (raw, expected) in [
+        (0, LanceMetricType::L2),
+        (1, LanceMetricType::Cosine),
+        (2, LanceMetricType::Dot),
+        (3, LanceMetricType::Hamming),
+    ] {
+        assert_eq!(LanceMetricType::from_c(raw).unwrap(), expected, "raw {raw}");
+    }
+}
+
+#[test]
+fn metric_type_from_c_rejects_out_of_range_raw_values() {
+    for raw in [-1, 4, i32::MAX, i32::MIN] {
+        let error = LanceMetricType::from_c(raw).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!(
+                "metric must be one of 0 (L2), 1 (Cosine), 2 (Dot), or 3 (Hamming); got {raw}"
+            )),
+            "raw {raw}: {error}"
+        );
+    }
+}

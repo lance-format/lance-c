@@ -12,8 +12,9 @@
 #     2. Stage <cargo-profile-dir>/liblance_c.* via LANCE_C_USE_PREBUILT=ON and
 #        run `cmake --install` into a clean prefix.
 #     3. Verify macOS Mach-O architectures when running on Darwin.
-#     4. Build and run `examples/cmake-consumer` from the source tree and from a
-#        copied-out directory against the installed prefix, with both static
+#     4. Build and run pure-C and C++17 C API consumers via find_package and
+#        add_subdirectory, then `examples/cmake-consumer` from the source tree
+#        and from a copied-out directory against the installed prefix, with both static
 #        and shared linkage. This includes the write/index/query workflow.
 #     5. Build and run `examples/c-scan` through pkg-config with both dynamic and
 #        static linkage.
@@ -149,12 +150,12 @@ verify_consumer_prefix() {
                 "$install_prefix" "$(uname -m)"
             bash "$repo_root/.github/scripts/verify-shared-exports.sh" \
                 "$install_prefix/lib/liblance_c.dylib" \
-                "$install_prefix/include/lance/lance.h" macos
+                "$install_prefix/include/lance" macos
             ;;
         Linux)
             bash "$repo_root/.github/scripts/verify-shared-exports.sh" \
                 "$install_prefix/lib/liblance_c.so" \
-                "$install_prefix/include/lance/lance.h" linux
+                "$install_prefix/include/lance" linux
             ;;
         *)
             echo "unsupported platform: $(uname -s)" >&2
@@ -185,6 +186,25 @@ verify_consumer_prefix() {
         -P "$repo_root/cmake/verify_installed_metadata.cmake"
 
     verify_pkg_config_consumer "$install_prefix"
+
+    # Exercise project(... LANGUAGES C) and a C++17 application that includes
+    # only lance.h. The existing examples below exercise the C++20 wrapper.
+    for integration in installed subdirectory; do
+        for linkage in static shared; do
+            for language in C CXX; do
+                local api_build="$work_dir/c-api-${integration}-${linkage}-${language}"
+                echo "==> Testing ${language} C API consumer (${integration}, ${linkage})"
+                cmake -S "$repo_root/cmake/tests/target-consumer" -B "$api_build" \
+                    -DTEST_REPO="$repo_root" -DTEST_PREFIX="$install_prefix" \
+                    -DCMAKE_PREFIX_PATH="$install_prefix" \
+                    -DTEST_MODE="$integration" -DTEST_LANGUAGE="$language" \
+                    -DTEST_LINK_CONSUMER=ON -DLanceC_LINK="$linkage" \
+                    -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+                cmake --build "$api_build" --parallel
+                "$api_build/consumer"
+            done
+        done
+    done
 
     local dataset_uri="$repo_root/test_data/v0.27.1/pq_in_schema"
     local expected_dataset_output="rows: 512, version: 2"

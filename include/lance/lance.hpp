@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -9766,6 +9767,17 @@ public:
         }
     }
 
+    /// Borrow row IDs from a contiguous range. Accepted sources include
+    /// `std::span`, `std::vector`, `std::array` and C arrays; the range is only
+    /// read during this call, so no copy or lifetime extension is required.
+    /// An empty range, including one whose `data()` is null, produces an empty
+    /// stream. `out` has the same ownership as the pointer/count overload.
+    void take_rows(std::span<const uint64_t> row_ids,
+                   const std::vector<std::string>& columns,
+                   ArrowArrayStream* out) const {
+        take_rows(row_ids.data(), row_ids.size(), columns, out);
+    }
+
     /// Take all columns by dataset row IDs with the same stream ownership as
     /// the overload above.
     void take_rows(const uint64_t* row_ids, size_t num_row_ids,
@@ -9774,6 +9786,13 @@ public:
                 handle_.get(), row_ids, num_row_ids, nullptr, out) != 0) {
             check_error();
         }
+    }
+
+    /// Borrow all-column row IDs with the same range lifetime, empty-range and
+    /// stream-ownership rules as the span overload above.
+    void take_rows(std::span<const uint64_t> row_ids,
+                   ArrowArrayStream* out) const {
+        take_rows(row_ids.data(), row_ids.size(), out);
     }
 
     /// Take blob handles by dataset row ID; element `i` is for `row_ids[i]`,

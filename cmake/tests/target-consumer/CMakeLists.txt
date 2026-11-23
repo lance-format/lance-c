@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+cmake_minimum_required(VERSION 3.22)
+project(target_consumer LANGUAGES ${TEST_LANGUAGE})
+
+# Deliberately differ from LanceC's standalone defaults.
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED OFF)
+set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+set(CMAKE_C_EXTENSIONS ON)
+set(CMAKE_CXX_EXTENSIONS ON)
+set(CMAKE_C_VISIBILITY_PRESET default)
+set(CMAKE_CXX_VISIBILITY_PRESET default)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "")
+
+if(TEST_MODE STREQUAL "installed")
+    find_package(LanceC CONFIG REQUIRED)
+    # Repeated discovery must not redefine the wrapper target.
+    find_package(LanceC CONFIG REQUIRED)
+else()
+    set(LANCE_C_USE_PREBUILT ON CACHE BOOL "" FORCE)
+    set(LANCE_C_PREBUILT_DIR "${TEST_PREFIX}" CACHE PATH "" FORCE)
+    set(LANCE_C_CRT_STATIC OFF CACHE BOOL "" FORCE)
+    set(LANCE_C_LINK "${LanceC_LINK}" CACHE STRING "" FORCE)
+    if(TEST_MODE STREQUAL "subdirectory")
+        add_subdirectory("${TEST_REPO}" lance-c)
+    else()
+        include(FetchContent)
+        FetchContent_Declare(LanceC SOURCE_DIR "${TEST_REPO}")
+        FetchContent_MakeAvailable(LanceC)
+    endif()
+    # Check the dependency directory as well: ordinary set() calls there do
+    # not propagate upward, but still change defaults for its child targets.
+    foreach(_variable IN ITEMS
+            CMAKE_C_STANDARD CMAKE_CXX_STANDARD
+            CMAKE_C_STANDARD_REQUIRED CMAKE_CXX_STANDARD_REQUIRED
+            CMAKE_C_EXTENSIONS CMAKE_CXX_EXTENSIONS
+            CMAKE_C_VISIBILITY_PRESET CMAKE_CXX_VISIBILITY_PRESET
+            CMAKE_VISIBILITY_INLINES_HIDDEN CMAKE_OSX_DEPLOYMENT_TARGET)
+        get_directory_property(_actual DIRECTORY "${TEST_REPO}"
+            DEFINITION "${_variable}")
+        if(NOT "${_actual}" STREQUAL "${${_variable}}")
+            message(FATAL_ERROR "LanceC changed ${_variable}: '${${_variable}}' -> '${_actual}'")
+        endif()
+    endforeach()
+endif()
+
+if(TEST_LANGUAGE STREQUAL "C" AND CMAKE_CXX_COMPILER_LOADED)
+    message(FATAL_ERROR "C package enabled CXX")
+endif()
+
+foreach(_target LanceC::lance_c_static LanceC::lance_c_shared)
+    get_target_property(_features ${_target} INTERFACE_COMPILE_FEATURES)
+    if(NOT _features STREQUAL "c_std_11")
+        message(FATAL_ERROR "${_target} requires '${_features}', expected c_std_11")
+    endif()
+endforeach()
+get_target_property(_shared_links LanceC::lance_c_shared INTERFACE_LINK_LIBRARIES)
+get_target_property(_static_links LanceC::lance_c_static INTERFACE_LINK_LIBRARIES)
+if(TEST_MODE STREQUAL "installed")
+    if(_shared_links)
+        message(FATAL_ERROR "Shared library exports dependencies: ${_shared_links}")
+    endif()
+    include("${TEST_REPO}/cmake/platform-deps.cmake")
+    lance_c_platform_dependencies(_expected_static_links "${CMAKE_SYSTEM_NAME}")
+else()
+    if(WIN32)
+        set(_expected_shared "${TEST_PREFIX}/lib/lance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        set(_expected_static "${TEST_PREFIX}/lib/lance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    else()
+        set(_expected_shared "${TEST_PREFIX}/lib/liblance_c${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        set(_expected_static "${TEST_PREFIX}/lib/liblance_c${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    endif()
+    # CACHE PATH normalizes redundant separators in LANCE_C_PREBUILT_DIR.
+    # Normalize only expectations so TEST_PREFIX still exercises that input.
+    cmake_path(NORMAL_PATH _expected_shared)
+    cmake_path(NORMAL_PATH _expected_static)
+    if(NOT _shared_links STREQUAL _expected_shared)
+        message(FATAL_ERROR
+            "Shared interface differs: expected '${_expected_shared}', got '${_shared_links}'")
+    endif()
+    set(_expected_static_links "${_expected_static};LanceC_platform_deps")
+endif()
+if(NOT _static_links STREQUAL _expected_static_links)
+    message(FATAL_ERROR
+        "Static dependencies differ: expected '${_expected_static_links}', got '${_static_links}'")
+endif()
+get_target_property(_alias LanceC::lance_c ALIASED_TARGET)
+if(NOT _alias STREQUAL "LanceC::lance_c_${LanceC_LINK}")
+    message(FATAL_ERROR "Unexpected default target: ${_alias}")
+endif()
+get_target_property(_cpp_features LanceC::lance_cpp INTERFACE_COMPILE_FEATURES)
+get_target_property(_cpp_links LanceC::lance_cpp INTERFACE_LINK_LIBRARIES)
+if(NOT _cpp_features STREQUAL "cxx_std_20" OR NOT _cpp_links STREQUAL "LanceC::lance_c")
+    message(FATAL_ERROR "C++ wrapper interface differs: ${_cpp_features}, ${_cpp_links}")
+endif()
+
+if(TEST_LANGUAGE STREQUAL "C")
+    set(_source "${CMAKE_CURRENT_BINARY_DIR}/consumer.c")
+    file(WRITE "${_source}" "#include <lance/lance.h>\nint main(void) { return lance_c_version() == NULL; }\n")
+else()
+    set(_source "${CMAKE_CURRENT_BINARY_DIR}/consumer.cpp")
+    if(TEST_CPP_WRAPPER)
+        file(WRITE "${_source}" "#include <lance/lance.hpp>\nstatic_assert(__cplusplus >= 202002L);\nint main() { return lance::version().empty(); }\n")
+    else()
+        file(WRITE "${_source}" "#include <lance/lance.h>\nstatic_assert(__cplusplus == 201703L);\nint main() { return lance_c_version() == nullptr; }\n")
+    endif()
+endif()
+
+# By default compile the real headers without requiring a Rust library build.
+# The package verification script also links and runs the same consumers.
+option(TEST_LINK_CONSUMER "Link against real library artifacts" OFF)
+if(TEST_LINK_CONSUMER)
+    add_executable(consumer "${_source}")
+else()
+    add_library(consumer OBJECT "${_source}")
+endif()
+if(MSVC AND TEST_LANGUAGE STREQUAL "CXX")
+    target_compile_options(consumer PRIVATE /Zc:__cplusplus)
+endif()
+if(TEST_CPP_WRAPPER)
+    target_link_libraries(consumer PRIVATE LanceC::lance_cpp)
+else()
+    target_link_libraries(consumer PRIVATE LanceC::lance_c)
+endif()

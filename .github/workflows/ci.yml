@@ -96,11 +96,13 @@ jobs:
         run: manylinux-install-clang -v 20.1.8.0
       - name: Ensure pkg-config
         run: command -v pkg-config >/dev/null || dnf install -y pkgconf-pkg-config
+      - name: Compile public headers with GCC and Clang
+        run: bash .github/scripts/verify-cxx-headers.sh
       - uses: ./.github/actions/setup-protoc
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
-        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance/lance.h linux
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.so include/lance linux
       - name: Run tests
         run: cargo test
       - name: Run C/C++ compilation tests
@@ -141,7 +143,7 @@ jobs:
       - name: Build library artifacts
         run: cargo build --lib
       - name: Verify shared-library exports
-        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance/lance.h macos
+        run: bash .github/scripts/verify-shared-exports.sh target/debug/liblance_c.dylib include/lance macos
       - name: Report and free cached test build headroom
         run: bash .github/scripts/free-macos-consumer-space.sh target/debug
       - name: Run tests
@@ -353,6 +355,17 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+  api-docs:
+    name: API docs (Doxygen)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Doxygen
+        run: bash .github/scripts/install-doxygen.sh
+      - name: Render and validate the public API reference
+        run: bash .github/scripts/check-doxygen.sh
 
   msrv:
     name: MSRV (1.95.0)
