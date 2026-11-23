@@ -438,14 +438,42 @@ try {
 }
 ```
 
-A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in the [C header](../include/lance/lance.h) for the complete boundary.
+A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in [error.h](../include/lance/error.h) for the complete boundary.
 
 ## Header inclusion
 
-The C++ wrapper `<lance/lance.hpp>` is a large header-only interface. Include
-it only in the `.cpp` translation units that use the C++ API, rather than in
-widely included project headers, to limit compile time and rebuild scope where
-practical. C callers include `<lance/lance.h>` directly.
+`<lance/lance.h>` is the umbrella C header and keeps the complete 0.2 public
+ABI. C callers that use only the dataset read path can include the focused
+domain headers instead:
+
+- `<lance/dataset.h>` — dataset open and close, snapshots, metadata and version history
+- `<lance/scanner.h>` — scanner configuration, planning and iteration
+- `<lance/batch.h>` — `LanceBatch` conversion to and from the Arrow C Data Interface
+
+Each domain header includes `<lance/arrow_abi.h>` and `<lance/fwd.h>`.
+Include `<lance/error.h>` as well when calling `lance_last_error_code()`,
+`lance_last_error_message()` or `lance_free_string()`, and
+`<lance/version.h>` for the version macros or `lance_c_version()`. The umbrella
+already brings in every header. For example, a read consumer that reports
+errors includes:
+
+```c
+#include <lance/dataset.h>
+#include <lance/scanner.h>
+#include <lance/error.h>
+```
+
+Every public header is self-contained: it can be the first include in a C11 or
+C++20 translation unit.
+
+Selective includes change neither the ABI nor the behavior, and the umbrella
+remains the safe choice for code that uses several domains. Existing code does
+not need to change.
+
+The C++ wrapper `<lance/lance.hpp>` is a large header-only interface and still
+includes the umbrella C header. Include it only in the `.cpp` translation units
+that use the C++ API, rather than in widely included project headers, to limit
+compile time and rebuild scope where practical.
 
 ## Binding version
 
@@ -1142,7 +1170,7 @@ approximate and may change as cache maintenance runs.
 ## Thread safety
 
 The C pointer is a lifetime token, not a lock, and a `const` qualifier does not
-by itself permit concurrent calls. The [header](../include/lance/lance.h)
+by itself permit concurrent calls. The [umbrella header](../include/lance/lance.h)
 defines the complete contract; the main cases are:
 
 - `LanceDataset` handles are shareable. Snapshot reads and in-place mutations

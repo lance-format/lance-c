@@ -3,9 +3,9 @@
 
 # Doxygen configuration for the public lance-c headers.
 #
-# This renders the C API in include/lance/lance.h and the C++ RAII wrappers in
-# include/lance/lance.hpp into HTML under build/doxygen/html. It does not read
-# any other source file and does not publish the result.
+# This renders the public C headers in include/lance/ and the C++ RAII wrappers
+# in include/lance/lance.hpp into HTML under build/doxygen/html. It does not
+# read any other source file and does not publish the result.
 #
 # CI runs .github/scripts/check-doxygen.sh, which renders this configuration
 # with warnings treated as errors. Doxygen 1.12.0 is pinned by
@@ -19,6 +19,13 @@ OUTPUT_DIRECTORY       = build/doxygen
 QUIET                  = YES
 
 INPUT                  = include/lance/lance.h \
+                         include/lance/version.h \
+                         include/lance/error.h \
+                         include/lance/arrow_abi.h \
+                         include/lance/fwd.h \
+                         include/lance/dataset.h \
+                         include/lance/scanner.h \
+                         include/lance/batch.h \
                          include/lance/lance.hpp
 RECURSIVE              = NO
 EXCLUDE_SYMLINKS       = YES

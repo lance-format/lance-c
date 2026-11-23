@@ -41,8 +41,9 @@ $expectedMachine = "machine ($Architecture)"
 $dll = Join-Path $prefixPath 'lib\lance_c.dll'
 $importLibrary = Join-Path $prefixPath 'lib\lance_c.dll.lib'
 $staticLibrary = Join-Path $prefixPath 'lib\lance_c.lib'
-$header = Join-Path $prefixPath 'include\lance\lance.h'
-$headerCpp = Join-Path $prefixPath 'include\lance\lance.hpp'
+$headerDir = Join-Path $prefixPath 'include\lance'
+$header = Join-Path $headerDir 'lance.h'
+$headerCpp = Join-Path $headerDir 'lance.hpp'
 $readme = Join-Path $prefixPath 'share\doc\lance-c\README.md'
 $license = Join-Path $prefixPath 'share\licenses\lance-c\LICENSE'
 $packageConfig = Join-Path $prefixPath 'lib\cmake\LanceC\LanceCConfig.cmake'
@@ -131,15 +132,25 @@ Write-Host "==> Verifying $Architecture package with $CMakeGenerator"
 Write-Host "==> Inspecting $dll with $script:Dumpbin"
 Assert-PeImage -Path $dll -Description 'staged DLL'
 
-$headerSource = Get-Content -LiteralPath $header -Raw
-$headerText = [regex]::Replace($headerSource, '(?s)/\*.*?\*/', ' ')
+# The public C ABI is declared by the umbrella header and its domain headers.
+# Read the complete installed C header set; scanning only lance.h would treat
+# every declaration that moved into a domain header as a non-header export.
+$publicHeaders = @(Get-ChildItem -LiteralPath $headerDir -File -Filter '*.h' |
+    Sort-Object Name)
+if ($publicHeaders.Count -eq 0) {
+    throw "no public C headers found in $headerDir"
+}
+$headerText = ($publicHeaders | ForEach-Object {
+    $source = Get-Content -LiteralPath $_.FullName -Raw
+    [regex]::Replace($source, '(?s)/\*.*?\*/', ' ')
+}) -join "`n"
 $headerText = [regex]::Replace($headerText, '(?m)//.*$', '')
 $expectedExports = [regex]::Matches(
     $headerText, 'lance_[A-Za-z0-9_]+(?=\s*\()') |
     ForEach-Object { $_.Value } |
     Sort-Object -Unique
 if ($expectedExports.Count -eq 0) {
-    throw "no public lance_* declarations found in $header"
+    throw "no public lance_* declarations found in $headerDir"
 }
 
 $exportText = (Invoke-Dumpbin @('/exports', $dll)) -join "`n"

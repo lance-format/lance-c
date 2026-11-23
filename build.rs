@@ -3,8 +3,9 @@
 
 //! Build script for lance-c.
 //!
-//! Optionally generates `include/lance.h` via cbindgen.
-//! If cbindgen is not available, the pre-committed header is used.
+//! The public C headers are hand-maintained under `include/lance/`; cbindgen
+//! generation is disabled in Cargo.toml. This script configures the shared
+//! library link and generates the MSVC export definition from those headers.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -12,10 +13,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    // cbindgen header generation is optional.
-    // Run `cargo install cbindgen && cbindgen --crate lance-c -o include/lance.h`
-    // to regenerate the header manually.
-
     configure_shared_library_link();
 }
 
@@ -67,16 +64,45 @@ fn write_msvc_export_definition() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
     );
-    let header_path = manifest_dir.join("include/lance/lance.h");
-    println!("cargo::rerun-if-changed={}", header_path.display());
+    let header_dir = manifest_dir.join("include/lance");
+    println!("cargo::rerun-if-changed={}", header_dir.display());
 
-    let header = fs::read_to_string(&header_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", header_path.display()));
+    // The public C ABI is declared by the umbrella header and its domain
+    // headers. Scan every header in the directory so a declaration moving to a
+    // domain header stays exported on Windows.
+    let mut header_paths = Vec::new();
+    for entry in fs::read_dir(&header_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", header_dir.display()))
+    {
+        let path = entry
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", header_dir.display()))
+            .path();
+        if path.extension().is_some_and(|extension| extension == "h") {
+            header_paths.push(path);
+        }
+    }
+    header_paths.sort();
+    if header_paths.is_empty() {
+        panic!("no public headers found in {}", header_dir.display());
+    }
+    for header_path in &header_paths {
+        println!("cargo::rerun-if-changed={}", header_path.display());
+    }
+
+    let mut header = String::new();
+    for header_path in &header_paths {
+        header.push_str(
+            &fs::read_to_string(header_path).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", header_path.display())
+            }),
+        );
+        header.push('\n');
+    }
     let exports = public_c_names(&header);
     if exports.is_empty() {
         panic!(
             "no public lance_* declarations found in {}",
-            header_path.display()
+            header_dir.display()
         );
     }
 
@@ -204,5 +230,5 @@ fn strip_c_comments(source: &str) -> String {
         }
     }
 
-    String::from_utf8(result).expect("include/lance/lance.h must be valid UTF-8")
+    String::from_utf8(result).expect("public lance headers must be valid UTF-8")
 }

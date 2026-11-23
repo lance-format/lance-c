@@ -142,6 +142,13 @@ for required in \
     index.html \
     lance_8h.html \
     lance_8hpp.html \
+    version_8h.html \
+    error_8h.html \
+    arrow__abi_8h.html \
+    fwd_8h.html \
+    dataset_8h.html \
+    scanner_8h.html \
+    batch_8h.html \
     classlance_1_1Dataset.html \
     classlance_1_1Scanner.html \
     search/searchdata.js; do
@@ -149,9 +156,21 @@ for required in \
         fail "rendered API reference is missing ${required}; check INPUT and EXTRACT_ALL in Doxyfile"
 done
 
-for symbol in lance_dataset_open lance_scanner_next; do
-    grep -Fq -- "$symbol" "${html_dir}/lance_8h.html" ||
-        fail "rendered C API reference does not mention ${symbol}"
+# Moved declarations must be documented on their domain page, and declarations
+# that stayed in the umbrella must still be documented there.
+for pair in \
+    "dataset_8h.html lance_dataset_open" \
+    "scanner_8h.html lance_scanner_next" \
+    "error_8h.html lance_last_error_code" \
+    "version_8h.html LANCE_C_VERSION" \
+    "batch_8h.html lance_batch_to_arrow" \
+    "arrow__abi_8h.html ArrowArrayStream" \
+    "fwd_8h.html LanceDataset" \
+    "lance_8h.html lance_dataset_compact_files"; do
+    page=${pair%% *}
+    symbol=${pair#* }
+    grep -Fq -- "$symbol" "${html_dir}/${page}" ||
+        fail "rendered API reference does not mention ${symbol} in ${page}"
 done
 for symbol in 'lance::Dataset' 'lance::Error'; do
     grep -Fq -- "$symbol" "${html_dir}/lance_8hpp.html" ||
@@ -161,4 +180,4 @@ done
 page_count="$(find "$html_dir" -name '*.html' | wc -l | tr -d ' ')"
 echo "Doxygen: $("$doxygen_bin" --version)"
 echo "API reference: ${page_count} HTML pages, $(du -sh "$html_dir" | cut -f1) in ${html_dir}"
-echo "Validated include/lance/lance.h and include/lance/lance.hpp with no Doxygen warnings."
+echo "Validated the public C headers in include/lance/ and include/lance/lance.hpp with no Doxygen warnings."
