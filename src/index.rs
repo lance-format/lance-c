@@ -1403,6 +1403,11 @@ pub enum LanceMetricType {
 /// Tagged-union of vector-index build parameters; mirrors the C struct
 /// `LanceVectorIndexParams` field-for-field.
 ///
+/// `index_type` and `metric` stay raw `i32` across the FFI so arbitrary C
+/// input is validated with `from_c` before a Rust enum is constructed.
+/// `build_vector_params_with_models` is the single validation point and
+/// rejects out-of-range values with `LANCE_ERR_INVALID_ARGUMENT`.
+///
 /// Field semantics (zero = "use Lance default" unless otherwise noted):
 /// * `num_partitions`  — IVF; **required (must be > 0)**.
 /// * `num_sub_vectors` — PQ; **required for any PQ variant** (must be > 0).
@@ -1414,8 +1419,8 @@ pub enum LanceMetricType {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LanceVectorIndexParams {
-    pub index_type: LanceVectorIndexType,
-    pub metric: LanceMetricType,
+    pub index_type: i32,
+    pub metric: i32,
     pub num_partitions: u32,
     pub num_sub_vectors: u32,
     pub num_bits: u32,
@@ -1672,9 +1677,10 @@ pub(crate) fn build_vector_params_with_models(
     centroids: Option<Arc<FixedSizeListArray>>,
     codebook: Option<ArrayRef>,
 ) -> Result<LanceCoreVectorIndexParams> {
-    let metric = p.metric.to_distance();
+    let index_type = LanceVectorIndexType::from_c(p.index_type)?;
+    let metric = LanceMetricType::from_c(p.metric)?.to_distance();
     use LanceVectorIndexType::*;
-    let core = match p.index_type {
+    let core = match index_type {
         IvfFlat => {
             let ivf = build_ivf(p, centroids)?;
             LanceCoreVectorIndexParams::with_ivf_flat_params(metric, ivf)
