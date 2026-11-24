@@ -58,8 +58,8 @@ An unknown UUID, absent fragment, invalid option combination or segment metadata
 without one valid schema key field is an error. A known segment with
 incomplete/unknown coverage, no suitable driver, unsupported
 index type, nested key, overlays, unknown physical row counts, fragment reuse,
-non-exact results or unsupported
-row-ID domain falls back to a non-indexed scan of the entire explicit domain.
+non-exact results or an unsupported candidate mask domain falls back to a
+non-indexed scan of the entire explicit domain.
 Legacy (v1) storage also takes this fallback because ordinary scans cannot consume
 external row masks; it reports `scalar_segment_fallback_legacy_storage` without
 searching the index.
@@ -84,11 +84,13 @@ cannot satisfy a scan that includes deleted rows. To read those rows, clear the
 segment setting and use an ordinary scan with `with_row_id=true`,
 `include_deleted_rows=true`, and `use_scalar_index=false`.
 Fragments removed from the current snapshot are not scanned by this option.
-Physical row-address
-results on stable-row-ID datasets currently fall back; results already expressed
-in the correct row-ID domain use the candidate path. Deletes and all remaining
-predicates are handled by the ordinary reader. No candidate-count limit is
-applied: LIMIT/OFFSET remain after the scanner's complete filter.
+Segment results are installed as a native `_rowid` candidate mask: an
+address-domain result on a stable-row-ID dataset is first translated through the
+dataset's row-ID sequences, and a mask that selects whole fragments rather than
+listed rows falls back with `scalar_segment_fallback_row_address_mask`. Deletes
+and all remaining predicates are handled by the ordinary reader. No
+candidate-count limit is applied: LIMIT/OFFSET remain after the scanner's
+complete filter.
 
 If the host has additional predicates outside Lance, do not set a local limit
 before those predicates. Never divide the global limit by the number of tasks.
