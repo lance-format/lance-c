@@ -44,6 +44,10 @@ The script runs in the `ABI types (v0.2.0)` CI job on Linux with
 CC=clang ABIDIFF=/path/to/abidiff bash .github/scripts/verify-abi-types.sh
 ```
 
-The script also compiles two temporary drift controls: an inserted
-`LanceOptionalU64` member and a changed `lance_scanner_set_limit` parameter.
-Both must be reported by abidiff; the controls never modify repository files.
+The script also compiles two temporary drift controls on copies of the frozen
+v0.2.0 fixture: an inserted `LanceOptionalU64` member and a changed
+`lance_scanner_set_limit` parameter. Both must be reported by abidiff. The
+fixture is verified against its recorded SHA-256 before use and is never
+modified; current-header formatting therefore cannot make a control silently
+edit nothing. The script interprets abidiff's documented exit-code bitmask so
+an actual ABI change is distinguished from a tool or usage error.
