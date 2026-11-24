@@ -39,6 +39,9 @@ jobs:
           - os: ubuntu-24.04-arm
             container: quay.io/pypa/manylinux_2_28_aarch64@sha256:34a5e614a4eb26f73f8bf44cbbf2acf8011620453d03ea35a58537bb3cde44de
             target: aarch64-unknown-linux-gnu
+            # Static-link smoke consumers take ~13 minutes each on the 4-vCPU
+            # ARM64 runner; the default 90-minute job cap expires mid-step.
+            timeout_minutes: 240
             artifact_suffix: ""
           - os: macos-15
             container: ""
