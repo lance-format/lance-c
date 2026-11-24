@@ -2502,8 +2502,9 @@ struct AddBasesOptions {
 };
 
 /// Owned progress callback for tracked-file enumeration. `manifests_total` is
-/// unset until native progress has a known total. The callback must not throw;
-/// it runs on a native background task.
+/// unset until native progress has a known total; the native listing races the
+/// walk, so it may stay unset for some or all updates. The callback must not
+/// throw; it runs on a native background task.
 using TrackedFilesProgressCallback = std::function<void(
     uint64_t manifests_processed,
     std::optional<uint64_t> manifests_total)>;

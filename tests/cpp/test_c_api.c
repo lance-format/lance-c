@@ -1247,8 +1247,8 @@ typedef struct {
     atomic_int calls;
     atomic_int released;
     atomic_ullong last_processed;
-    atomic_ullong last_total;
-    atomic_int has_total;
+    atomic_ullong expected_total;
+    atomic_int total_mismatch;
 } TrackedProgressCapture;
 
 typedef struct {
@@ -1268,13 +1268,12 @@ static void capture_tracked_progress(
         &context->capture->last_processed,
         manifests_processed,
         memory_order_seq_cst);
-    if (manifests_total != NULL) {
+    if (manifests_total != NULL &&
+        *manifests_total !=
+            atomic_load_explicit(
+                &context->capture->expected_total, memory_order_seq_cst)) {
         atomic_store_explicit(
-            &context->capture->has_total, 1, memory_order_seq_cst);
-        atomic_store_explicit(
-            &context->capture->last_total,
-            *manifests_total,
-            memory_order_seq_cst);
+            &context->capture->total_mismatch, 1, memory_order_seq_cst);
     }
 }
 
@@ -4463,6 +4462,7 @@ static void test_file_enumeration(const char *uri, const char *alternate_uri) {
 
     TrackedProgressCapture capture;
     TrackedProgressContext *context = new_tracked_progress(&capture);
+    atomic_store(&capture.expected_total, manifest_rows);
     LanceTrackedFilesProgress progress = {
         capture_tracked_progress,
         release_tracked_progress,
@@ -4485,14 +4485,17 @@ static void test_file_enumeration(const char *uri, const char *alternate_uri) {
            "each manifest must report progress");
     ASSERT(atomic_load(&capture.last_processed) == manifest_rows,
            "last progress must process every manifest");
-    ASSERT(atomic_load(&capture.has_total) == 1 &&
-               atomic_load(&capture.last_total) == manifest_rows,
-           "final progress must report the native total");
+    /* Native learns the manifest total from a listing that races the walk, so
+       no update, including the last, is guaranteed to report it. Every
+       reported total must still be the walk's manifest count. */
+    ASSERT(atomic_load(&capture.total_mismatch) == 0,
+           "a reported progress total must equal the manifest count");
 
     ds = lance_dataset_open(uri, NULL, 0);
     ASSERT(ds != NULL, "early-close fixture reopen failed");
     TrackedProgressCapture early_capture;
     TrackedProgressContext *early_context = new_tracked_progress(&early_capture);
+    atomic_store(&early_capture.expected_total, manifest_rows);
     LanceTrackedFilesProgress early_progress = {
         capture_tracked_progress,
         release_tracked_progress,
@@ -4512,6 +4515,7 @@ static void test_file_enumeration(const char *uri, const char *alternate_uri) {
     TrackedProgressCapture factory_capture;
     TrackedProgressContext *factory_context =
         new_tracked_progress(&factory_capture);
+    atomic_store(&factory_capture.expected_total, manifest_rows);
     LanceTrackedFilesProgress factory_progress = {
         capture_tracked_progress,
         release_tracked_progress,

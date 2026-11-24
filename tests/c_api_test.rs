@@ -33521,12 +33521,39 @@ fn test_dataset_file_enumeration_matches_native_and_owns_progress_context() {
         tracked_file_rows(&native_tracked_batches)
     );
     wait_for_progress_release(&progress_state);
+    // Native reports one update per fully processed manifest, in completion
+    // order, carrying a running count plus the manifest total while it is
+    // known. `TrackedFilesProgress::manifests_total` becomes `Some` only once
+    // the manifest listing is exhausted, and that listing runs concurrently
+    // with this walk, so the final update may still report an unknown total.
+    // What the binding must preserve is the count and the optional total, not
+    // the moment the listing finishes.
     let events = progress_state.events.lock().unwrap();
     assert_eq!(events.len(), manifest_count as usize);
     assert_eq!(
-        events.last().copied(),
-        Some((manifest_count, Some(manifest_count)))
+        events
+            .iter()
+            .map(|(processed, _)| *processed)
+            .collect::<Vec<_>>(),
+        (1..=manifest_count).collect::<Vec<_>>(),
+        "every manifest must report exactly one incrementing update"
     );
+    let mut known_total = None;
+    for (processed, total) in events.iter() {
+        match (*total, known_total) {
+            (None, None) => {}
+            (None, Some(known)) => {
+                panic!("update {processed} lost the previously reported total {known}: {events:?}")
+            }
+            (Some(total), _) => {
+                assert_eq!(
+                    total, manifest_count,
+                    "update {processed} must report the walk's manifest count: {events:?}"
+                );
+                known_total = Some(total);
+            }
+        }
+    }
     drop(events);
 
     let blocking_state = Arc::new(BlockingProgressState {
