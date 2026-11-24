@@ -115,15 +115,14 @@ jobs:
   test-sanitizers:
     name: Tests (Linux, sanitizers)
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
-    # Run the two core native consumer suites under sanitizers in their own job
-    # so setup and failures stay isolated from test-linux.
+    # The manylinux static Clang ships without compiler-rt sanitizer runtimes.
+    # This test-only job uses the standard Ubuntu packages for a matching
+    # Clang 20 + libclang-rt-20-dev pair; release and glibc-pinned jobs stay on
+    # the manylinux image.
     timeout-minutes: 60
     env:
-      CC: clang
-      CXX: clang++
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      CC: clang-20
+      CXX: clang++-20
       LANCE_C_SANITIZERS: address,undefined
       # AddressSanitizer includes LeakSanitizer on Linux. These settings apply
       # to the native consumer binaries; the Rust library is not instrumented.
@@ -134,13 +133,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # test-linux saves the shared target cache on main.
           save-if: false
-      - name: Install Clang 20
-        run: manylinux-install-clang -v 20.1.8.0
-      - name: Ensure pkg-config
-        run: command -v pkg-config >/dev/null || dnf install -y pkgconf-pkg-config
+      - name: Install Clang 20 and matching sanitizer runtimes
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-20.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-20 libclang-rt-20-dev pkg-config
+          "$CC" --version
+          "$CC" -print-resource-dir
       - uses: ./.github/actions/setup-protoc
+      - name: Verify sanitizer runtime links and runs
+        run: |
+          cat > /tmp/sanitizer-smoke.c <<'SMOKE'
+          #include <stdlib.h>
+          int main(void) {
+              char *p = malloc(8);
+              p[0] = 0;
+              free(p);
+              return 0;
+          }
+          SMOKE
+          cat > /tmp/sanitizer-smoke.cpp <<'SMOKE'
+          #include <cstdlib>
+          int main() {
+              char *p = static_cast<char *>(std::malloc(8));
+              p[0] = 0;
+              std::free(p);
+              return 0;
+          }
+          SMOKE
+          "$CC" -fsanitize=address,undefined -fno-sanitize-recover=all -g \
+            /tmp/sanitizer-smoke.c -o /tmp/sanitizer-smoke-c
+          /tmp/sanitizer-smoke-c
+          "$CXX" -std=c++20 -fsanitize=address,undefined \
+            -fno-sanitize-recover=all -g \
+            /tmp/sanitizer-smoke.cpp -o /tmp/sanitizer-smoke-cpp
+          /tmp/sanitizer-smoke-cpp
       - name: Run C consumer under sanitizers
         run: cargo test --test compile_and_run_test -- --ignored test_c_compilation_and_execution
       - name: Run C++ consumer under sanitizers
