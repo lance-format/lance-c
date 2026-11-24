@@ -64,6 +64,10 @@ sanitizer C/C++ consumers: `LANCE_C_SANITIZERS=address,undefined ASAN_OPTIONS=de
 - All bugfixes and features must have corresponding tests.
 - Cover NULL/empty edge cases.
 - Include multi-fragment scenarios for dataset operations.
+- `test_public_header_signatures_match_rust` compiles the public header
+declarations against the Rust `extern "C"` signatures and checks that both
+name sets agree. It runs with the ignored C/C++ compilation tests; its
+declaration-mismatch self-tests mutate temporary header copies only.
 
 ### Dependencies
 - Prefer the standard library or existing workspace dependencies before adding new external crates.

@@ -32,11 +32,17 @@ use lance_file::version::LanceFileVersion;
 use common::{create_config_base_files_fixture, create_rtree_geometry_fixture};
 use std::ffi::CString;
 
+#[path = "support/c_text.rs"]
+mod c_text;
+
 #[path = "support/abi_layout.rs"]
 mod abi_layout;
 
 #[path = "support/c_toolchain.rs"]
 mod c_toolchain;
+
+#[path = "support/header_signatures.rs"]
+mod header_signatures;
 
 #[path = "support/local_uri.rs"]
 mod local_uri;
@@ -2270,6 +2276,12 @@ fn test_commit_lock_native_compilation_and_execution() {
 #[ignore = "requires a C compiler; run with: cargo test --test compile_and_run_test -- --ignored test_public_c_abi_layout_matches_rust"]
 fn test_public_c_abi_layout_matches_rust() {
     abi_layout::assert_public_abi();
+}
+
+#[test]
+#[ignore = "requires a C compiler; run with: cargo test --test compile_and_run_test -- --ignored test_public_header_signatures_match_rust"]
+fn test_public_header_signatures_match_rust() {
+    header_signatures::assert_public_header_signatures();
 }
 
 #[test]
