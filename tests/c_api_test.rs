@@ -34737,7 +34737,7 @@ fn test_merge_insert_rejects_partial_list_update() {
     };
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
-    let message = unsafe { CStr::from_ptr(lance_last_error_message()) }.to_string_lossy();
+    let message = take_last_error_message();
     assert!(
         message.contains("partially supplies list field"),
         "unexpected error: {message}"
