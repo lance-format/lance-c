@@ -112,6 +112,7 @@ jobs:
       - name: Verify CMake package and consumer linkage
         run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
       - name: Verify GCC C11 and C++20 consumers
+        shell: bash
         run: |
           gcc -std=c11 -Wall -Wextra -Iinclude examples/c-scan/main.c \
             -Ltarget/debug -llance_c -Wl,-rpath,"$PWD/target/debug" \
