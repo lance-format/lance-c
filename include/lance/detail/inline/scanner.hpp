@@ -314,6 +314,10 @@ inline Scanner& Scanner::nearest(const std::string& column, const float* q, size
         return *this;
     }
 
+inline Scanner& Scanner::nearest(const std::string& column, std::span<const float> q, uint32_t k) {
+        return nearest(column, q.data(), q.size(), k);
+    }
+
 inline Scanner& Scanner::nearest(const std::string& column, const void* q, size_t dim,
                      LanceDataType dtype, uint32_t k) {
         if (lance_scanner_nearest(handle_.get(), column.c_str(),
@@ -343,6 +347,19 @@ inline Scanner& Scanner::nearest_batch(const std::string& column, const void* qu
 inline Scanner& Scanner::nearest_batch(const std::string& column, const float* query_data,
                            size_t dimension, size_t num_queries, uint32_t k) {
         return nearest_batch(column, query_data, dimension, num_queries, LANCE_DTYPE_FLOAT32, k);
+    }
+
+inline Scanner& Scanner::nearest_batch(const std::string& column, std::span<const float> queries,
+                           size_t dimension, uint32_t k) {
+        if (dimension != 0 && queries.size() % dimension != 0) {
+            throw Error(
+                LANCE_ERR_INVALID_ARGUMENT,
+                "nearest_batch query_data length " + std::to_string(queries.size()) +
+                    " is not a multiple of dimension " + std::to_string(dimension));
+        }
+        const size_t num_queries =
+            dimension == 0 ? 0 : queries.size() / dimension;
+        return nearest_batch(column, queries.data(), dimension, num_queries, k);
     }
 
 inline Scanner& Scanner::nearest_multivector(const std::string& column, const void* query_data,

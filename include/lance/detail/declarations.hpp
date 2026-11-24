@@ -5913,6 +5913,10 @@ public:
     /// k-NN search (Float32 sugar).
     Scanner& nearest(const std::string& column, const float* q, size_t dim, uint32_t k);
 
+    /// k-NN search over a contiguous Float32 query vector. The span length is
+    /// used as the query dimension and must match the column.
+    Scanner& nearest(const std::string& column, std::span<const float> q, uint32_t k);
+
     /// k-NN search (typed).
     Scanner& nearest(const std::string& column, const void* q, size_t dim,
                      LanceDataType dtype, uint32_t k);
@@ -5933,6 +5937,12 @@ public:
     /// Float32 batch convenience overload; input values are copied before returning.
     Scanner& nearest_batch(const std::string& column, const float* query_data,
                            size_t dimension, size_t num_queries, uint32_t k);
+
+    /// Float32 batch sugar over a contiguous row-major matrix. The number of
+    /// queries is derived from the span length, which must be a multiple of
+    /// dimension. Values are copied before returning.
+    Scanner& nearest_batch(const std::string& column, std::span<const float> queries,
+                           size_t dimension, uint32_t k);
 
     /// One multi-vector query, copied from dimension * num_vectors row-major elements.
     Scanner& nearest_multivector(const std::string& column, const void* query_data,
