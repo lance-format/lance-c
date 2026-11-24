@@ -19,9 +19,19 @@ case "$ARCH" in
     exit 1
     ;;
 esac
+PREFIX=${PROTOC_INSTALL_PREFIX:-/usr/local}
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PA}.zip" -o "$WORK_DIR/protoc.zip"
 echo "$SHA256  $WORK_DIR/protoc.zip" | sha256sum --check --strict
-unzip -o "$WORK_DIR/protoc.zip" -d /usr/local bin/protoc 'include/*'
-/usr/local/bin/protoc --version
+mkdir -p "$PREFIX"
+unzip -o "$WORK_DIR/protoc.zip" -d "$PREFIX" bin/protoc 'include/*'
+"$PREFIX/bin/protoc" --version
+# Keep the install discoverable in later steps without relying on a writable
+# system prefix.
+if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "$PREFIX/bin" >>"$GITHUB_PATH"
+fi
+if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "PROTOC_INCLUDE=$PREFIX/include" >>"$GITHUB_ENV"
+fi

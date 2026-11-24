@@ -146,6 +146,22 @@ jobs:
           "$CC" --version
           "$CC" -print-resource-dir
       - uses: ./.github/actions/setup-protoc
+        with:
+          install-prefix: ${{ runner.temp }}/protoc
+      - name: Verify protoc include discovery
+        run: |
+          cat > "$RUNNER_TEMP/protoc-smoke.proto" <<'SMOKE'
+          syntax = "proto3";
+          package smoke;
+          import "google/protobuf/timestamp.proto";
+          message Smoke {
+              google.protobuf.Timestamp at = 1;
+          }
+          SMOKE
+          command -v protoc
+          protoc --version
+          protoc --proto_path="$RUNNER_TEMP" \
+            --descriptor_set_out=/dev/null "$RUNNER_TEMP/protoc-smoke.proto"
       - name: Verify sanitizer runtime links and runs
         run: |
           cat > /tmp/sanitizer-smoke.c <<'SMOKE'
