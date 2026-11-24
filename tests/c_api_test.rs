@@ -28,9 +28,9 @@ use arrow::record_batch::RecordBatchReader;
 use arrow_array::make_array;
 use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
-    Array, BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
-    LargeBinaryArray, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
+    Int64Array, LargeBinaryArray, ListArray, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
@@ -34614,6 +34614,135 @@ fn test_merge_insert_upsert_updates_and_inserts() {
         }
     }
     assert!(seen_5 && seen_200);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_merge_insert_rejects_partial_list_update() {
+    // A list's item fields share offsets and validity, so replacing only some
+    // item fields would leave an inconsistent fragment. Upstream rejects the
+    // partial schema before planning; the FFI must report InvalidArgument and
+    // leave the dataset untouched instead of committing a corrupt row.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp
+        .path()
+        .join("merge_list_ds")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let item_fields = Fields::from(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]);
+    let item_type = DataType::Struct(item_fields);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", item_type.clone(), true))),
+            true,
+        ),
+    ]));
+
+    let target_items = StructArray::from(vec![
+        (
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        ),
+    ]);
+    let target_list = ListArray::new(
+        Arc::new(Field::new("item", item_type, true)),
+        arrow::buffer::OffsetBuffer::from_lengths([1, 1]),
+        Arc::new(target_items),
+        None,
+    );
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(target_list) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(target)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let partial_item_type =
+        DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)]));
+    let partial_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                partial_item_type.clone(),
+                true,
+            ))),
+            true,
+        ),
+    ]));
+    let partial_items = StructArray::from(vec![(
+        Arc::new(Field::new("a", DataType::Int32, true)),
+        Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+    )]);
+    let partial_list = ListArray::new(
+        Arc::new(Field::new("item", partial_item_type, true)),
+        arrow::buffer::OffsetBuffer::from_lengths([1]),
+        Arc::new(partial_items),
+        None,
+    );
+    let source = RecordBatch::try_new(
+        partial_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            Arc::new(partial_list) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut stream = batch_to_ffi_stream(source);
+    let on = [c_str("id")];
+    let on_ptrs = cstr_ptrs(&on);
+    let params = merge_params(
+        LanceMergeWhenMatched::UpdateAll,
+        LanceMergeWhenNotMatched::InsertAll,
+        LanceMergeWhenNotMatchedBySource::Keep,
+    );
+    let rc = unsafe {
+        lance_dataset_merge_insert(
+            ds,
+            on_ptrs.as_ptr(),
+            1,
+            &mut stream,
+            &params,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, -1);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe { CStr::from_ptr(lance_last_error_message()) }.to_string_lossy();
+    assert!(
+        message.contains("partially supplies list field"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 2);
 
     unsafe { lance_dataset_close(ds) };
 }
