@@ -521,3 +521,14 @@ jobs:
             echo "Missing SPDX license header in:$MISSING"
             exit 1
           fi
+
+  abi-types:
+    name: ABI types (v0.2.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libabigail
+        run: sudo apt-get update && sudo apt-get install -y abigail-tools
+      - name: Compare public C types with v0.2.0
+        run: bash .github/scripts/verify-abi-types.sh
