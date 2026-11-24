@@ -87,6 +87,20 @@ fn sanitizer_arguments(sanitizers: Option<&str>) -> Vec<OsString> {
     ]
 }
 
+/// Configure a compiler invocation without running it.
+///
+/// The returned command has the same target-aware compiler and language
+/// arguments as [`compile`]. Callers that must inspect diagnostics, such as the
+/// expected-failure signature probes, can capture its output instead of
+/// inheriting the test's streams. Optional sanitizer flags are not applied
+/// here: this helper serves syntax-only checks that are never linked or
+/// executed.
+pub(crate) fn compile_command(compilation: &Compilation<'_>) -> Command {
+    let mut command = compiler_command(compilation.language);
+    command.args(compiler_arguments(compilation));
+    command
+}
+
 /// Path of a compiled test binary. MSVC appends `.exe`; the harness passes the
 /// same path to `Command`, so it must name the file exactly.
 pub(crate) fn executable_path(directory: &Path, stem: &str) -> PathBuf {
