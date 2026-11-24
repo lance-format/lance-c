@@ -4873,6 +4873,32 @@ static void test_scanner_substrait_aggregate(
     PASS();
 }
 
+static void test_scanner_substrait_filter(
+    const std::string& uri,
+    const std::string& expression_path) {
+    TEST(test_scanner_substrait_filter);
+
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan();
+
+    auto bytes = read_file_bytes(expression_path);
+    assert(!bytes.empty());
+    scanner.substrait_filter(bytes);
+    /* The C entry point copies the expression before returning, so the
+       caller-owned storage may be reused or freed afterwards. */
+    std::fill(bytes.begin(), bytes.end(), 0);
+    bytes.clear();
+
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    auto ids = collect_ordering_ids(stream);
+    std::sort(ids.begin(), ids.end());
+    assert((ids == std::vector<int32_t>{4, 5, 6, 7, 8, 9, 10, 11}));
+
+    PASS();
+}
+
 static std::vector<int32_t> scan_filtered_ids(
     const std::string& uri,
     const std::string& filter,
@@ -6040,12 +6066,12 @@ int main(int argc, char** argv) {
     /* Keep progress visible when the process dies without unwinding: stdout to
        a pipe is otherwise block-buffered and the last TEST() marker is lost. */
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (argc < 13) {
+    if (argc < 15) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
                 "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
                 "<rtree_geometry_uri> <aggregate_plan_path> <config_base_uri> "
-                "<alternate_base_uri>\n",
+                "<alternate_base_uri> <write_file_uri> <substrait_filter_path>\n",
                 argv[0]);
         return 1;
     }
@@ -6062,6 +6088,7 @@ int main(int argc, char** argv) {
     std::string aggregate_plan_path(argv[10]);
     std::string config_base_uri(argv[11]);
     std::string alternate_base_uri(argv[12]);
+    std::string substrait_filter_path(argv[14]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_binding_version();
@@ -6074,6 +6101,7 @@ int main(int argc, char** argv) {
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
     test_scanner_substrait_aggregate(ordering_uri, aggregate_plan_path);
+    test_scanner_substrait_filter(ordering_uri, substrait_filter_path);
     test_scanner_introspection(uri);
     test_fragment_snapshots(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);
