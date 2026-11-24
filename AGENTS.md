@@ -22,7 +22,7 @@
 ## Structure
 Rust FFI source: `src/`
 C headers (stable ABI): `include/lance/lance.h` umbrella plus domain headers in `include/lance/`
-C++ RAII wrappers (header-only): `include/lance/lance.hpp`
+C++ RAII wrappers (header-only): `include/lance/lance.hpp` umbrella; shared declarations and opt-in inline definitions under `include/lance/detail/`
 Tests (Rust): `tests/c_api_test.rs`
 Tests (C/C++): `tests/cpp/`
 Historical test data: `test_data/`

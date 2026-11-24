@@ -149,6 +149,8 @@ for required in \
     dataset_8h.html \
     scanner_8h.html \
     batch_8h.html \
+    attributes_8h.html \
+    declarations_8hpp.html \
     classlance_1_1Dataset.html \
     classlance_1_1Scanner.html \
     search/searchdata.js; do
@@ -180,4 +182,4 @@ done
 page_count="$(find "$html_dir" -name '*.html' | wc -l | tr -d ' ')"
 echo "Doxygen: $("$doxygen_bin" --version)"
 echo "API reference: ${page_count} HTML pages, $(du -sh "$html_dir" | cut -f1) in ${html_dir}"
-echo "Validated the public C headers in include/lance/ and include/lance/lance.hpp with no Doxygen warnings."
+echo "Validated the public C headers, include/lance/lance.hpp and include/lance/detail/declarations.hpp with no Doxygen warnings."
