@@ -20429,6 +20429,153 @@ fn test_vector_index_options_all_families_query_reopen_and_metadata() {
     unsafe { lance_dataset_close(dataset) };
 }
 
+/// A normal (single-writer) vector index must expose the same physical segment
+/// type through the C listing and the native query planner. Lance 15.0.0-beta.31
+/// resolves that type from the index file schema, so the two must agree even
+/// when the C caller only sees the manifest-backed segment JSON.
+#[test]
+fn test_normal_vector_index_segments_match_physical_types() {
+    use lance_index::IndexType;
+
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let column = c_str("embedding");
+    let index_name = c_str("normal_vector_types_idx");
+    let query: Vec<f32> = (0..8)
+        .map(|component| 5.25 + component as f32 / 8.0)
+        .collect();
+
+    let mut dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let mut options = vector_index_options(LanceVectorIndexType::IvfFlat, LanceMetricType::Cosine);
+    options.num_partitions = set_option(2);
+    options.max_iters = set_option(10);
+    options.sample_rate = set_option(128);
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index_with_options(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &options,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    unsafe { lance_dataset_close(dataset) };
+
+    dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+
+    let segment_count = unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) };
+    assert_eq!(segment_count, 1, "{}", take_last_error_message());
+    let mut uuid_bytes = vec![0_u8; segment_count as usize * 16];
+    let mut written = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                uuid_bytes.as_mut_ptr(),
+                segment_count as usize,
+                &mut written,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(written, segment_count);
+    let uuids = uuid_bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|bytes| uuid::Uuid::from_bytes(*bytes))
+        .collect::<Vec<_>>();
+
+    let physical_types = lance_c::runtime::block_on(async {
+        let native = Dataset::open(&uri).await.unwrap();
+        native
+            .vector_index_types("embedding", &uuids)
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        physical_types,
+        vec![IndexType::IvfFlat],
+        "the normal index file must resolve to one IVF_FLAT segment"
+    );
+
+    let segments_json = take_scanner_string(unsafe { lance_dataset_index_segments_json(dataset) });
+    let segments: serde_json::Value = serde_json::from_str(&segments_json).unwrap();
+    let uuid_text = uuids[0].to_string();
+    let entry = segments
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["uuid"].as_str() == Some(uuid_text.as_str()))
+        .unwrap_or_else(|| panic!("missing normal vector segment: {segments_json}"));
+    assert_eq!(entry["name"], "normal_vector_types_idx");
+    assert_eq!(entry["columns"], serde_json::json!(["embedding"]));
+    assert_eq!(entry["type"], "IVF_FLAT");
+
+    let (indexed_ids, _, indexed_statistics) = nearest_ids_distances_and_statistics(
+        dataset,
+        "embedding",
+        &query,
+        NearestScanOptions {
+            metric: Some(LanceMetricType::Cosine),
+            use_index: true,
+            k: 3,
+            nprobes: 2,
+            refine_factor: 8,
+        },
+    );
+    assert!(
+        indexed_statistics.index_partitions_loaded > 0,
+        "the normal index scan must load persisted partitions"
+    );
+    let native_ids = lance_c::runtime::block_on(async {
+        use futures::TryStreamExt;
+
+        let native = Dataset::open(&uri).await.unwrap();
+        let mut scanner = native.scan();
+        let native_query = arrow_array::Float32Array::from(query.clone());
+        scanner.nearest("embedding", &native_query, 3).unwrap();
+        scanner.nprobes(2).refine(8).use_index(true);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        indexed_ids, native_ids,
+        "normal IVF_FLAT segments must preserve native cosine query results"
+    );
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
 #[test]
 fn test_vector_index_ivf_rq_dot_query_reopen_and_native_oracle() {
     let dim = 8_usize;
