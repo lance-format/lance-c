@@ -1365,7 +1365,7 @@ Nanosecond accessors report an error when a timestamp does not fit i64
 nanoseconds. Snapshot creation and millisecond reads retain the native range.
 There is no C-side timestamp/asof selector.
 
-Branches use the public Lance 14.0.2 branch lifecycle:
+Branches use the selected Lance core's public branch lifecycle:
 
 ```cpp
 auto branch = source.create_branch(
@@ -1469,9 +1469,9 @@ later valid call can still enable it.
 
 `lance-c` creates one process-wide, multi-thread Tokio runtime lazily on the
 first runtime-backed call. It does not add a binding-specific worker-count API
-or environment variable. The locked Tokio version (1.53.1 in `Cargo.lock`)
-reads `TOKIO_WORKER_THREADS` when that runtime is built because `lance-c` does
-not call `Builder::worker_threads`.
+or environment variable. The Tokio release locked in the checkout's
+[Cargo.lock](../Cargo.lock) reads `TOKIO_WORKER_THREADS` when that runtime is
+built because `lance-c` does not call `Builder::worker_threads`.
 
 - When unset, Tokio uses `std::thread::available_parallelism()`, the parallelism
   available to the process, normally one worker per available CPU.

@@ -34,13 +34,13 @@ Stable downloads are on the [latest stable release](https://github.com/lance-for
 
 | Platform | Archive | Runtime & ABI contract |
 | --- | --- | --- |
-| Linux `x86_64` | `lance-c-<release-tag>-x86_64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` (`pthread`/`dl` on older glibc); C++20 for `lance.hpp` |
-| Linux `aarch64` | `lance-c-<release-tag>-aarch64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`; C++20 for `lance.hpp` |
+| Linux `x86_64` | `lance-c-<release-tag>-x86_64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; allowed `DT_NEEDED`: `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `libpthread.so.0`, `libdl.so.2`, `ld-linux-x86-64.so.2`; C++20 for `lance.hpp` |
+| Linux `aarch64` | `lance-c-<release-tag>-aarch64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; allowed `DT_NEEDED`: `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `libpthread.so.0`, `libdl.so.2`, `ld-linux-aarch64.so.1`; C++20 for `lance.hpp` |
 | macOS `arm64` | `lance-c-<release-tag>-aarch64-apple-darwin.tar.xz` | Apple silicon (`minos 11.0`); C++20 for `lance.hpp` |
 | Windows `x86_64` | `lance-c-<release-tag>-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 | Windows `ARM64` | `lance-c-<release-tag>-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 
-The stable prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
+The table lists the `DT_NEEDED` entries [`verify-linux-staging.sh`](../.github/scripts/verify-linux-staging.sh) allows for each Linux target, not the exact set every archive must contain. The `ld-linux-*` loader is allowed as the program interpreter rather than required, and glibc 2.28 keeps `libpthread` and `libdl` separate; the staging check prints the dependencies it observes. The stable prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
 
 The v0.2.0 release was the first stable release of the 0.2.x line and established the ABI baseline described below. It pinned Lance 15.0.0-beta.25 (`f5dbd55d`).
 
@@ -56,6 +56,7 @@ The public C ABI is the `lance_*` function set declared by the installed `includ
 - The Go bindings already parse declaration attributes and modular headers (lance-go #120, #132 and #129). A production repin still needs the published archive identities for the split header set; this repository does not publish a native pin.
 
 <a id="linux-runtime-requirements"></a>
+<a id="linux-baseline-for-future-packages"></a>
 
 ## Linux runtime requirements
 
@@ -256,9 +257,9 @@ Run this on `main` before starting the release workflow or tagging manually:
 
 1. Scan the user-facing docs for release-specific versions and promises:
    ```bash
-   grep -RInE 'v[0-9]+\.[0-9]+\.[0-9]+|0\.[0-9]+\.x|current release|latest release|next release|unreleased|will (adopt|publish|ship)|maintained release' README.md docs examples ports recipes .github/abi-baseline/README.md
+   grep -RInE '(^|[^0-9A-Za-z])v?[0-9]+\.[0-9]+\.[0-9]+([^0-9A-Za-z]|$)|0\.[0-9]+\.x|current release|latest release|next release|unreleased|will (adopt|publish|ship)|maintained release' README.md docs examples ports recipes .github/abi-baseline/README.md
    ```
-   The scan also matches this checklist and historical compatibility facts; review each match rather than deleting it. Every remaining match must be a historical fact, a placeholder such as `vX.Y.Z`, or the exact release being cut. Remove or rewrite claims about the current stable release, the next release, or future core adoption.
+   The scan also matches this checklist and historical compatibility facts; review each match rather than deleting it. Every remaining match must be historical provenance, a compatibility floor, or a pinned build dependency (for example a core revision, ABI baseline, minimum toolchain, or Corrosion release), a placeholder such as `vX.Y.Z`, or the exact release being cut. Remove or rewrite present-tense claims about a release version, the current stable release, the next release, or future core adoption.
 2. Confirm release links: stable downloads use `/releases/latest`, history uses `/releases`, and `/releases/tag/<tag>` links are only for historical facts.
 3. Compare the archive names and checksum conventions in the docs with `release.yml` and the planned release assets. If the supported platform matrix, core version, or ABI baseline changes, update the docs in the same release commit.
 4. Confirm the README and guide do not name the release being cut as current and do not state what an unreleased version will contain.
@@ -309,7 +310,7 @@ To cut a release manually without `create-release.yml`:
    git push origin "$TAG"
    ```
 
-You can also run a dry-run build of [`release.yml`](../.github/workflows/release.yml) via Actions → **Release** → **Run workflow** with a test version such as `0.0.1-dev` (the `publish` job is skipped unless the ref is `refs/tags/v*`).
+You can also run a dry-run build of [`release.yml`](../.github/workflows/release.yml) via Actions → **Release** → **Run workflow** with a placeholder test version such as `X.Y.Z-dev` (the `publish` job is skipped unless the ref is `refs/tags/v*`).
 
 <a id="post-publication-check"></a>
 ### Post-publication check
