@@ -3,6 +3,11 @@
 
 name: Set up protoc
 description: Install checksum-verified protoc for Linux x86_64 or aarch64
+inputs:
+  install-prefix:
+    description: Prefix for the protoc binary and bundled .proto includes
+    required: false
+    default: /usr/local
 runs:
   using: composite
   steps:
@@ -10,4 +15,5 @@ runs:
       shell: bash
       env:
         PROTOC_VERSION: "25.3"
+        PROTOC_INSTALL_PREFIX: ${{ inputs.install-prefix }}
       run: bash "$GITHUB_ACTION_PATH/install.sh"

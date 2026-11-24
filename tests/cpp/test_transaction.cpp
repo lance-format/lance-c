@@ -2047,6 +2047,12 @@ static void test_update_rewrite_operations(const std::string& source_uri,
     }
     CHECK(bloom_rejected);
 
+    /* A zero-length input is the documented empty exact set. */
+    auto empty = lance::KeyExistenceFilter::from_proto({});
+    CHECK(empty.kind() == LANCE_KEY_EXISTENCE_FILTER_EXACT);
+    CHECK(empty.field_ids().empty());
+    CHECK(empty.exact_keys().empty());
+
     const std::vector<uint8_t> bloom_bytes = {
         0x08, 0x01, 0x1A, 0x12, 0x0A, 0x03, 0x01, 0x02, 0x03, 0x10,
         0x40, 0x18, 0x00, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -2061,6 +2067,14 @@ static void test_update_rewrite_operations(const std::string& source_uri,
     auto bloom_round_trip = lance::KeyExistenceFilter::from_proto(
         bloom.to_proto());
     CHECK(bloom_round_trip.bloom().number_of_items == 8192);
+
+    /* A clone owns independent native storage: replacing the source keeps the
+       clone's kind and membership readable. */
+    auto clone_source = lance::KeyExistenceFilter::from_proto(exact_bytes);
+    auto exact_clone = clone_source.clone();
+    clone_source = lance::KeyExistenceFilter::from_proto(bloom_bytes);
+    CHECK(exact_clone.kind() == LANCE_KEY_EXISTENCE_FILTER_EXACT);
+    CHECK((exact_clone.exact_keys() == std::vector<uint64_t>{4, 9}));
 
     /* ── RewrittenIndex: None vs Some(empty) vs populated files. ── */
     const std::array<uint8_t, 16> old_id = {0x11, 0x11, 0x11, 0x11,

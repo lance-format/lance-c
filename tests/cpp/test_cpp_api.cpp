@@ -60,6 +60,31 @@ static_assert(std::is_move_constructible_v<lance::IndexSegmentResult>);
 static_assert(!std::is_copy_constructible_v<lance::CompactionPlan>);
 static_assert(!std::is_copy_constructible_v<lance::IndexSegmentResult>);
 
+template <typename... Args>
+concept CanCallScannerNearest = requires(lance::Scanner& scanner, Args&&... args) {
+    scanner.nearest("embedding", std::forward<Args>(args)...);
+};
+
+template <typename... Args>
+concept CanCallScannerNearestBatch = requires(lance::Scanner& scanner, Args&&... args) {
+    scanner.nearest_batch("embedding", std::forward<Args>(args)...);
+};
+
+// Float32 ranges bind the span overloads; pointer/count calls keep their meaning.
+static_assert(CanCallScannerNearest<std::vector<float>&, uint32_t>);
+static_assert(CanCallScannerNearest<float (&)[8], uint32_t>);
+static_assert(CanCallScannerNearest<std::span<const float>, uint32_t>);
+static_assert(CanCallScannerNearest<float (&)[8], size_t, uint32_t>);
+static_assert(!CanCallScannerNearest<std::vector<float>&, size_t, uint32_t>);
+static_assert(!CanCallScannerNearest<std::span<const double>, uint32_t>);
+
+static_assert(CanCallScannerNearestBatch<std::vector<float>&, size_t, uint32_t>);
+static_assert(CanCallScannerNearestBatch<std::span<const float>, size_t, uint32_t>);
+static_assert(CanCallScannerNearestBatch<float (&)[16], size_t, uint32_t>);
+static_assert(CanCallScannerNearestBatch<float (&)[16], size_t, size_t, uint32_t>);
+static_assert(
+    !CanCallScannerNearestBatch<std::vector<float>&, size_t, size_t, uint32_t>);
+
 static const char* arrow_field_metadata_value(
     const ArrowSchema* field,
     const char* key,
@@ -3913,21 +3938,17 @@ static void test_alter_columns(const std::string& dst_uri) {
     }
     assert(caught_noop);
 
-    // Out-of-range nullable_mode discriminant must throw with INVALID_ARGUMENT.
-    // Cast `99` through the enum type to verify the C++ wrapper forwards it
-    // verbatim rather than silently clamping.
-    bool caught_bad_mode = false;
-    try {
-        lance::ColumnAlteration bad_mode;
-        bad_mode.path = "id";
-        bad_mode.nullable_mode =
-            static_cast<LanceColumnNullableMode>(99);
-        ds.alter_columns({bad_mode});
-    } catch (const lance::Error& e) {
-        caught_bad_mode = true;
-        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
-    }
-    assert(caught_bad_mode);
+    // The wrapper types nullable_mode as an enum, so an out-of-range value can
+    // only be represented at the documented C ABI integer boundary. Keep the
+    // rejection check there.
+    LanceDataset* raw_dataset = lance_dataset_open(dst_uri.c_str(), nullptr, 0);
+    assert(raw_dataset != nullptr);
+    LanceColumnAlteration bad_mode{};
+    bad_mode.path = "id";
+    bad_mode.nullable_mode = 99;
+    assert(lance_dataset_alter_columns(raw_dataset, &bad_mode, 1) == -1);
+    assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
+    lance_dataset_close(raw_dataset);
 
     PASS();
 }
@@ -4462,6 +4483,18 @@ static void test_distance_range(const std::string& uri) {
         check_distance_range_results(&stream, lower ? &*lower : nullptr,
                                      upper ? &*upper : nullptr, expected_ids[mode], expected[mode]);
     }
+
+    std::vector<float> query_vector(query, query + 8);
+    {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query_vector, 20).use_index(false);
+        const float upper = 0.125f;
+        scanner.distance_range(std::nullopt, upper);
+        ArrowArrayStream stream{};
+        scanner.to_arrow_stream(&stream);
+        check_distance_range_results(&stream, nullptr, &upper, expected_ids[0],
+                                     expected[0]);
+    }
     PASS();
 }
 
@@ -4530,6 +4563,31 @@ static void test_batch_nearest(const std::string& uri) {
         ArrowArrayStream stream = {};
         scanner.to_arrow_stream(&stream);
         check_batch_nearest_results(&stream);
+    }
+
+    std::vector<float> query_vector(queries, queries + 16);
+    {
+        auto scanner = dataset.scan();
+        scanner.nearest_batch("embedding", query_vector, 8, 2);
+        scanner.use_index(false).batch_size(1);
+        ArrowArrayStream stream = {};
+        scanner.to_arrow_stream(&stream);
+        check_batch_nearest_results(&stream);
+    }
+
+    // A span whose length is not a multiple of the dimension is rejected
+    // before the native call instead of reading past its bounds.
+    {
+        std::vector<float> short_queries(15, 0.0f);
+        auto scanner = dataset.scan();
+        bool rejected = false;
+        try {
+            scanner.nearest_batch("embedding", short_queries, 8, 2);
+        } catch (const lance::Error& error) {
+            rejected = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(rejected);
     }
     PASS();
 }
@@ -4714,23 +4772,32 @@ static void test_scanner_order_by(const std::string& uri) {
     }
 
     {
-        auto scanner = ds.scan();
-        scanner.order_by(ordering);
-        bool caught = false;
-        try {
-            scanner.order_by(std::vector<lance::ColumnOrdering>{
-                {"rank", static_cast<LanceOrderDirection>(7),
-                 LANCE_ORDER_NULLS_LAST},
-            });
-        } catch (const lance::Error& error) {
-            caught = true;
-            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
-            assert(std::string(error.what()).find("order_by direction") !=
-                   std::string::npos);
+        // The wrapper types a direction as an enum, so an out-of-range value
+        // can only be represented at the documented C ABI integer boundary.
+        // Keep the rejection and retained-ordering checks there.
+        LanceDataset* raw_dataset = lance_dataset_open(uri.c_str(), nullptr, 0);
+        assert(raw_dataset != nullptr);
+        LanceScanner* raw_scanner = lance_scanner_new(raw_dataset, nullptr, nullptr);
+        assert(raw_scanner != nullptr);
+        LanceColumnOrdering native_ordering[] = {
+            {"category", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+            {"rank", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+            {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+        };
+        assert(lance_scanner_set_order_by(raw_scanner, native_ordering, 3) == 0);
+        LanceColumnOrdering invalid = {"rank", 7, LANCE_ORDER_NULLS_LAST};
+        assert(lance_scanner_set_order_by(raw_scanner, &invalid, 1) == -1);
+        assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
+        const char* message = lance_last_error_message();
+        assert(message != nullptr);
+        assert(std::string(message).find("order_by direction") != std::string::npos);
+        lance_free_string(message);
+        {
+            lance::Scanner scanner(raw_scanner);
+            // The rejected call retained the previous ordering.
+            assert(scan_ordering_ids(scanner) == expected);
         }
-        assert(caught);
-        // The rejected call retained the previous ordering.
-        assert(scan_ordering_ids(scanner) == expected);
+        lance_dataset_close(raw_dataset);
     }
 
     std::vector<int32_t> unordered;
@@ -4864,6 +4931,32 @@ static void test_scanner_substrait_aggregate(
                std::string::npos);
     }
     assert(caught);
+
+    PASS();
+}
+
+static void test_scanner_substrait_filter(
+    const std::string& uri,
+    const std::string& expression_path) {
+    TEST(test_scanner_substrait_filter);
+
+    auto ds = lance::Dataset::open(uri);
+    auto scanner = ds.scan();
+
+    auto bytes = read_file_bytes(expression_path);
+    assert(!bytes.empty());
+    scanner.substrait_filter(bytes);
+    /* The C entry point copies the expression before returning, so the
+       caller-owned storage may be reused or freed afterwards. */
+    std::fill(bytes.begin(), bytes.end(), 0);
+    bytes.clear();
+
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    auto ids = collect_ordering_ids(stream);
+    std::sort(ids.begin(), ids.end());
+    assert((ids == std::vector<int32_t>{4, 5, 6, 7, 8, 9, 10, 11}));
 
     PASS();
 }
@@ -6035,12 +6128,12 @@ int main(int argc, char** argv) {
     /* Keep progress visible when the process dies without unwinding: stdout to
        a pipe is otherwise block-buffered and the last TEST() marker is lost. */
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (argc < 13) {
+    if (argc < 15) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
                 "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
                 "<rtree_geometry_uri> <aggregate_plan_path> <config_base_uri> "
-                "<alternate_base_uri>\n",
+                "<alternate_base_uri> <write_file_uri> <substrait_filter_path>\n",
                 argv[0]);
         return 1;
     }
@@ -6057,6 +6150,7 @@ int main(int argc, char** argv) {
     std::string aggregate_plan_path(argv[10]);
     std::string config_base_uri(argv[11]);
     std::string alternate_base_uri(argv[12]);
+    std::string substrait_filter_path(argv[14]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_binding_version();
@@ -6069,6 +6163,7 @@ int main(int argc, char** argv) {
     test_scanner_projection(uri);
     test_scanner_order_by(ordering_uri);
     test_scanner_substrait_aggregate(ordering_uri, aggregate_plan_path);
+    test_scanner_substrait_filter(ordering_uri, substrait_filter_path);
     test_scanner_introspection(uri);
     test_fragment_snapshots(fragment_uri);
     test_fragment_read_operations(fragment_read_uri);

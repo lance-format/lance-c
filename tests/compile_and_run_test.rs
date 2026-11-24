@@ -32,11 +32,17 @@ use lance_file::version::LanceFileVersion;
 use common::{create_config_base_files_fixture, create_rtree_geometry_fixture};
 use std::ffi::CString;
 
+#[path = "support/c_text.rs"]
+mod c_text;
+
 #[path = "support/abi_layout.rs"]
 mod abi_layout;
 
 #[path = "support/c_toolchain.rs"]
 mod c_toolchain;
+
+#[path = "support/header_signatures.rs"]
+mod header_signatures;
 
 #[path = "support/local_uri.rs"]
 mod local_uri;
@@ -798,15 +804,20 @@ fn typed_fts_row_id(uri: &str, target: i32) -> u64 {
     })
 }
 
+/// Schema of the two-fragment scanner-ordering fixture.
+fn ordering_dataset_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("rank", DataType::Int32, true),
+    ]))
+}
+
 /// Create a two-fragment dataset for scanner ordering tests.
 fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("ordering_ds").to_str().unwrap().to_string();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("category", DataType::Utf8, true),
-        Field::new("rank", DataType::Int32, true),
-    ]));
+    let schema = ordering_dataset_schema();
     let make_batch = |ids: Vec<i32>, groups: &[Option<&str>], ranks: &[Option<i32>]| {
         RecordBatch::try_new(
             schema.clone(),
@@ -1313,8 +1324,8 @@ fn compile_header_with_args(
 /// for the write test and its `file://` form, the Blob v2 and ordering
 /// datasets, the indexed session cache dataset, separate non-stable/stable
 /// fragment-deletion datasets, the cleanup and RTree geometry fixtures, the
-/// aggregate plan, and the config/base/file fixture. The destination path must
-/// not pre-exist.
+/// aggregate plan and Substrait filter expression, and the config/base/file
+/// fixture. The destination path must not pre-exist.
 #[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
@@ -1328,6 +1339,7 @@ fn run_test_binary(
     cleanup_uri: &str,
     rtree_geometry_uri: &str,
     aggregate_plan_path: &Path,
+    substrait_filter_path: &Path,
     config_base_files: &common::ConfigBaseFilesFixture,
 ) {
     let write_file_uri = local_uri::file_uri(Path::new(write_uri));
@@ -1345,6 +1357,7 @@ fn run_test_binary(
         .arg(&config_base_files.uri)
         .arg(&config_base_files.alternate_base_uri)
         .arg(&write_file_uri)
+        .arg(substrait_filter_path)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -1376,6 +1389,21 @@ fn describe_exit_status(status: std::process::ExitStatus) -> String {
         Some(code) => code.to_string(),
         None => "terminated by signal".to_string(),
     }
+}
+
+/// Write a serialized Substrait `ExtendedExpression` selecting `id > 3`
+/// against the scanner-ordering fixture schema.
+fn write_substrait_filter_expression(directory: &Path) -> PathBuf {
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::SessionContext;
+    use lance_datafusion::substrait::encode_substrait;
+
+    let expression = col("id").gt(lit(3i32));
+    let state = SessionContext::new().state();
+    let bytes = encode_substrait(expression, ordering_dataset_schema(), &state).unwrap();
+    let path = directory.join("ordering-filter.expression");
+    std::fs::write(&path, bytes).unwrap();
+    path
 }
 
 fn write_ordering_aggregate_plan(directory: &Path) -> PathBuf {
@@ -1472,6 +1500,7 @@ fn test_c_compilation_and_execution() {
         "C test compilation failed"
     );
     let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
+    let substrait_filter_path = write_substrait_filter_expression(build_dir.path());
 
     run_test_binary(
         &binary,
@@ -1485,6 +1514,7 @@ fn test_c_compilation_and_execution() {
         &cleanup_uri,
         &rtree_geometry.uri,
         &aggregate_plan_path,
+        &substrait_filter_path,
         &config_base_files,
     );
 }
@@ -1521,6 +1551,7 @@ fn test_cpp_compilation_and_execution() {
         "C++ test compilation failed"
     );
     let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
+    let substrait_filter_path = write_substrait_filter_expression(build_dir.path());
 
     run_test_binary(
         &binary,
@@ -1534,6 +1565,7 @@ fn test_cpp_compilation_and_execution() {
         &cleanup_uri,
         &rtree_geometry.uri,
         &aggregate_plan_path,
+        &substrait_filter_path,
         &config_base_files,
     );
 }
@@ -2273,6 +2305,12 @@ fn test_public_c_abi_layout_matches_rust() {
 }
 
 #[test]
+#[ignore = "requires a C compiler; run with: cargo test --test compile_and_run_test -- --ignored test_public_header_signatures_match_rust"]
+fn test_public_header_signatures_match_rust() {
+    header_signatures::assert_public_header_signatures();
+}
+
+#[test]
 #[ignore = "requires C and C++ compilers; run with: cargo test --test compile_and_run_test -- --ignored test_arrow_header_include_orders"]
 fn test_arrow_header_include_orders() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2487,4 +2525,255 @@ fn test_api_attribute_contract() {
             "{source_name} failed without the deprecation diagnostic:\n{stderr}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires C++ compiler (c++); run with: cargo test -p lance-c -- --ignored test_cpp_narrow_read_header_link"]
+fn test_cpp_narrow_read_header_link() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_dataset_tmp, dataset_uri) = create_test_dataset_on_disk();
+    let build_dir = tempfile::tempdir().expect("failed to create mixed consumer directory");
+
+    let helper = build_dir.path().join("narrow_helper.cpp");
+    std::fs::write(
+        &helper,
+        r#"#include <lance/detail/declarations.hpp>
+#include <lance/detail/inline/read.hpp>
+
+uint64_t narrow_count_rows(const lance::Dataset& dataset) {
+    return dataset.count_rows();
+}
+"#,
+    )
+    .expect("failed to write narrow helper");
+
+    let main = build_dir.path().join("mixed_main.cpp");
+    std::fs::write(
+        &main,
+        r#"#include <lance/lance.hpp>
+
+#include <cstdint>
+
+uint64_t narrow_count_rows(const lance::Dataset& dataset);
+
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
+    auto dataset = lance::Dataset::open(argv[1]);
+    auto scanner = dataset.scan();
+    scanner.limit(1);
+    ArrowArrayStream stream{};
+    scanner.to_arrow_stream(&stream);
+    if (stream.release) stream.release(&stream);
+    return narrow_count_rows(dataset) == dataset.count_rows() ? 0 : 1;
+}
+"#,
+    )
+    .expect("failed to write umbrella consumer");
+
+    let binary = c_toolchain::executable_path(build_dir.path(), "mixed_read");
+    assert!(
+        compile_cpp_test(
+            &[helper.as_path(), main.as_path()],
+            &binary,
+            &include_dir,
+            &lib_path
+        ),
+        "mixed umbrella/narrow C++ consumer failed to compile or link"
+    );
+
+    let output = Command::new(&binary)
+        .arg(&dataset_uri)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run mixed consumer: {error}"));
+    assert!(
+        output.status.success(),
+        "mixed umbrella/narrow consumer failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires C++ compiler (c++); run with: cargo test -p lance-c -- --ignored test_cpp_narrow_open_paths"]
+fn test_cpp_narrow_open_paths() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_dataset_tmp, dataset_uri) = create_test_dataset_on_disk();
+    let build_dir = tempfile::tempdir().expect("failed to create narrow open consumer directory");
+
+    let source = build_dir.path().join("narrow_open.cpp");
+    std::fs::write(
+        &source,
+        r#"#include <lance/detail/declarations.hpp>
+#include <lance/detail/inline/read.hpp>
+
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
+
+    auto base = lance::Dataset::open(argv[1]);
+    auto rows = base.count_rows();
+
+    lance::DatasetOpenOptions options{};
+    auto with_options = lance::Dataset::open_with_options(argv[1], options);
+
+    lance::Session session(std::uint64_t{1} << 20, std::uint64_t{1} << 20);
+    auto with_session = lance::Dataset::open_with_session(session, argv[1]);
+
+    auto with_commit_lock =
+        lance::Dataset::open_with_commit_lock(argv[1], nullptr, 0, nullptr, nullptr);
+
+    auto scanner = with_options.scan();
+    scanner.limit(1);
+    ArrowArrayStream stream{};
+    scanner.to_arrow_stream(&stream);
+    if (stream.release) stream.release(&stream);
+
+    return rows == with_session.count_rows() &&
+                   with_commit_lock.version() == with_options.version()
+               ? 0
+               : 1;
+}
+"#,
+    )
+    .expect("failed to write narrow open consumer");
+
+    let binary = c_toolchain::executable_path(build_dir.path(), "narrow_open");
+    assert!(
+        compile_cpp_test(&[source.as_path()], &binary, &include_dir, &lib_path),
+        "narrow-only C++ open consumer failed to compile or link"
+    );
+
+    let output = Command::new(&binary)
+        .arg(&dataset_uri)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run narrow open consumer: {error}"));
+    assert!(
+        output.status.success(),
+        "narrow-only open consumer failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires C++ compiler (c++); run with: cargo test -p lance-c -- --ignored test_cpp_narrow_owning_streams"]
+fn test_cpp_narrow_owning_streams() {
+    let (lib_path, include_dir) = build_lance_c();
+    let (_dataset_tmp, dataset_uri) = create_test_dataset_on_disk();
+    let build_dir = tempfile::tempdir().expect("failed to create narrow owning-stream directory");
+
+    let source = build_dir.path().join("narrow_owning_streams.cpp");
+    std::fs::write(
+        &source,
+        r#"#include <lance/detail/declarations.hpp>
+#include <lance/detail/inline/read.hpp>
+
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
+#include <utility>
+
+static void counting_release(ArrowArrayStream* stream) {
+    auto* releases = static_cast<int*>(stream->private_data);
+    ++*releases;
+    stream->release = nullptr;
+}
+
+static uint64_t drain(ArrowArrayStream& stream) {
+    uint64_t rows = 0;
+    for (;;) {
+        ArrowArray batch{};
+        const int status = stream.get_next(&stream, &batch);
+        if (status != 0) {
+            const char* message =
+                stream.get_last_error ? stream.get_last_error(&stream) : nullptr;
+            std::fprintf(stderr, "get_next failed: %s\n",
+                         message ? message : "(no message)");
+            std::abort();
+        }
+        if (batch.release == nullptr) break;
+        rows += static_cast<uint64_t>(batch.length);
+        batch.release(&batch);
+    }
+    return rows;
+}
+
+int main(int argc, char** argv) {
+    assert(argc == 2);
+
+    auto dataset = lance::Dataset::open(argv[1]);
+    ArrowArrayStream raw_stream{};
+    ArrowArrayStream* raw_out = &raw_stream;
+
+    // Braced/null resolution stays on the caller-owned raw-out overload.
+    static_assert(
+        std::is_same_v<decltype(dataset.take_rows({}, {})), lance::ArrowStream>);
+    static_assert(
+        std::is_same_v<decltype(dataset.take_rows({}, {}, raw_out)), void>);
+    static_assert(
+        std::is_same_v<decltype(dataset.take(nullptr, 0, raw_out)), void>);
+    static_assert(std::is_same_v<decltype(std::declval<lance::Scanner&>().to_arrow_stream()),
+                                 lance::ArrowStream>);
+    static_assert(std::is_same_v<decltype(std::declval<lance::Scanner&>().to_arrow_stream(raw_out)),
+                                 void>);
+
+    int releases = 0;
+    {
+        ArrowArrayStream raw{};
+        raw.private_data = &releases;
+        raw.release = counting_release;
+        lance::ArrowStream source(raw);
+        auto moved = std::move(source);
+        assert(!source);
+        assert(moved);
+        moved.reset();
+        assert(releases == 1);
+    }
+    assert(releases == 1);
+
+    const uint64_t expected_rows = dataset.count_rows();
+    assert(expected_rows > 0);
+
+    auto scanner = dataset.scan();
+    ArrowArrayStream caller_stream{};
+    scanner.to_arrow_stream(&caller_stream);
+    const uint64_t raw_rows = drain(caller_stream);
+    if (caller_stream.release) caller_stream.release(&caller_stream);
+    assert(raw_rows == expected_rows);
+
+    auto owning_scanner = dataset.scan();
+    auto owning_stream = owning_scanner.to_arrow_stream();
+    assert(drain(*owning_stream.get()) == expected_rows);
+
+    auto empty_owned = dataset.take_rows(nullptr, 0);
+    assert(drain(*empty_owned.get()) == 0);
+
+    ArrowArrayStream empty_raw{};
+    dataset.take_rows(nullptr, 0, &empty_raw);
+    assert(drain(empty_raw) == 0);
+    if (empty_raw.release) empty_raw.release(&empty_raw);
+
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write narrow owning-stream consumer");
+
+    let binary = c_toolchain::executable_path(build_dir.path(), "narrow_owning_streams");
+    assert!(
+        compile_cpp_test(&[source.as_path()], &binary, &include_dir, &lib_path),
+        "narrow-only owning-stream consumer failed to compile or link"
+    );
+
+    let output = Command::new(&binary)
+        .arg(&dataset_uri)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run narrow owning-stream consumer: {error}"));
+    assert!(
+        output.status.success(),
+        "narrow-only owning-stream consumer failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

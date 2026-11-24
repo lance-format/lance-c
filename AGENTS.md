@@ -22,7 +22,7 @@
 ## Structure
 Rust FFI source: `src/`
 C headers (stable ABI): `include/lance/lance.h` umbrella plus domain headers in `include/lance/`
-C++ RAII wrappers (header-only): `include/lance/lance.hpp`
+C++ RAII wrappers (header-only): `include/lance/lance.hpp` umbrella; shared declarations and opt-in inline definitions under `include/lance/detail/`
 Tests (Rust): `tests/c_api_test.rs`
 Tests (C/C++): `tests/cpp/`
 Historical test data: `test_data/`
@@ -34,6 +34,7 @@ lint: `cargo clippy --all-targets -- -D warnings`
 test: `cargo test`
 test C/C++ compilation: `cargo test --test compile_and_run_test -- --ignored`
 check C/C++ headers: `bash .github/scripts/verify-cxx-headers.sh` (defaults to gcc:g++ and clang:clang++; pass `gcc14-gcc:gcc14-g++` style pairs to test other local toolchains)
+sanitizer C/C++ consumers: `LANCE_C_SANITIZERS=address,undefined ASAN_OPTIONS=detect_leaks=1 cargo test --test compile_and_run_test -- --ignored test_c_compilation_and_execution` (Linux; any native consumer test works)
 
 ## Key Patterns
 - Opaque handles with `lance_*_open`/`lance_*_close` lifecycle.
@@ -63,6 +64,10 @@ check C/C++ headers: `bash .github/scripts/verify-cxx-headers.sh` (defaults to g
 - All bugfixes and features must have corresponding tests.
 - Cover NULL/empty edge cases.
 - Include multi-fragment scenarios for dataset operations.
+- `test_public_header_signatures_match_rust` compiles the public header
+declarations against the Rust `extern "C"` signatures and checks that both
+name sets agree. It runs with the ignored C/C++ compilation tests; its
+declaration-mismatch self-tests mutate temporary header copies only.
 
 ### Dependencies
 - Prefer the standard library or existing workspace dependencies before adding new external crates.

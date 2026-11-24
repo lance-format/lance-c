@@ -2633,6 +2633,7 @@ static void test_native_refs_and_tags(const char *uri) {
            "tag created timestamp");
     ASSERT(lance_tag_updated_at_ns(tag, &updated_at) == 1 && updated_at >= created_at,
            "tag updated timestamp");
+    lance_tag_close(tag);
 
     LanceRef *duplicate = lance_ref_version_number(2);
     ASSERT(lance_dataset_tag_create(ds, "c-release", duplicate) == -1,

@@ -1,3 +1,6 @@
+This retired port packages only v0.1.9. For supported stable downloads, use the
+latest stable release: https://github.com/lance-format/lance-c/releases/latest
+
 The package lance-c provides CMake targets:
 
     find_package(LanceC CONFIG REQUIRED)
@@ -15,7 +18,9 @@ The default linkage matches the vcpkg triplet:
 
 Override per-build by setting LanceC_LINK=static|shared before find_package.
 
-Prebuilt archives are published for x64-linux, arm64-linux, and arm64-osx.
+For the v0.1.9 package, prebuilt archives are published for x64-linux,
+arm64-linux, and arm64-osx. This port does not distribute newer stable
+releases.
 Intel macOS (x64-osx) is not a supported platform for new releases; the port
 rejects it rather than falling back to a source build. Unsupported Linux
 triples without a matching prebuilt asset can install with the from-source

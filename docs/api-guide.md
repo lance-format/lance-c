@@ -2,7 +2,7 @@
 
 See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function; see [Generated C/C++ API reference](api-reference.md) to render the headers as searchable HTML.
 
-The core workflows use public calls present in v0.2.0 and current source, and were exercised against the published 0.2.0 library. That release pins Lance 15.0.0-beta.25; a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Behavior that requires a newer Lance core is not part of the 0.2.0 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
+The core workflows use public calls present in the current source and were exercised against a published stable release. The [latest stable release](https://github.com/lance-format/lance-c/releases/latest) provides supported downloads, and the [releases page](https://github.com/lance-format/lance-c/releases) records the changes in each release. A package may not contain entry points added after its release: check the installed header before using one.
 
 ## Write Arrow batches
 
@@ -153,6 +153,10 @@ scanner.nearest("embedding", query, 2, 5)
        .prefilter(true)
        .limit(2);
 ```
+
+`Scanner::nearest` also accepts a contiguous Float32 range; `std::vector`,
+`std::array`, `std::span` and C arrays bind the span overload, whose length is
+the query dimension. The pointer/count overloads are unchanged.
 
 Full-text search uses BM25 over an inverted scalar index. Build the index first, then either name the indexed columns or pass NULL to search all FTS-indexed columns. `max_fuzzy_distance == 0` selects exact term matching; a positive value enables native fuzzy matching. The default scoring path adds `_score`. FTS and nearest queries are mutually exclusive on one scanner. See [Scanner projection and scoring columns](#scanner-projection-and-scoring-columns), [Distance-bounded vector search](#distance-bounded-vector-search), and [Multi-vector search](#multi-vector-search) for the specialized forms.
 
@@ -429,7 +433,7 @@ fts query: 1 2 4
 workflow: PASS
 ```
 
-The example uses only calls and behavior present in v0.2.0. It is not a statement that later unreleased APIs are part of the 0.2.0 archive.
+The example uses only calls and behavior present in the stable release you installed. A development build may add entry points that the archive does not contain; check its header.
 
 ## Errors and panic recovery
 
@@ -493,10 +497,19 @@ Selective includes change neither the ABI nor the behavior, and the umbrella
 remains the safe choice for code that uses several domains. Existing code does
 not need to change.
 
-The C++ wrapper `<lance/lance.hpp>` is a large header-only interface and still
+The C++ wrapper `<lance/lance.hpp>` is a header-only interface and still
 includes the umbrella C header. Include it only in the `.cpp` translation units
 that use the C++ API, rather than in widely included project headers, to limit
 compile time and rebuild scope where practical.
+
+Internally the wrapper separates shared class declarations
+(`<lance/detail/declarations.hpp>`) from opt-in inline definitions grouped under
+`<lance/detail/inline/>`. The umbrella includes every definition, so header-only
+linking and existing includes are unchanged. A translation unit that only opens
+and scans a dataset can include `lance/detail/declarations.hpp` and
+`lance/detail/inline/read.hpp` to skip parsing the unrelated inline
+definitions; the `detail/` paths are implementation headers, not a separate
+stability contract.
 
 ## Binding version
 
@@ -934,6 +947,16 @@ scanner.nearest_batch("embedding", queries, 2, 2, 10)
        .use_index(false);
 ```
 
+`Scanner::nearest_batch` also accepts a contiguous Float32 range and derives the
+number of queries from its length. The length must be a multiple of `dimension`;
+otherwise the call throws `lance::Error` with `LANCE_ERR_INVALID_ARGUMENT`
+before the native call. The pointer/count overloads are unchanged.
+
+```cpp
+std::vector<float> queries{1.0f, 0.0f, 0.0f, 1.0f};
+scanner.nearest_batch("embedding", queries, 2, 10);  /* two queries */
+```
+
 Here there are two queries of dimension two, each returning up to ten rows.
 The result includes the zero-based `query_index` (`int32`) and, under the legacy
 scoring default, `_distance`, alongside the requested dataset columns. A batch
@@ -1365,7 +1388,7 @@ Nanosecond accessors report an error when a timestamp does not fit i64
 nanoseconds. Snapshot creation and millisecond reads retain the native range.
 There is no C-side timestamp/asof selector.
 
-Branches use the public Lance 14.0.2 branch lifecycle:
+Branches use the selected Lance core's public branch lifecycle:
 
 ```cpp
 auto branch = source.create_branch(
@@ -1469,9 +1492,9 @@ later valid call can still enable it.
 
 `lance-c` creates one process-wide, multi-thread Tokio runtime lazily on the
 first runtime-backed call. It does not add a binding-specific worker-count API
-or environment variable. The locked Tokio version (1.53.1 in `Cargo.lock`)
-reads `TOKIO_WORKER_THREADS` when that runtime is built because `lance-c` does
-not call `Builder::worker_threads`.
+or environment variable. The Tokio release locked in the checkout's
+[Cargo.lock](../Cargo.lock) reads `TOKIO_WORKER_THREADS` when that runtime is
+built because `lance-c` does not call `Builder::worker_threads`.
 
 - When unset, Tokio uses `std::thread::available_parallelism()`, the parallelism
   available to the process, normally one worker per available CPU.

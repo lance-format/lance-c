@@ -40,6 +40,7 @@ cpp_flags=(
     -Wall -Wextra -Wpedantic
     -Wshadow -Wconversion -Wsign-conversion
     -Werror
+    -Werror=return-type
 )
 
 failures=0
@@ -97,6 +98,10 @@ check_cpp_header_sources() {
         "${cpp_flags[@]}" -I"$include_dir" -I"$arrow_abi_dir"
     run_check "$compiler" C++20 "$tests_dir/header_data_only_before_lance.cpp" \
         "${cpp_flags[@]}" -I"$include_dir" -I"$arrow_abi_data_dir"
+    run_check "$compiler" C++20 "$tests_dir/header_noreturn.cpp" \
+        "${cpp_flags[@]}" -I"$include_dir"
+    run_check "$compiler" C++20 "$tests_dir/header_noreturn_narrow.cpp" \
+        "${cpp_flags[@]}" -I"$include_dir"
     for header in version error arrow_abi fwd attributes dataset scanner batch; do
         source="$work_dir/${header}.cpp"
         printf '#include <lance/%s.h>\nint main() { return 0; }\n' "$header" >"$source"
