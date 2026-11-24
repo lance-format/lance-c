@@ -106,17 +106,35 @@ static void init_batch_arrays(
     array->release = release_array;
 }
 
+/* Resolve an object-store path to a local file path.
+ *
+ * A local object store reports the store-relative path without its leading
+ * separator on POSIX (`tmp/dir/object`), so the path is rooted at `/`. On
+ * Windows the path keeps its drive letter (`C:/dir/object`), which is already
+ * absolute and must not be rooted again. */
+static void object_path_on_disk(
+    const char *object_path,
+    char *local_path,
+    size_t capacity) {
+    int is_drive_path =
+        ((object_path[0] >= 'A' && object_path[0] <= 'Z') ||
+         (object_path[0] >= 'a' && object_path[0] <= 'z')) &&
+        object_path[1] == ':' &&
+        (object_path[2] == '/' || object_path[2] == '\\');
+    if (object_path[0] == '/' || object_path[0] == '\\' || is_drive_path) {
+        snprintf(local_path, capacity, "%s", object_path);
+    } else {
+        snprintf(local_path, capacity, "/%s", object_path);
+    }
+}
+
 static int read_object_bytes(
     const char *object_path,
     char *output,
     size_t capacity,
     long *output_len) {
     char local_path[4096];
-    if (object_path[0] == '/') {
-        snprintf(local_path, sizeof(local_path), "%s", object_path);
-    } else {
-        snprintf(local_path, sizeof(local_path), "/%s", object_path);
-    }
+    object_path_on_disk(object_path, local_path, sizeof(local_path));
     FILE *file = fopen(local_path, "rb");
     if (!file) return 0;
     if (fseek(file, 0, SEEK_END) != 0) {
@@ -501,9 +519,9 @@ static int verify_released_blob_v2_raw_file(const char *base_dir) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
-    char base_uri[4096];
-    snprintf(base_uri, sizeof(base_uri), "file://%s", argv[1]);
+    if (argc != 3) return 2;
+    /* argv[1] is the directory for local fixture files; argv[2] is its URI. */
+    const char *base_uri = argv[2];
 
     const char *option_keys[] = {"block_size"};
     const char *option_values[] = {"4096"};

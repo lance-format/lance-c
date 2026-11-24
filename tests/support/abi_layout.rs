@@ -1727,22 +1727,21 @@ fn run_c_probe(manifest: &AbiManifest, include_dir: &Path) -> BTreeSet<String> {
     let source = generate_c_probe(manifest);
     let build_dir = tempfile::tempdir().expect("failed to create ABI probe build directory");
     let source_path = build_dir.path().join("abi_layout_probe.c");
-    let binary_path = build_dir.path().join("abi_layout_probe");
+    let binary_path = crate::c_toolchain::executable_path(build_dir.path(), "abi_layout_probe");
     std::fs::write(&source_path, &source).expect("failed to write ABI probe source");
 
-    let compiler = std::env::var("CC").unwrap_or_else(|_| "clang".to_owned());
-    let compile = Command::new(&compiler)
-        .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
-        .arg(format!("-I{}", include_dir.display()))
-        .arg(&source_path)
-        .arg("-o")
-        .arg(&binary_path)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run C compiler `{compiler}`: {error}"));
+    let sources: [&Path; 1] = [&source_path];
+    let includes: [&Path; 1] = [include_dir];
     assert!(
-        compile.status.success(),
-        "C11 ABI probe failed to compile with `{compiler}`:\n{}\n--- probe source ---\n{source}",
-        String::from_utf8_lossy(&compile.stderr),
+        crate::c_toolchain::compile(&crate::c_toolchain::Compilation {
+            language: crate::c_toolchain::Language::C,
+            sources: &sources,
+            includes: &includes,
+            output: Some(&binary_path),
+            shared_library: None,
+            deny_warnings: true,
+        }),
+        "C11 ABI probe failed to compile:\n--- probe source ---\n{source}"
     );
 
     let run = Command::new(&binary_path)

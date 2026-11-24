@@ -7,6 +7,8 @@
 //! validating the C API contract without needing a C compiler.
 
 mod common;
+#[path = "support/local_uri.rs"]
+mod local_uri;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -8024,7 +8026,7 @@ fn schema_to_ffi(schema: &Schema) -> FFI_ArrowSchema {
 #[test]
 fn test_write_fragments_creates_data_files() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().to_str().unwrap());
+    let uri = local_uri::file_uri(tmp.path());
     let c_uri = CString::new(uri.clone()).unwrap();
 
     let schema = Arc::new(Schema::new(vec![
@@ -8079,7 +8081,7 @@ fn test_write_fragments_null_args_returns_error() {
 #[test]
 fn test_write_fragments_schema_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().to_str().unwrap());
+    let uri = local_uri::file_uri(tmp.path());
     let c_uri = CString::new(uri).unwrap();
 
     // Stream has columns (id: Int32, val: Float32)
@@ -8128,7 +8130,7 @@ fn test_robotics_e2e_write_then_finalize() {
     // ── Step 1: "C++ edge device" writes fragment data files ──
 
     let staging_dir = tempfile::tempdir().unwrap();
-    let staging_uri = format!("file://{}", staging_dir.path().to_str().unwrap());
+    let staging_uri = local_uri::file_uri(staging_dir.path());
     let c_uri = CString::new(staging_uri.clone()).unwrap();
 
     let schema = Arc::new(Schema::new(vec![
@@ -15442,6 +15444,15 @@ fn native_descriptor_parts(
     builder.finish().unwrap().into_parts()
 }
 
+/// Object-store path reported by the C API.
+///
+/// `Path::from` percent-encodes object-key characters such as `~`, so a Windows
+/// 8.3 temporary path (`RUNNER~1`) becomes `RUNNER%7E1` and no longer names the
+/// file the writer created. `Path::parse` keeps the reported spelling.
+fn reported_object_path(path: &str) -> object_store::path::Path {
+    object_store::path::Path::parse(path).unwrap()
+}
+
 fn read_blob_sidecar(
     store: &lance_io::object_store::ObjectStore,
     path: &object_store::path::Path,
@@ -15566,7 +15577,7 @@ fn binary_payload_cases() -> Vec<BinaryPayloadCase> {
 #[test]
 fn test_packed_blob_writer_c_matches_native_binary_types_and_descriptor_identity() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
+    let uri = local_uri::file_uri(tmp.path());
     let (store, base) =
         lance_c::runtime::block_on(lance_io::object_store::ObjectStore::from_uri(&uri)).unwrap();
     let session = open_blob_test_session(&uri);
@@ -15618,7 +15629,7 @@ fn test_packed_blob_writer_c_matches_native_binary_types_and_descriptor_identity
             take_last_error_message()
         );
         let (c_field, c_array) = output_parts(out_array, out_schema);
-        let c_bytes = read_blob_sidecar(&store, &object_store::path::Path::from(c_path.as_str()));
+        let c_bytes = read_blob_sidecar(&store, &reported_object_path(&c_path));
         assert_eq!(c_bytes, expected_payload_bytes(&rows));
         unsafe { lance_packed_blob_writer_close(writer) };
 
@@ -15654,7 +15665,7 @@ fn test_packed_blob_writer_c_matches_native_binary_types_and_descriptor_identity
 #[test]
 fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
+    let uri = local_uri::file_uri(tmp.path());
     let (store, base) =
         lance_c::runtime::block_on(lance_io::object_store::ObjectStore::from_uri(&uri)).unwrap();
     let session = open_blob_test_session(&uri);
@@ -15691,7 +15702,7 @@ fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
         take_last_error_message()
     );
     let (c_field, c_array) = output_parts(out_array, out_schema);
-    let c_bytes = read_blob_sidecar(&store, &object_store::path::Path::from(c_path.as_str()));
+    let c_bytes = read_blob_sidecar(&store, &reported_object_path(&c_path));
     assert_eq!(c_bytes, b"alphaomega");
     assert_eq!(c_array.len(), 1);
     unsafe { lance_dedicated_blob_writer_close(writer) };
@@ -15738,8 +15749,7 @@ fn test_dedicated_blob_writer_finish_array_matches_native_and_empty() {
     );
     let (empty_field, empty_array) = output_parts(empty_array, empty_schema);
     assert_eq!(empty_field.name(), "");
-    let empty_bytes =
-        read_blob_sidecar(&store, &object_store::path::Path::from(empty_path.as_str()));
+    let empty_bytes = read_blob_sidecar(&store, &reported_object_path(&empty_path));
     assert!(empty_bytes.is_empty());
     unsafe { lance_dedicated_blob_writer_close(empty_writer) };
 
@@ -15796,7 +15806,7 @@ unsafe extern "C" fn release_invalid_test_array(array: *mut FFI_ArrowArray) {
 #[test]
 fn test_blob_writer_arrow_ownership_validation_and_finish_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
+    let uri = local_uri::file_uri(tmp.path());
     let session = open_blob_test_session(&uri);
     let writer = unsafe {
         lance_file_session_open_packed_blob_writer(session, c"ownership.lance".as_ptr(), 61)
@@ -28375,7 +28385,7 @@ fn test_native_write_options_external_blob_policy() {
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("external-payload.bin");
     std::fs::write(&source_path, b"external blob bytes").unwrap();
-    let source_uri = format!("file://{}", source_path.display());
+    let source_uri = local_uri::file_uri(&source_path);
 
     let mut builder = lance::BlobArrayBuilder::new(1);
     builder.push_uri(source_uri).expect("external blob URI");
@@ -29184,7 +29194,7 @@ fn test_native_data_file_and_data_replacement_metadata() {
 
     let alternate = tmp.path().join("alternate_base");
     std::fs::create_dir_all(&alternate).unwrap();
-    let alternate_uri = format!("file://{}", alternate.to_str().unwrap());
+    let alternate_uri = local_uri::file_uri(&alternate);
     let alternate_uri_c = c_str(&alternate_uri);
     let alternate_name = c_str("native-alternate");
     let base = LanceBasePath {

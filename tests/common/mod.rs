@@ -131,24 +131,15 @@ pub fn create_rtree_geometry_fixture() -> RTreeGeometryFixture {
 /// - `untracked.txt` exists under the primary root and is not tracked.
 pub fn create_config_base_files_fixture() -> ConfigBaseFilesFixture {
     let tmp = tempfile::tempdir().unwrap();
-    let source_uri = tmp
-        .path()
-        .join("config_base_source")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let uri = tmp
-        .path()
-        .join("config_base_dataset")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let alternate_base_uri = tmp
-        .path()
-        .join("config_base_alternate")
-        .to_str()
-        .unwrap()
-        .to_string();
+    // The native assertions compare these locations against JSON output as
+    // literal substrings, so the fixture hands out file URIs: a native Windows
+    // path would be JSON-escaped (`\\`) and never match.
+    let source_dir = tmp.path().join("config_base_source");
+    let dataset_dir = tmp.path().join("config_base_dataset");
+    let alternate_dir = tmp.path().join("config_base_alternate");
+    let source_uri = crate::local_uri::file_uri(&source_dir);
+    let uri = crate::local_uri::file_uri(&dataset_dir);
+    let alternate_base_uri = crate::local_uri::file_uri(&alternate_dir);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -236,7 +227,7 @@ pub fn create_config_base_files_fixture() -> ConfigBaseFilesFixture {
     });
 
     std::fs::write(
-        std::path::Path::new(&uri).join("untracked.txt"),
+        dataset_dir.join("untracked.txt"),
         b"untracked fixture file\n",
     )
     .unwrap();

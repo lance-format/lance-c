@@ -5900,21 +5900,6 @@ static std::vector<int32_t> cpp_scan_ids(lance::Dataset& dataset) {
     return ids;
 }
 
-static std::string cpp_clone_base_path(lance::Dataset& dataset) {
-    const std::string json = dataset.base_paths_json();
-    const std::string marker = "\"path\":\"";
-    auto start = json.find(marker);
-    if (start == std::string::npos) {
-        throw std::runtime_error("base_paths_json has no base path");
-    }
-    start += marker.size();
-    const auto end = json.find('"', start);
-    if (end == std::string::npos) {
-        throw std::runtime_error("base_paths_json base path is unterminated");
-    }
-    return json.substr(start, end - start);
-}
-
 static void test_dataset_shallow_clone_base_store_params(
     const std::string& feature_uri) {
     TEST(test_dataset_shallow_clone_base_store_params);
@@ -5953,7 +5938,11 @@ static void test_dataset_shallow_clone_base_store_params(
             target, nullptr, &invalid_target_accessor));
         assert(cloned->version() == source_version);
         assert(cpp_scan_ids(*cloned) == source_ids);
-        source_base = cpp_clone_base_path(*cloned);
+        // Lance stores the source branch location URI as the inherited base
+        // path, and `Dataset::branch_location()` takes it from `Dataset::uri()`.
+        // Binding the base therefore only needs the source's own URI, with no
+        // JSON decoding and no dependence on path escaping.
+        source_base = source.uri();
     }
 
     // The returned handle retains runtime base params after the source closes.
@@ -6043,6 +6032,9 @@ static void test_binding_version() {
 }
 
 int main(int argc, char** argv) {
+    /* Keep progress visible when the process dies without unwinding: stdout to
+       a pipe is otherwise block-buffered and the last TEST() marker is lost. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 13) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "

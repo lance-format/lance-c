@@ -192,14 +192,22 @@ fn unguarded_stream_panic_aborts_process() {
         // Parent mode: re-run this test in a child process and observe how it dies.
         let output = run_child("unguarded_stream_panic_aborts_process", "POC_CHILD");
 
-        use std::os::unix::process::ExitStatusExt;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.signal(),
-            Some(libc::SIGABRT),
-            "expected SIGABRT, got status {:?}\nstderr:\n{stderr}",
+        assert!(
+            !output.status.success(),
+            "expected the child to abort, got status {:?}\nstderr:\n{stderr}",
             output.status
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGABRT),
+                "expected SIGABRT, got status {:?}\nstderr:\n{stderr}",
+                output.status
+            );
+        }
         assert!(
             stderr.contains("panic in a function that cannot unwind"),
             "expected the Rust 1.81 cannot-unwind abort message\nstderr:\n{stderr}"

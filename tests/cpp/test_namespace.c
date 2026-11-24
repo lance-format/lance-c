@@ -7,8 +7,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#define test_mkdir(path) _mkdir(path)
+#define test_path_exists(path) (_access(path, 0) == 0)
+#else
 #include <sys/stat.h>
 #include <unistd.h>
+#define test_mkdir(path) mkdir(path, 0755)
+#define test_path_exists(path) (access(path, F_OK) == 0)
+#endif
 
 static void fail_check(const char* message, int line) {
     const char* error = lance_last_error_message();
@@ -200,15 +209,20 @@ static void write_table(
 }
 
 int main(int argc, char** argv) {
-    CHECK(argc > 1, "missing test root argument");
+    CHECK(argc > 2, "missing test root or root URI argument");
     char root[512];
     snprintf(root, sizeof(root), "%s/namespace", argv[1]);
-    CHECK(mkdir(root, 0755) == 0 || access(root, F_OK) == 0, "namespace root");
+    CHECK(test_mkdir(root) == 0 || test_path_exists(root), "namespace root");
+    /* argv[1] is the directory to create; argv[2] is its file URI. The JSON
+       root is the URI plus an ASCII suffix, so Windows backslashes never reach
+       the JSON text. */
+    char root_json[520];
+    snprintf(root_json, sizeof(root_json), "%s/namespace", argv[2]);
     char properties[1024];
     snprintf(properties, sizeof(properties),
              "{\"root\":\"%s\",\"manifest_enabled\":\"true\","
              "\"table_version_tracking_enabled\":\"true\",\"ops_metrics_enabled\":\"true\"}",
-             root);
+             root_json);
 
     LanceNamespace* ns = lance_namespace_directory_new(properties, NULL, NULL);
     CHECK(ns != NULL, "directory namespace");

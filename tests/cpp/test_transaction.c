@@ -292,7 +292,7 @@ static void write_c_replacement_file(const char *uri,
     CHECK_OK();
 
     char data_uri[4096];
-    snprintf(data_uri, sizeof(data_uri), "file://%s/data", uri);
+    snprintf(data_uri, sizeof(data_uri), "%s/data", uri);
     LanceFileSession *session =
         lance_file_session_new(data_uri, NULL, NULL, NULL);
     ASSERT(session != NULL, "replacement file session");
@@ -2053,7 +2053,7 @@ static void test_blob_writer_publication(const char *uri) {
     check_publication_payloads(uri, 4, after_delete, 6);
 
     char data_uri[4096];
-    snprintf(data_uri, sizeof(data_uri), "file://%s/data", uri);
+    snprintf(data_uri, sizeof(data_uri), "%s/data", uri);
     LanceFileSession *session =
         lance_file_session_new(data_uri, NULL, NULL, NULL);
     ASSERT(session != NULL, "open publication session");
@@ -2380,7 +2380,7 @@ static void test_blob_writer_append(const char *uri) {
     check_publication_payloads(uri, 3, pristine, 7);
 
     char data_uri[4096];
-    snprintf(data_uri, sizeof(data_uri), "file://%s/data", uri);
+    snprintf(data_uri, sizeof(data_uri), "%s/data", uri);
     LanceFileSession *session =
         lance_file_session_new(data_uri, NULL, NULL, NULL);
     ASSERT(session != NULL, "open blob append session");

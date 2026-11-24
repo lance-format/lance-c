@@ -14,6 +14,7 @@
  *                    <session_uri> <fragment_uri> <fragment_read_uri>
  *                    <cleanup_uri> <aggregate_plan_path>
  *                    <config_base_uri> <alternate_base_uri>
+ *                    <write_file_uri>
  */
 
 #include "lance/lance.h"
@@ -22,7 +23,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <windows.h>
+#define test_mkdir(path) _mkdir(path)
+#else
 #include <sys/stat.h>
+#define test_mkdir(path) mkdir(path, 0755)
+#endif
 #include <time.h>
 
 _Static_assert(sizeof(LanceCompactionOptions) == 40,
@@ -1232,13 +1240,22 @@ static int dictionary_string_equals(
     return string_array_equals(array->dictionary, value_index, expected);
 }
 
+/* Wait one millisecond for a native callback without a POSIX-only API. */
+static void test_sleep_one_millisecond(void) {
+#ifdef _WIN32
+    Sleep(1);
+#else
+    struct timespec delay = {0, 1000000};
+    nanosleep(&delay, NULL);
+#endif
+}
+
 static void wait_released(atomic_int *released) {
     for (int attempt = 0; attempt < 10000; ++attempt) {
         if (atomic_load_explicit(released, memory_order_seq_cst) > 0) {
             return;
         }
-        struct timespec delay = {0, 1000000};
-        nanosleep(&delay, NULL);
+        test_sleep_one_millisecond();
     }
     ASSERT(0, "progress context release timed out");
 }
@@ -2407,7 +2424,7 @@ static void test_managed_blob_descriptor_roundtrip(const char *write_uri) {
         object_path, sizeof(object_path), "%s/managed.bin", object_dir);
     ASSERT(written > 0 && (size_t)written < sizeof(object_path),
            "managed object path too long");
-    (void)mkdir(object_dir, 0755);
+    (void)test_mkdir(object_dir);
     FILE *object = fopen(object_path, "wb");
     ASSERT(object != NULL, "create managed object");
     ASSERT(fwrite("0123456789", 1, 10, object) == 10,
@@ -3216,8 +3233,7 @@ static void native_write_release(void *callback_ctx) {
 static void native_write_wait_release(NativeWriteProgressCapture *capture) {
     for (int attempt = 0; attempt < 10000; ++attempt) {
         if (native_write_load(&capture->releases) == 1) return;
-        struct timespec delay = {0, 1000000};
-        nanosleep(&delay, NULL);
+        test_sleep_one_millisecond();
     }
     ASSERT(native_write_load(&capture->releases) == 1,
            "progress context must be released exactly once");
@@ -3277,7 +3293,9 @@ static int32_t native_write_staged(
     return rc;
 }
 
-static NativeWriteInput native_write_external_blob_input(const char *write_uri) {
+static NativeWriteInput native_write_external_blob_input(
+    const char *write_uri,
+    const char *write_file_uri) {
     char payload_path[4096];
     char payload_uri[4100];
     snprintf(
@@ -3285,7 +3303,12 @@ static NativeWriteInput native_write_external_blob_input(const char *write_uri) 
         sizeof(payload_path),
         "%s_native_blob_payload.bin",
         write_uri);
-    snprintf(payload_uri, sizeof(payload_uri), "file://%s", payload_path);
+    /* A safe ASCII suffix on the already-encoded URI of the same directory. */
+    snprintf(
+        payload_uri,
+        sizeof(payload_uri),
+        "%s_native_blob_payload.bin",
+        write_file_uri);
 
     unsigned char payload[32];
     for (size_t index = 0; index < sizeof(payload); ++index) {
@@ -3791,7 +3814,8 @@ static void test_native_write_base_placement(
  * count is directly observable. */
 static void test_native_write_data_options(
     const char *src_uri,
-    const char *write_uri) {
+    const char *write_uri,
+    const char *write_file_uri) {
     printf("  test_native_write_data_options... ");
     char file_uri[4096];
     char blob_output_uri[4096];
@@ -3852,7 +3876,8 @@ static void test_native_write_data_options(
         lance_native_write_options_new(&blob_spec);
     ASSERT(blob_options != NULL, "blob write options must be created");
     CHECK_OK();
-    NativeWriteInput blob_input = native_write_external_blob_input(write_uri);
+    NativeWriteInput blob_input =
+        native_write_external_blob_input(write_uri, write_file_uri);
     rc = native_write_ordinary(
         blob_output_uri,
         &blob_input,
@@ -3893,7 +3918,7 @@ static void test_native_write_data_options(
            "native blob-conflict options must be constructed");
     CHECK_OK();
     NativeWriteInput conflict_input =
-        native_write_external_blob_input(write_uri);
+        native_write_external_blob_input(write_uri, write_file_uri);
     dataset = NULL;
     rc = native_write_ordinary(
         blob_output_uri,
@@ -4615,16 +4640,19 @@ static void test_cleanup_and_lifecycle(const char *uri) {
     CHECK_OK();
     ASSERT(deleted == 1, "cleanup fixture deleted-row count mismatch");
 
-    uint64_t small = UINT64_MAX;
-    ASSERT(lance_dataset_num_small_files(ds, 0, &small) == 0,
+    /* `small` is a Windows SDK macro (`#define small char`), so the fixture
+       variable uses a name the headers cannot rewrite. */
+    uint64_t small_file_count = UINT64_MAX;
+    ASSERT(lance_dataset_num_small_files(ds, 0, &small_file_count) == 0,
            "zero small-file threshold failed");
-    ASSERT(small == 0, "native zero threshold must return zero");
-    ASSERT(lance_dataset_num_small_files(ds, 5, &small) == 0,
+    ASSERT(small_file_count == 0, "native zero threshold must return zero");
+    ASSERT(lance_dataset_num_small_files(ds, 5, &small_file_count) == 0,
            "small-file count failed");
-    ASSERT(small == 4, "small-file count mismatch");
-    ASSERT(lance_dataset_num_small_files(ds, 4, &small) == 0,
+    ASSERT(small_file_count == 4, "small-file count mismatch");
+    ASSERT(lance_dataset_num_small_files(ds, 4, &small_file_count) == 0,
            "strict small-file boundary failed");
-    ASSERT(small == 0, "physical rows equal to threshold are not small");
+    ASSERT(small_file_count == 0,
+           "physical rows equal to threshold are not small");
 
     const uint64_t selected[] = {2, 3};
     LanceCleanupPolicy policy = {0};
@@ -8425,12 +8453,12 @@ static void test_binding_version(void) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    if (argc < 13) {
+    if (argc < 14) {
         fprintf(stderr,
                 "Usage: %s <dataset_uri> <write_uri> <blob_uri> <ordering_uri> "
                 "<session_uri> <fragment_uri> <fragment_read_uri> <cleanup_uri> "
                 "<rtree_geometry_uri> <aggregate_plan_path> <config_base_uri> "
-                "<alternate_base_uri>\n",
+                "<alternate_base_uri> <write_file_uri>\n",
                 argv[0]);
         return 1;
     }
@@ -8447,6 +8475,7 @@ int main(int argc, char **argv) {
     const char *aggregate_plan_path = argv[10];
     const char *config_base_uri = argv[11];
     const char *alternate_base_uri = argv[12];
+    const char *write_file_uri = argv[13];
     printf("Running C API tests with dataset: %s\n", uri);
 
     test_binding_version();
@@ -8494,7 +8523,7 @@ int main(int argc, char **argv) {
     test_write_options_and_config(uri, write_uri);
     test_native_write_options(uri, write_uri);
     test_native_write_base_placement(uri, write_uri);
-    test_native_write_data_options(uri, write_uri);
+    test_native_write_data_options(uri, write_uri, write_file_uri);
     test_native_write_progress_and_owners(uri, write_uri);
     test_data_statistics(write_uri);
     test_diagnostics(uri);
