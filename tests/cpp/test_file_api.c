@@ -35,6 +35,15 @@ static void release_array(ArrowArray *array) {
     if (array) array->release = NULL;
 }
 
+static int counted_array_releases = 0;
+
+static void release_counted_array(ArrowArray *array) {
+    if (array) {
+        counted_array_releases += 1;
+        array->release = NULL;
+    }
+}
+
 static void init_schema(
     ArrowSchema *schema,
     const char *format,
@@ -746,6 +755,36 @@ int main(int argc, char **argv) {
               "packed bulk write");
         CHECK(payload_array.release == NULL, "packed input array consumed");
         CHECK(payload_schema.release != NULL, "packed input schema borrowed");
+
+        const int32_t non_binary_values[] = {1, 2, 3};
+        const void *non_binary_buffers[2] = {NULL, non_binary_values};
+        ArrowArray non_binary_array = {0};
+        non_binary_array.length = 3;
+        non_binary_array.n_buffers = 2;
+        non_binary_array.buffers = non_binary_buffers;
+        non_binary_array.release = release_counted_array;
+        ArrowSchema non_binary_schema;
+        init_schema(&non_binary_schema, "i", "payload", ARROW_FLAG_NULLABLE,
+                    NULL, 0);
+        counted_array_releases = 0;
+        CHECK(lance_packed_blob_writer_write_blobs(
+                  packed, &non_binary_array, &non_binary_schema) == -1,
+              "packed bulk write rejects a non-binary payload");
+        CHECK(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+              "packed non-binary payload error code");
+        const char *non_binary_error = lance_last_error_message();
+        CHECK(non_binary_error != NULL &&
+                  strstr(non_binary_error, "Binary") != NULL,
+              "packed non-binary payload error message");
+        if (non_binary_error) lance_free_string(non_binary_error);
+        CHECK(counted_array_releases == 1,
+              "packed non-binary payload array released exactly once");
+        CHECK(non_binary_array.release == NULL &&
+                  non_binary_array.n_children == 0,
+              "packed non-binary payload source consumed");
+        CHECK(non_binary_schema.release != NULL,
+              "packed non-binary payload schema stays caller-owned");
+        non_binary_schema.release(&non_binary_schema);
         CHECK(lance_packed_blob_writer_write_blob(packed, NULL, 0) == 0,
               "packed NULL empty payload");
         ArrowArray prepared_array = {0};
