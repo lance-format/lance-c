@@ -3313,7 +3313,7 @@ static void test_file_stream_ownership(
     std::weak_ptr<ProgressLifetime> weak;
     std::atomic<uint64_t> calls{0};
     std::atomic<uint64_t> last_processed{0};
-    std::atomic<uint64_t> last_total{0};
+    std::atomic<bool> total_mismatch{false};
     {
         auto lifetime = std::make_shared<ProgressLifetime>(&destroyed);
         weak = lifetime;
@@ -3322,13 +3322,14 @@ static void test_file_stream_ownership(
             auto ds = lance::Dataset::open(uri);
             progress_stream = ds.tracked_files_stream(
                 std::nullopt,
-                [lifetime, &calls, &last_processed, &last_total](
+                [lifetime, &calls, &last_processed, &total_mismatch,
+                 manifest_rows](
                     uint64_t processed,
                     std::optional<uint64_t> total) {
                     calls.fetch_add(1, std::memory_order_seq_cst);
                     last_processed.store(processed, std::memory_order_seq_cst);
-                    if (total) {
-                        last_total.store(*total, std::memory_order_seq_cst);
+                    if (total && *total != manifest_rows) {
+                        total_mismatch.store(true, std::memory_order_seq_cst);
                     }
                 });
         }
@@ -3340,7 +3341,10 @@ static void test_file_stream_ownership(
     assert(destroyed.load() == 1);
     assert(calls.load() == manifest_rows);
     assert(last_processed.load() == manifest_rows);
-    assert(last_total.load() == manifest_rows);
+    // Native learns the manifest total from a listing that races the walk, so
+    // no update, including the last, is guaranteed to carry it. Every reported
+    // total must still be the walk's manifest count.
+    assert(!total_mismatch.load());
 
     std::atomic<int> early_destroyed{0};
     std::weak_ptr<ProgressLifetime> early_weak;

@@ -656,6 +656,10 @@ auto tracked = ds.tracked_files_stream(
 auto files = ds.all_files_stream();
 ```
 
+The progress `total` is an optional hint. Native reports it only after its
+manifest listing finishes, and that listing races the walk, so an update may
+arrive without a total even when it completes the last manifest.
+
 An exported stream retains what it needs after the source dataset closes. The
 stream `release` callback may return before a native progress callback finishes;
 the C++ wrapper keeps the callback capture until the native emitter releases it.

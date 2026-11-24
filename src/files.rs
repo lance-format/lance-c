@@ -27,6 +27,12 @@ use crate::stream_guard::GuardedReader;
 /// `manifests_processed` counts completed manifests. `manifests_total` is
 /// non-NULL only when native progress reports a known total; the pointed-to
 /// value is borrowed for the duration of the callback and must not be retained.
+///
+/// Native learns the total only once it has finished listing manifests, and
+/// that listing runs concurrently with the manifest walk. The total can
+/// therefore stay NULL for some or all updates, including the update that
+/// completes the last manifest. A NULL total is not an error signal: consumers
+/// must treat the total as an optional hint rather than wait for it.
 pub type LanceTrackedFilesProgressCallback = Option<
     unsafe extern "C" fn(
         callback_ctx: *mut c_void,
@@ -246,4 +252,76 @@ fn export_stream(
         ptr::write_unaligned(out, ffi_stream);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecordedProgress {
+        updates: Mutex<Vec<(u64, Option<u64>)>>,
+        releases: AtomicUsize,
+    }
+
+    /// Owned by the shim until the release callback reclaims it.
+    struct ProgressHandle {
+        state: Arc<RecordedProgress>,
+    }
+
+    unsafe extern "C" fn record_progress(
+        callback_ctx: *mut c_void,
+        manifests_processed: u64,
+        manifests_total: *const u64,
+    ) {
+        let handle = unsafe { &*callback_ctx.cast::<ProgressHandle>() };
+        let total = if manifests_total.is_null() {
+            None
+        } else {
+            Some(unsafe { *manifests_total })
+        };
+        handle
+            .state
+            .updates
+            .lock()
+            .unwrap()
+            .push((manifests_processed, total));
+    }
+
+    unsafe extern "C" fn release_progress(callback_ctx: *mut c_void) {
+        let handle = unsafe { Box::from_raw(callback_ctx.cast::<ProgressHandle>()) };
+        handle.state.releases.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn progress_update_forwards_processed_count_and_optional_total() {
+        let state = Arc::new(RecordedProgress::default());
+        let handle = Box::into_raw(Box::new(ProgressHandle {
+            state: Arc::clone(&state),
+        }));
+        let context = OwnedProgressContext {
+            callback: record_progress,
+            release: release_progress,
+            callback_ctx: handle.cast(),
+        };
+
+        context.notify(TrackedFilesProgress {
+            manifests_processed: 1,
+            manifests_total: None,
+        });
+        context.notify(TrackedFilesProgress {
+            manifests_processed: 2,
+            manifests_total: Some(2),
+        });
+        drop(context);
+
+        assert_eq!(
+            *state.updates.lock().unwrap(),
+            vec![(1, None), (2, Some(2))]
+        );
+        assert_eq!(state.releases.load(Ordering::SeqCst), 1);
+    }
 }

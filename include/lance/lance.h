@@ -1654,7 +1654,10 @@ LANCE_API int32_t lance_dataset_add_bases(
  * Tracked-files progress callback.
  *
  * `manifests_total` is NULL when the native total is not yet known. Otherwise
- * it points to a value borrowed for the duration of this call only. Progress
+ * it points to a value borrowed for the duration of this call only. Native
+ * learns the total from a manifest listing that races the walk, so it may stay
+ * NULL for some or all updates, including the update that completes the last
+ * manifest; it is an optional hint, not a completion signal. Progress
  * callbacks run on a native background task and must not block or unwind.
  */
 typedef void (*LanceTrackedFilesProgressCallback)(
