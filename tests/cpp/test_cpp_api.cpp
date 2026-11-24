@@ -3938,21 +3938,17 @@ static void test_alter_columns(const std::string& dst_uri) {
     }
     assert(caught_noop);
 
-    // Out-of-range nullable_mode discriminant must throw with INVALID_ARGUMENT.
-    // Cast `99` through the enum type to verify the C++ wrapper forwards it
-    // verbatim rather than silently clamping.
-    bool caught_bad_mode = false;
-    try {
-        lance::ColumnAlteration bad_mode;
-        bad_mode.path = "id";
-        bad_mode.nullable_mode =
-            static_cast<LanceColumnNullableMode>(99);
-        ds.alter_columns({bad_mode});
-    } catch (const lance::Error& e) {
-        caught_bad_mode = true;
-        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
-    }
-    assert(caught_bad_mode);
+    // The wrapper types nullable_mode as an enum, so an out-of-range value can
+    // only be represented at the documented C ABI integer boundary. Keep the
+    // rejection check there.
+    LanceDataset* raw_dataset = lance_dataset_open(dst_uri.c_str(), nullptr, 0);
+    assert(raw_dataset != nullptr);
+    LanceColumnAlteration bad_mode{};
+    bad_mode.path = "id";
+    bad_mode.nullable_mode = 99;
+    assert(lance_dataset_alter_columns(raw_dataset, &bad_mode, 1) == -1);
+    assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
+    lance_dataset_close(raw_dataset);
 
     PASS();
 }
@@ -4776,23 +4772,32 @@ static void test_scanner_order_by(const std::string& uri) {
     }
 
     {
-        auto scanner = ds.scan();
-        scanner.order_by(ordering);
-        bool caught = false;
-        try {
-            scanner.order_by(std::vector<lance::ColumnOrdering>{
-                {"rank", static_cast<LanceOrderDirection>(7),
-                 LANCE_ORDER_NULLS_LAST},
-            });
-        } catch (const lance::Error& error) {
-            caught = true;
-            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
-            assert(std::string(error.what()).find("order_by direction") !=
-                   std::string::npos);
+        // The wrapper types a direction as an enum, so an out-of-range value
+        // can only be represented at the documented C ABI integer boundary.
+        // Keep the rejection and retained-ordering checks there.
+        LanceDataset* raw_dataset = lance_dataset_open(uri.c_str(), nullptr, 0);
+        assert(raw_dataset != nullptr);
+        LanceScanner* raw_scanner = lance_scanner_new(raw_dataset, nullptr, nullptr);
+        assert(raw_scanner != nullptr);
+        LanceColumnOrdering native_ordering[] = {
+            {"category", LANCE_ORDER_DESCENDING, LANCE_ORDER_NULLS_FIRST},
+            {"rank", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+            {"id", LANCE_ORDER_ASCENDING, LANCE_ORDER_NULLS_LAST},
+        };
+        assert(lance_scanner_set_order_by(raw_scanner, native_ordering, 3) == 0);
+        LanceColumnOrdering invalid = {"rank", 7, LANCE_ORDER_NULLS_LAST};
+        assert(lance_scanner_set_order_by(raw_scanner, &invalid, 1) == -1);
+        assert(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT);
+        const char* message = lance_last_error_message();
+        assert(message != nullptr);
+        assert(std::string(message).find("order_by direction") != std::string::npos);
+        lance_free_string(message);
+        {
+            lance::Scanner scanner(raw_scanner);
+            // The rejected call retained the previous ordering.
+            assert(scan_ordering_ids(scanner) == expected);
         }
-        assert(caught);
-        // The rejected call retained the previous ordering.
-        assert(scan_ordering_ids(scanner) == expected);
+        lance_dataset_close(raw_dataset);
     }
 
     std::vector<int32_t> unordered;

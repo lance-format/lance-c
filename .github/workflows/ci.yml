@@ -76,9 +76,13 @@ jobs:
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     # A cold Lance pin builds for ~12 minutes and runs the C/C++ and installed
-    # consumer checks for another ~10. Leave room for the main-branch cache
-    # save, which compresses the multi-gigabyte target directory.
-    timeout-minutes: 45
+    # consumer checks for another ~7-11. The first main run after a Cargo.lock
+    # or pin change must also save the multi-gigabyte target cache, which takes
+    # ~17 minutes; measured totals are 39m23s (`a800fd5`, completed) and 45m03s
+    # (`ed635e2`, killed by the former 45-minute cap during that save). Keep the
+    # cap above the cold-build plus first-save worst case; warm main runs skip
+    # the save and still finish in ~13 minutes.
+    timeout-minutes: 60
     env:
       CC: clang
       CXX: clang++
@@ -111,6 +115,88 @@ jobs:
         run: cargo test --test compile_and_run_test -- --ignored
       - name: Verify CMake package and consumer linkage
         run: bash .github/scripts/verify-cmake-consumer.sh --from-target-dir target/debug
+
+  test-sanitizers:
+    name: Tests (Linux, sanitizers)
+    runs-on: ubuntu-24.04
+    # The manylinux static Clang ships without compiler-rt sanitizer runtimes.
+    # This test-only job uses the standard Ubuntu packages for a matching
+    # Clang 20 + libclang-rt-20-dev pair; release and glibc-pinned jobs stay on
+    # the manylinux image.
+    timeout-minutes: 60
+    env:
+      CC: clang-20
+      CXX: clang++-20
+      LANCE_C_SANITIZERS: address,undefined
+      # AddressSanitizer includes LeakSanitizer on Linux. These settings apply
+      # to the native consumer binaries; the Rust library is not instrumented.
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - name: Install Clang 20 and matching sanitizer runtimes
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-20 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-20.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-20 libclang-rt-20-dev pkg-config
+          "$CC" --version
+          "$CC" -print-resource-dir
+      - uses: ./.github/actions/setup-protoc
+        with:
+          install-prefix: ${{ runner.temp }}/protoc
+      - name: Verify protoc include discovery
+        run: |
+          cat > "$RUNNER_TEMP/protoc-smoke.proto" <<'SMOKE'
+          syntax = "proto3";
+          package smoke;
+          import "google/protobuf/timestamp.proto";
+          message Smoke {
+              google.protobuf.Timestamp at = 1;
+          }
+          SMOKE
+          command -v protoc
+          protoc --version
+          protoc --proto_path="$RUNNER_TEMP" \
+            --descriptor_set_out=/dev/null "$RUNNER_TEMP/protoc-smoke.proto"
+      - name: Verify sanitizer runtime links and runs
+        run: |
+          cat > /tmp/sanitizer-smoke.c <<'SMOKE'
+          #include <stdlib.h>
+          int main(void) {
+              char *p = malloc(8);
+              p[0] = 0;
+              free(p);
+              return 0;
+          }
+          SMOKE
+          cat > /tmp/sanitizer-smoke.cpp <<'SMOKE'
+          #include <cstdlib>
+          int main() {
+              char *p = static_cast<char *>(std::malloc(8));
+              p[0] = 0;
+              std::free(p);
+              return 0;
+          }
+          SMOKE
+          "$CC" -fsanitize=address,undefined -fno-sanitize-recover=all -g \
+            /tmp/sanitizer-smoke.c -o /tmp/sanitizer-smoke-c
+          /tmp/sanitizer-smoke-c
+          "$CXX" -std=c++20 -fsanitize=address,undefined \
+            -fno-sanitize-recover=all -g \
+            /tmp/sanitizer-smoke.cpp -o /tmp/sanitizer-smoke-cpp
+          /tmp/sanitizer-smoke-cpp
+      - name: Run C consumer under sanitizers
+        run: cargo test --test compile_and_run_test -- --ignored test_c_compilation_and_execution
+      - name: Run C++ consumer under sanitizers
+        run: cargo test --test compile_and_run_test -- --ignored test_cpp_compilation_and_execution
 
   test-macos:
     name: Tests (macOS)

@@ -1,6 +1,6 @@
 # Generated C/C++ API reference
 
-The public headers carry Doxygen documentation, and [`Doxyfile`](../Doxyfile) renders it as searchable HTML. The configuration reads only `include/lance/lance.h` and `include/lance/lance.hpp`; it does not scan the Rust sources or any other directory.
+The public headers carry Doxygen documentation, and [`Doxyfile`](../Doxyfile) renders it as searchable HTML. The configuration reads the public C headers under `include/lance/` (the exact list is the `INPUT` entries in `Doxyfile`), the C++ umbrella `include/lance/lance.hpp`, and the shared C++ declaration header `include/lance/detail/declarations.hpp`; it does not scan the Rust sources or any other directory.
 
 ## Render locally
 
@@ -26,7 +26,7 @@ The `API docs (Doxygen)` CI job runs `.github/scripts/check-doxygen.sh` on every
 
 - Runs a header-only self-test that must fail on a wrong `@param` name, a documented parameter without a description, malformed markup such as an unescaped `<uri>`, and an unresolved `@ref`. A correctly documented fixture must pass, so the check cannot pass by rejecting everything.
 - Renders the public headers with `WARN_AS_ERROR = FAIL_ON_WARNINGS`, so any documentation warning fails the job. Findings are written to `build/doxygen/warnings.log`.
-- Asserts that the index page, both header pages, the `lance::Dataset` and `lance::Scanner` class pages, the search index, and representative C and C++ symbols are present. A configuration change that silently dropped a header or stopped extracting entities fails here.
+- Asserts that the index page, the public header pages, the `lance::Dataset` and `lance::Scanner` class pages, the search index, and representative C and C++ symbols are present. A configuration change that silently dropped a header or stopped extracting entities fails here.
 
 The job does not require a Rust toolchain and takes seconds after checkout.
 

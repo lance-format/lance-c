@@ -497,10 +497,19 @@ Selective includes change neither the ABI nor the behavior, and the umbrella
 remains the safe choice for code that uses several domains. Existing code does
 not need to change.
 
-The C++ wrapper `<lance/lance.hpp>` is a large header-only interface and still
+The C++ wrapper `<lance/lance.hpp>` is a header-only interface and still
 includes the umbrella C header. Include it only in the `.cpp` translation units
 that use the C++ API, rather than in widely included project headers, to limit
 compile time and rebuild scope where practical.
+
+Internally the wrapper separates shared class declarations
+(`<lance/detail/declarations.hpp>`) from opt-in inline definitions grouped under
+`<lance/detail/inline/>`. The umbrella includes every definition, so header-only
+linking and existing includes are unchanged. A translation unit that only opens
+and scans a dataset can include `lance/detail/declarations.hpp` and
+`lance/detail/inline/read.hpp` to skip parsing the unrelated inline
+definitions; the `detail/` paths are implementation headers, not a separate
+stability contract.
 
 ## Binding version
 
