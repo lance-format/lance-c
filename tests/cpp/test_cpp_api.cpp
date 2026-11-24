@@ -5896,91 +5896,6 @@ static std::vector<int32_t> cpp_scan_ids(lance::Dataset& dataset) {
     return ids;
 }
 
-/// Decode the JSON string escapes serde emits for a base path.
-///
-/// `base_paths_json` escapes backslashes, so a native Windows base path
-/// (`C:\dir`) appears as `C:\\dir`. A base store param compares `base_path`
-/// verbatim, so the escaped text must be decoded before it can bind the base.
-static std::string json_unescape(const std::string& value) {
-    std::string decoded;
-    decoded.reserve(value.size());
-    for (std::size_t index = 0; index < value.size(); ++index) {
-        const char character = value[index];
-        if (character != '\\') {
-            decoded.push_back(character);
-            continue;
-        }
-        if (++index == value.size()) {
-            throw std::runtime_error("base_paths_json escape is truncated");
-        }
-        switch (value[index]) {
-            case '"': decoded.push_back('"'); break;
-            case '\\': decoded.push_back('\\'); break;
-            case '/': decoded.push_back('/'); break;
-            case 'b': decoded.push_back('\b'); break;
-            case 'f': decoded.push_back('\f'); break;
-            case 'n': decoded.push_back('\n'); break;
-            case 'r': decoded.push_back('\r'); break;
-            case 't': decoded.push_back('\t'); break;
-            case 'u': {
-                // Encode one BMP code point as UTF-8. Filesystem paths do not
-                // contain surrogate pairs, so only the BMP case is handled.
-                if (index + 4 >= value.size()) {
-                    throw std::runtime_error(
-                        "base_paths_json unicode escape is truncated");
-                }
-                unsigned int code = 0;
-                for (std::size_t digit_index = index + 1;
-                     digit_index <= index + 4; ++digit_index) {
-                    const char digit = value[digit_index];
-                    code <<= 4;
-                    if (digit >= '0' && digit <= '9') {
-                        code |= static_cast<unsigned int>(digit - '0');
-                    } else if (digit >= 'a' && digit <= 'f') {
-                        code |= static_cast<unsigned int>(digit - 'a' + 10);
-                    } else if (digit >= 'A' && digit <= 'F') {
-                        code |= static_cast<unsigned int>(digit - 'A' + 10);
-                    } else {
-                        throw std::runtime_error(
-                            "base_paths_json unicode escape is invalid");
-                    }
-                }
-                index += 4;
-                if (code < 0x80) {
-                    decoded.push_back(static_cast<char>(code));
-                } else if (code < 0x800) {
-                    decoded.push_back(static_cast<char>(0xC0 | (code >> 6)));
-                    decoded.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-                } else {
-                    decoded.push_back(static_cast<char>(0xE0 | (code >> 12)));
-                    decoded.push_back(
-                        static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-                    decoded.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-                }
-                break;
-            }
-            default:
-                throw std::runtime_error("base_paths_json has an unknown escape");
-        }
-    }
-    return decoded;
-}
-
-static std::string cpp_clone_base_path(lance::Dataset& dataset) {
-    const std::string json = dataset.base_paths_json();
-    const std::string marker = "\"path\":\"";
-    auto start = json.find(marker);
-    if (start == std::string::npos) {
-        throw std::runtime_error("base_paths_json has no base path");
-    }
-    start += marker.size();
-    const auto end = json.find('"', start);
-    if (end == std::string::npos) {
-        throw std::runtime_error("base_paths_json base path is unterminated");
-    }
-    return json_unescape(json.substr(start, end - start));
-}
-
 static void test_dataset_shallow_clone_base_store_params(
     const std::string& feature_uri) {
     TEST(test_dataset_shallow_clone_base_store_params);
@@ -6019,7 +5934,11 @@ static void test_dataset_shallow_clone_base_store_params(
             target, nullptr, &invalid_target_accessor));
         assert(cloned->version() == source_version);
         assert(cpp_scan_ids(*cloned) == source_ids);
-        source_base = cpp_clone_base_path(*cloned);
+        // Lance stores the source branch location URI as the inherited base
+        // path, and `Dataset::branch_location()` takes it from `Dataset::uri()`.
+        // Binding the base therefore only needs the source's own URI, with no
+        // JSON decoding and no dependence on path escaping.
+        source_base = source.uri();
     }
 
     // The returned handle retains runtime base params after the source closes.
