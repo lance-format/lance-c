@@ -20,7 +20,7 @@ This document provides platform-specific build instructions, binary packaging co
 
 Each release `.tar.xz` archive unpacks an install prefix containing:
 
-- Public headers under `include/lance/` (the v0.2.0 archive contains `lance.h` and `lance.hpp`; check the archive for its exact header set)
+- Public headers under `include/lance/`: the umbrella `lance.h`, the C domain headers, `lance.hpp`, and the C++ declaration/inline headers under `include/lance/detail/` (the v0.2.0 archive contains only `lance.h` and `lance.hpp`; check the archive for its exact header set)
 - Static and shared libraries under `lib/` (plus `lib/lance_c.dll.lib` on Windows)
 - `lib/cmake/LanceC/` (`LanceCConfig.cmake` and `LanceCConfigVersion.cmake`)
 - `lib/pkgconfig/lance-c.pc`

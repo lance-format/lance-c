@@ -76,9 +76,13 @@ jobs:
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     # A cold Lance pin builds for ~12 minutes and runs the C/C++ and installed
-    # consumer checks for another ~10. Leave room for the main-branch cache
-    # save, which compresses the multi-gigabyte target directory.
-    timeout-minutes: 45
+    # consumer checks for another ~7-11. The first main run after a Cargo.lock
+    # or pin change must also save the multi-gigabyte target cache, which takes
+    # ~17 minutes; measured totals are 39m23s (`a800fd5`, completed) and 45m03s
+    # (`ed635e2`, killed by the former 45-minute cap during that save). Keep the
+    # cap above the cold-build plus first-save worst case; warm main runs skip
+    # the save and still finish in ~13 minutes.
+    timeout-minutes: 60
     env:
       CC: clang
       CXX: clang++
