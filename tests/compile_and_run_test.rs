@@ -804,15 +804,20 @@ fn typed_fts_row_id(uri: &str, target: i32) -> u64 {
     })
 }
 
+/// Schema of the two-fragment scanner-ordering fixture.
+fn ordering_dataset_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("rank", DataType::Int32, true),
+    ]))
+}
+
 /// Create a two-fragment dataset for scanner ordering tests.
 fn create_ordering_dataset_on_disk() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("ordering_ds").to_str().unwrap().to_string();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("category", DataType::Utf8, true),
-        Field::new("rank", DataType::Int32, true),
-    ]));
+    let schema = ordering_dataset_schema();
     let make_batch = |ids: Vec<i32>, groups: &[Option<&str>], ranks: &[Option<i32>]| {
         RecordBatch::try_new(
             schema.clone(),
@@ -1319,8 +1324,8 @@ fn compile_header_with_args(
 /// for the write test and its `file://` form, the Blob v2 and ordering
 /// datasets, the indexed session cache dataset, separate non-stable/stable
 /// fragment-deletion datasets, the cleanup and RTree geometry fixtures, the
-/// aggregate plan, and the config/base/file fixture. The destination path must
-/// not pre-exist.
+/// aggregate plan and Substrait filter expression, and the config/base/file
+/// fixture. The destination path must not pre-exist.
 #[allow(clippy::too_many_arguments)]
 fn run_test_binary(
     binary: &Path,
@@ -1334,6 +1339,7 @@ fn run_test_binary(
     cleanup_uri: &str,
     rtree_geometry_uri: &str,
     aggregate_plan_path: &Path,
+    substrait_filter_path: &Path,
     config_base_files: &common::ConfigBaseFilesFixture,
 ) {
     let write_file_uri = local_uri::file_uri(Path::new(write_uri));
@@ -1351,6 +1357,7 @@ fn run_test_binary(
         .arg(&config_base_files.uri)
         .arg(&config_base_files.alternate_base_uri)
         .arg(&write_file_uri)
+        .arg(substrait_filter_path)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run {}: {e}", binary.display()));
 
@@ -1382,6 +1389,21 @@ fn describe_exit_status(status: std::process::ExitStatus) -> String {
         Some(code) => code.to_string(),
         None => "terminated by signal".to_string(),
     }
+}
+
+/// Write a serialized Substrait `ExtendedExpression` selecting `id > 3`
+/// against the scanner-ordering fixture schema.
+fn write_substrait_filter_expression(directory: &Path) -> PathBuf {
+    use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::SessionContext;
+    use lance_datafusion::substrait::encode_substrait;
+
+    let expression = col("id").gt(lit(3i32));
+    let state = SessionContext::new().state();
+    let bytes = encode_substrait(expression, ordering_dataset_schema(), &state).unwrap();
+    let path = directory.join("ordering-filter.expression");
+    std::fs::write(&path, bytes).unwrap();
+    path
 }
 
 fn write_ordering_aggregate_plan(directory: &Path) -> PathBuf {
@@ -1478,6 +1500,7 @@ fn test_c_compilation_and_execution() {
         "C test compilation failed"
     );
     let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
+    let substrait_filter_path = write_substrait_filter_expression(build_dir.path());
 
     run_test_binary(
         &binary,
@@ -1491,6 +1514,7 @@ fn test_c_compilation_and_execution() {
         &cleanup_uri,
         &rtree_geometry.uri,
         &aggregate_plan_path,
+        &substrait_filter_path,
         &config_base_files,
     );
 }
@@ -1527,6 +1551,7 @@ fn test_cpp_compilation_and_execution() {
         "C++ test compilation failed"
     );
     let aggregate_plan_path = write_ordering_aggregate_plan(build_dir.path());
+    let substrait_filter_path = write_substrait_filter_expression(build_dir.path());
 
     run_test_binary(
         &binary,
@@ -1540,6 +1565,7 @@ fn test_cpp_compilation_and_execution() {
         &cleanup_uri,
         &rtree_geometry.uri,
         &aggregate_plan_path,
+        &substrait_filter_path,
         &config_base_files,
     );
 }
