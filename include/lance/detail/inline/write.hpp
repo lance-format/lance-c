@@ -7,6 +7,7 @@
 #include "lance/detail/declarations.hpp"
 #include "lance/detail/inline/base.hpp"
 #include "lance/detail/inline/storage.hpp"
+#include "lance/detail/inline/udf.hpp"
 
 namespace lance {
 

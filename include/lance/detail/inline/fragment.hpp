@@ -5,6 +5,7 @@
 #pragma once
 
 #include "lance/detail/declarations.hpp"
+#include "lance/detail/inline/udf.hpp"
 
 namespace lance {
 
