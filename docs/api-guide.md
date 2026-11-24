@@ -154,6 +154,10 @@ scanner.nearest("embedding", query, 2, 5)
        .limit(2);
 ```
 
+`Scanner::nearest` also accepts a contiguous Float32 range; `std::vector`,
+`std::array`, `std::span` and C arrays bind the span overload, whose length is
+the query dimension. The pointer/count overloads are unchanged.
+
 Full-text search uses BM25 over an inverted scalar index. Build the index first, then either name the indexed columns or pass NULL to search all FTS-indexed columns. `max_fuzzy_distance == 0` selects exact term matching; a positive value enables native fuzzy matching. The default scoring path adds `_score`. FTS and nearest queries are mutually exclusive on one scanner. See [Scanner projection and scoring columns](#scanner-projection-and-scoring-columns), [Distance-bounded vector search](#distance-bounded-vector-search), and [Multi-vector search](#multi-vector-search) for the specialized forms.
 
 ```c
@@ -932,6 +936,16 @@ const float queries[] = {1.0f, 0.0f, 0.0f, 1.0f};
 auto scanner = dataset.scan();
 scanner.nearest_batch("embedding", queries, 2, 2, 10)
        .use_index(false);
+```
+
+`Scanner::nearest_batch` also accepts a contiguous Float32 range and derives the
+number of queries from its length. The length must be a multiple of `dimension`;
+otherwise the call throws `lance::Error` with `LANCE_ERR_INVALID_ARGUMENT`
+before the native call. The pointer/count overloads are unchanged.
+
+```cpp
+std::vector<float> queries{1.0f, 0.0f, 0.0f, 1.0f};
+scanner.nearest_batch("embedding", queries, 2, 10);  /* two queries */
 ```
 
 Here there are two queries of dimension two, each returning up to ten rows.

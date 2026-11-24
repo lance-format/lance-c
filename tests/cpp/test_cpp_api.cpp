@@ -60,6 +60,31 @@ static_assert(std::is_move_constructible_v<lance::IndexSegmentResult>);
 static_assert(!std::is_copy_constructible_v<lance::CompactionPlan>);
 static_assert(!std::is_copy_constructible_v<lance::IndexSegmentResult>);
 
+template <typename... Args>
+concept CanCallScannerNearest = requires(lance::Scanner& scanner, Args&&... args) {
+    scanner.nearest("embedding", std::forward<Args>(args)...);
+};
+
+template <typename... Args>
+concept CanCallScannerNearestBatch = requires(lance::Scanner& scanner, Args&&... args) {
+    scanner.nearest_batch("embedding", std::forward<Args>(args)...);
+};
+
+// Float32 ranges bind the span overloads; pointer/count calls keep their meaning.
+static_assert(CanCallScannerNearest<std::vector<float>&, uint32_t>);
+static_assert(CanCallScannerNearest<float (&)[8], uint32_t>);
+static_assert(CanCallScannerNearest<std::span<const float>, uint32_t>);
+static_assert(CanCallScannerNearest<float (&)[8], size_t, uint32_t>);
+static_assert(!CanCallScannerNearest<std::vector<float>&, size_t, uint32_t>);
+static_assert(!CanCallScannerNearest<std::span<const double>, uint32_t>);
+
+static_assert(CanCallScannerNearestBatch<std::vector<float>&, size_t, uint32_t>);
+static_assert(CanCallScannerNearestBatch<std::span<const float>, size_t, uint32_t>);
+static_assert(CanCallScannerNearestBatch<float (&)[16], size_t, uint32_t>);
+static_assert(CanCallScannerNearestBatch<float (&)[16], size_t, size_t, uint32_t>);
+static_assert(
+    !CanCallScannerNearestBatch<std::vector<float>&, size_t, size_t, uint32_t>);
+
 static const char* arrow_field_metadata_value(
     const ArrowSchema* field,
     const char* key,
@@ -4462,6 +4487,18 @@ static void test_distance_range(const std::string& uri) {
         check_distance_range_results(&stream, lower ? &*lower : nullptr,
                                      upper ? &*upper : nullptr, expected_ids[mode], expected[mode]);
     }
+
+    std::vector<float> query_vector(query, query + 8);
+    {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query_vector, 20).use_index(false);
+        const float upper = 0.125f;
+        scanner.distance_range(std::nullopt, upper);
+        ArrowArrayStream stream{};
+        scanner.to_arrow_stream(&stream);
+        check_distance_range_results(&stream, nullptr, &upper, expected_ids[0],
+                                     expected[0]);
+    }
     PASS();
 }
 
@@ -4530,6 +4567,31 @@ static void test_batch_nearest(const std::string& uri) {
         ArrowArrayStream stream = {};
         scanner.to_arrow_stream(&stream);
         check_batch_nearest_results(&stream);
+    }
+
+    std::vector<float> query_vector(queries, queries + 16);
+    {
+        auto scanner = dataset.scan();
+        scanner.nearest_batch("embedding", query_vector, 8, 2);
+        scanner.use_index(false).batch_size(1);
+        ArrowArrayStream stream = {};
+        scanner.to_arrow_stream(&stream);
+        check_batch_nearest_results(&stream);
+    }
+
+    // A span whose length is not a multiple of the dimension is rejected
+    // before the native call instead of reading past its bounds.
+    {
+        std::vector<float> short_queries(15, 0.0f);
+        auto scanner = dataset.scan();
+        bool rejected = false;
+        try {
+            scanner.nearest_batch("embedding", short_queries, 8, 2);
+        } catch (const lance::Error& error) {
+            rejected = true;
+            assert(error.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(rejected);
     }
     PASS();
 }
