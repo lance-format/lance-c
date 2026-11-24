@@ -22,7 +22,7 @@ using only `<lance/lance.h>` link `LanceC::lance_c` and can use C11 or C++17.
 
 ## Build
 
-After unpacking the [0.2.x release archive](../../README.md#quickstart), use its install prefix:
+After unpacking a [stable release archive](../../README.md#quickstart), use its install prefix:
 
 ```bash
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/lance-c-install
@@ -31,7 +31,7 @@ cmake --build build
 ./build/workflow file:///tmp/lance-c-workflow.lance
 ```
 
-The `workflow` target uses public calls present in v0.2.0 and prints:
+The `workflow` target uses public calls present in the stable release you installed and prints:
 
 ```text
 write: rows=6 version=1

@@ -2,7 +2,7 @@
 
 See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function; see [Generated C/C++ API reference](api-reference.md) to render the headers as searchable HTML.
 
-The core workflows use public calls present in v0.2.0 and current source, and were exercised against the published 0.2.0 library. That release pins Lance 15.0.0-beta.25; a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Behavior that requires a newer Lance core is not part of the 0.2.0 archive, even when a later development build describes it. Check the header of the package you installed before using an entry point added after this guide.
+The core workflows use public calls present in the current source and were exercised against a published stable release. The [latest stable release](https://github.com/lance-format/lance-c/releases/latest) provides supported downloads, and the [releases page](https://github.com/lance-format/lance-c/releases) records the changes in each release. A package may not contain entry points added after its release: check the installed header before using one.
 
 ## Write Arrow batches
 
@@ -429,7 +429,7 @@ fts query: 1 2 4
 workflow: PASS
 ```
 
-The example uses only calls and behavior present in v0.2.0. It is not a statement that later unreleased APIs are part of the 0.2.0 archive.
+The example uses only calls and behavior present in the stable release you installed. A development build may add entry points that the archive does not contain; check its header.
 
 ## Errors and panic recovery
 

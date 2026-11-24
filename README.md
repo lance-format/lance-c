@@ -2,7 +2,7 @@
 
 Read, write, and search [Lance](https://lance.org/) datasets from C or C++. The library exposes a C ABI and header-only C++ RAII wrappers. Scans and writes exchange Arrow batches through the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html).
 
-The maintained release line is **0.2.x**. The current [v0.2.0 release](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) uses Lance 15.0.0-beta.25 (`f5dbd55d`); a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. Prebuilt packages support Linux x86_64 and AArch64 (glibc 2.28+), macOS arm64, and Windows x64 and ARM64 with the static `/MT` CRT. The C API requires C11; the C++ wrapper requires C++20.
+Prebuilt packages support Linux x86_64 and AArch64 (glibc 2.28+), macOS arm64, and Windows x64 and ARM64 with the static `/MT` CRT. The C API requires C11; the C++ wrapper requires C++20. Download stable packages from the [latest stable release](https://github.com/lance-format/lance-c/releases/latest); the [releases page](https://github.com/lance-format/lance-c/releases) lists previews, older releases, and their notes.
 
 <a id="quickstart"></a>
 
@@ -13,7 +13,8 @@ On Linux x86_64, use a C++20 compiler and CMake 3.22+ to build this C++ consumer
 ```bash
 mkdir lance-c-quickstart && cd lance-c-quickstart
 
-TAG=v0.2.0
+# Replace vX.Y.Z with a stable tag from https://github.com/lance-format/lance-c/releases/latest
+TAG=vX.Y.Z
 ARCHIVE=lance-c-$TAG-x86_64-unknown-linux-gnu.tar.xz
 
 curl -fLO "https://github.com/lance-format/lance-c/releases/download/$TAG/$ARCHIVE"
@@ -37,7 +38,7 @@ Expected output:
 rows: 512, version: 2
 ```
 
-The `consumer` directory has no dependency on the checkout layout and also runs against any other Lance dataset. For other platforms, see the [release archives and platform requirements](docs/building-and-packaging.md#published-prebuilt-archives). Pair the library with examples whose API matches its release.
+The `consumer` directory has no dependency on the checkout layout and also runs against any other Lance dataset. For other platforms, see the [release archives and platform requirements](docs/building-and-packaging.md#published-prebuilt-archives). Pair the library with examples whose API matches the release you downloaded.
 
 ## Add Lance to a project
 
@@ -52,7 +53,7 @@ C and C++ applications using `<lance/lance.h>` link `LanceC::lance_c`.
 For the C++20 wrapper `<lance/lance.hpp>`, link `LanceC::lance_cpp` instead;
 it selects the required C++ standard and links the C library.
 
-CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules). The public C ABI is checked against the v0.2.0 export baseline; see [ABI compatibility](docs/building-and-packaging.md#abi-compatibility).
+CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules). The public C ABI is checked against the published export baseline; see [ABI compatibility](docs/building-and-packaging.md#abi-compatibility).
 
 With pkg-config, point `PKG_CONFIG_PATH` at the archive's `lib/pkgconfig`:
 

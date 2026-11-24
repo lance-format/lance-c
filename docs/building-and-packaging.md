@@ -6,7 +6,7 @@ This document provides platform-specific build instructions, binary packaging co
 
 - [Published prebuilt archives](#published-prebuilt-archives)
 - [ABI compatibility](#abi-compatibility)
-- [Linux runtime requirements](#linux-baseline-for-future-packages)
+- [Linux runtime requirements](#linux-runtime-requirements)
 - [Try the published package](#try-the-published-package)
 - [Choosing static or shared linkage](#choosing-static-or-shared-linkage)
 - [Building from source via Cargo](#from-source-via-cargo-rust-developers)
@@ -20,7 +20,7 @@ This document provides platform-specific build instructions, binary packaging co
 
 Each release `.tar.xz` archive unpacks an install prefix containing:
 
-- `include/lance/lance.h` (umbrella), `include/lance/lance.hpp`, and the domain headers under `include/lance/`
+- Public headers under `include/lance/` (the v0.2.0 archive contains `lance.h` and `lance.hpp`; check the archive for its exact header set)
 - Static and shared libraries under `lib/` (plus `lib/lance_c.dll.lib` on Windows)
 - `lib/cmake/LanceC/` (`LanceCConfig.cmake` and `LanceCConfigVersion.cmake`)
 - `lib/pkgconfig/lance-c.pc`
@@ -28,32 +28,34 @@ Each release `.tar.xz` archive unpacks an install prefix containing:
 
 In the published archives, Linux and macOS release shared libraries (`liblance_c.so`, `liblance_c.dylib`) are stripped of debug/local symbols and restrict their defined dynamic exports to the public `lance_*` C ABI. Windows requires both `lance_c.dll` and `lance_c.dll.lib` to expose only the header-declared `lance_*` symbols. Static archives (`liblance_c.a`, `lance_c.lib`) are unstripped so they retain the symbol table required for static linking.
 
-### Stable release (`v0.2.0`)
+### Stable release archives
 
-[`v0.2.0`](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) is the first stable release of the 0.2.x line. It pins Lance 15.0.0-beta.25 (`f5dbd55d`); a later 0.2.x patch will adopt upstream Lance 15.0.0 while preserving the C ABI. It publishes five prebuilt archives, per-archive `.sha256` and `.sha512` files, and a five-line `SHA512SUMS`:
+Stable downloads are on the [latest stable release](https://github.com/lance-format/lance-c/releases/latest); the [releases page](https://github.com/lance-format/lance-c/releases) lists every release and its notes. Stable releases publish the five prebuilt archives listed below, plus per-archive `.sha256` and `.sha512` files and a five-line `SHA512SUMS` that verifies all five archives. Replace `<release-tag>` below with the tag you downloaded, including its `v` prefix.
 
 | Platform | Archive | Runtime & ABI contract |
 | --- | --- | --- |
-| Linux `x86_64` | `lance-c-v0.2.0-x86_64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` (`pthread`/`dl` on older glibc); C++20 for `lance.hpp` |
-| Linux `aarch64` | `lance-c-v0.2.0-aarch64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`; C++20 for `lance.hpp` |
-| macOS `arm64` | `lance-c-v0.2.0-aarch64-apple-darwin.tar.xz` | Apple silicon (`minos 11.0`); C++20 for `lance.hpp` |
-| Windows `x86_64` | `lance-c-v0.2.0-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
-| Windows `ARM64` | `lance-c-v0.2.0-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
+| Linux `x86_64` | `lance-c-<release-tag>-x86_64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` (`pthread`/`dl` on older glibc); C++20 for `lance.hpp` |
+| Linux `aarch64` | `lance-c-<release-tag>-aarch64-unknown-linux-gnu.tar.xz` | `glibc >= 2.28`; links only `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`; C++20 for `lance.hpp` |
+| macOS `arm64` | `lance-c-<release-tag>-aarch64-apple-darwin.tar.xz` | Apple silicon (`minos 11.0`); C++20 for `lance.hpp` |
+| Windows `x86_64` | `lance-c-<release-tag>-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
+| Windows `ARM64` | `lance-c-<release-tag>-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 
-The 0.2.x prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
+The stable prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
+
+The v0.2.0 release was the first stable release of the 0.2.x line and established the ABI baseline described below. It pinned Lance 15.0.0-beta.25 (`f5dbd55d`).
 
 <a id="abi-compatibility"></a>
 
 ## ABI compatibility
 
-The public C ABI is the `lance_*` function set declared by the installed `include/lance/` headers. The 0.2.x line preserves it: releases may add entry points, but must not remove or change an existing one.
+The public C ABI is the `lance_*` function set declared by the installed `include/lance/` headers. The 0.2.x line, introduced by v0.2.0, preserves it: releases may add entry points, but must not remove or change an existing one.
 
 - Release and CI builds compare each staged Linux, macOS, and Windows shared library with [`.github/abi-baseline/v0.2.0-exports.txt`](../.github/abi-baseline/v0.2.0-exports.txt), the export names published by the verified `v0.2.0` release. Dropping a published name fails the build even when the declaration and the library are changed together; new exports are allowed and reported. This is an export-name comparison only: it does not detect changed signatures, struct or enum layouts, or changed behavior. The same build still requires the library to match the installed header set exactly, and `tests/support/abi_layout.rs` checks struct sizes, alignments, field offsets and enum values against the current Rust definitions.
 - `LANCE_API`, `LANCE_DEPRECATED(message)` and `LANCE_NODISCARD` are defined in `include/lance/attributes.h`, which every public declaration header includes. On Windows, declarations are ordinary by default, so one header works with both the static archive and the DLL import library. The installed CMake shared target (`LanceC::lance_c_shared`, or `LanceC::lance_c` with `-DLanceC_LINK=shared`) defines `LANCE_C_SHARED`, which opts into `__declspec(dllimport)`; direct DLL consumers may define it themselves. Static consumers need no macro.
 - The shared-library file names stay unversioned (`liblance_c.so`, `liblance_c.dylib`, `lance_c.dll`) in the 0.2.x line. A versioned SONAME or install name changes a loader contract that published archives and downstream native modules currently pin, so it needs its own migration plan.
 - The Go bindings already parse declaration attributes and modular headers (lance-go #120, #132 and #129). A production repin still needs the published archive identities for the split header set; this repository does not publish a native pin.
 
-<a id="linux-baseline-for-future-packages"></a>
+<a id="linux-runtime-requirements"></a>
 
 ## Linux runtime requirements
 
@@ -191,7 +193,7 @@ cc myapp.c $(pkg-config --cflags --libs lance-c) -o myapp
 <a id="windows-x86_64-pc-windows-msvc-and-aarch64-pc-windows-msvc"></a>
 ## Windows (`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`)
 
-Windows prebuilt archives are published in the [v0.2.0 release](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) and later 0.2.x releases.
+Windows prebuilt archives are published in stable releases; see the [latest stable release](https://github.com/lance-format/lance-c/releases/latest) and the [archive table](#published-prebuilt-archives).
 
 ### Building from source on Windows
 
@@ -247,6 +249,20 @@ The install prefix contains `lib/lance_c.dll`, its import library `lib/lance_c.d
 
 Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), which builds five prebuilt `.tar.xz` archives (Linux `x86_64` and `aarch64` targeting `glibc 2.28`, macOS `arm64`, and Windows `x86_64` and `aarch64`), verifies exports/runtime dependencies/consumers, and attaches the archives and checksums to a GitHub Release. Beta tags (`v*-beta.*`) are published as GitHub pre-releases; stable tags publish a normal release. Generated notes are grouped by [`.github/release.yml`](../.github/release.yml).
 
+<a id="pre-tag-documentation-check"></a>
+### Pre-tag documentation check
+
+Run this on `main` before starting the release workflow or tagging manually:
+
+1. Scan the user-facing docs for release-specific versions and promises:
+   ```bash
+   grep -RInE 'v[0-9]+\.[0-9]+\.[0-9]+|0\.[0-9]+\.x|current release|latest release|next release|unreleased|will (adopt|publish|ship)|maintained release' README.md docs examples ports recipes .github/abi-baseline/README.md
+   ```
+   The scan also matches this checklist and historical compatibility facts; review each match rather than deleting it. Every remaining match must be a historical fact, a placeholder such as `vX.Y.Z`, or the exact release being cut. Remove or rewrite claims about the current stable release, the next release, or future core adoption.
+2. Confirm release links: stable downloads use `/releases/latest`, history uses `/releases`, and `/releases/tag/<tag>` links are only for historical facts.
+3. Compare the archive names and checksum conventions in the docs with `release.yml` and the planned release assets. If the supported platform matrix, core version, or ABI baseline changes, update the docs in the same release commit.
+4. Confirm the README and guide do not name the release being cut as current and do not state what an unreleased version will contain.
+
 <a id="recommended-cut-a-release-via-actions-ui"></a>
 ### Recommended: cut a release via Actions UI
 
@@ -258,7 +274,7 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
    - **release_channel**: `preview` (tags `vX.Y.Z-beta.N`, auto-incremented) or `stable` (tags `vX.Y.Z`).
    - **dry_run**: leave on for the first run to preview the computed tag and version without pushing.
 3. Re-run with **dry_run** off. When the version changes, the workflow updates `Cargo.toml`, `Cargo.lock`, and the public version macros in `include/lance/version.h`, commits as `github-actions[bot]`, pushes the commit and tag, and triggers `release.yml` at the new tag's ref. With `release_type: current`, it tags the current release commit without another version commit.
-4. Verify that the release page contains all expected platform archives and checksums. Download an archive and run the consumer from the same tag.
+4. Run the post-publication check below before announcing the release.
 
 > **Branch protection:** If `main` is protected, allow `github-actions[bot]` (or the GitHub Actions integration) to bypass push restrictions, or configure `create-release.yml` with a PAT that has `contents: write`.
 
@@ -267,22 +283,41 @@ Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), w
 
 To cut a release manually without `create-release.yml`:
 
-1. Choose the new semver version (for `0.x.y`, bump **minor** for breaking changes or new features, **patch** for bug fixes).
+1. Choose the new semver version (for `0.x.y`, bump **minor** for breaking changes or new features, **patch** for bug fixes). In each block below, set `LANCE_C_VERSION` to that version without the `v` prefix, and let `TAG` name the release and its archives:
+   ```bash
+   LANCE_C_VERSION=X.Y.Z
+   TAG="v$LANCE_C_VERSION"
+   ```
 2. On `main`, update `version = ...` in [`Cargo.toml`](../Cargo.toml), refresh `Cargo.lock`, and synchronize the public header macros:
    ```bash
+   LANCE_C_VERSION=X.Y.Z
+   TAG="v$LANCE_C_VERSION"
    git checkout main && git pull
-   # edit Cargo.toml version
+   # edit Cargo.toml version to "$LANCE_C_VERSION"
    cargo update -p lance-c
-   python3 .github/scripts/sync-version-header.py 0.2.0
+   python3 .github/scripts/sync-version-header.py "$LANCE_C_VERSION"
    python3 .github/scripts/sync-version-header.py --check
-   git checkout -b chore/release-0.2.0
-   git commit -am "chore(release): v0.2.0"
+   git checkout -b "chore/release-$LANCE_C_VERSION"
+   git commit -am "chore(release): $TAG"
    ```
 3. Merge the version-bump PR into `main`, then tag and push:
    ```bash
+   LANCE_C_VERSION=X.Y.Z
+   TAG="v$LANCE_C_VERSION"
    git checkout main && git pull
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag "$TAG"
+   git push origin "$TAG"
    ```
 
 You can also run a dry-run build of [`release.yml`](../.github/workflows/release.yml) via Actions → **Release** → **Run workflow** with a test version such as `0.0.1-dev` (the `publish` job is skipped unless the ref is `refs/tags/v*`).
+
+<a id="post-publication-check"></a>
+### Post-publication check
+
+After `release.yml` publishes the GitHub Release:
+
+1. Open the release page and compare every archive, `.sha256`, `.sha512`, and `SHA512SUMS` name with the docs table and quickstart. Fix any mismatch in a follow-up docs commit before announcing the release.
+2. Download `SHA512SUMS` and at least one archive from the published release. Verify the checksum, unpack the archive, and run the README quickstart from the published tag, including `git clone --branch`.
+3. Confirm `https://github.com/lance-format/lance-c/releases/latest` resolves to the intended stable release. A preview release must not become the latest stable download.
+4. Re-run the stale-release scan from the pre-tag check. Fix any doc that names the wrong tag, calls a version current, or promises an unreleased version, then merge the docs fix and re-check its links.
+5. Check every local link and release/download URL touched by the release. The examples and API guide must match the installed archive's headers.
