@@ -49,7 +49,10 @@ impl Compilation<'_> {
 /// the test's stderr, so a failure is visible in the CI log.
 pub(crate) fn compile(compilation: &Compilation<'_>) -> bool {
     let mut command = compiler_command(compilation.language);
-    let arguments = compiler_arguments(compilation);
+    let mut arguments = compiler_arguments(compilation);
+    arguments.extend(sanitizer_arguments(
+        std::env::var("LANCE_C_SANITIZERS").ok().as_deref(),
+    ));
     command.args(&arguments);
 
     let status = command.status().unwrap_or_else(|error| {
@@ -59,6 +62,29 @@ pub(crate) fn compile(compilation: &Compilation<'_>) -> bool {
         )
     });
     status.success()
+}
+
+/// Extra flags requested through `LANCE_C_SANITIZERS` (for example
+/// `address,undefined`).
+///
+/// The Rust library itself stays uninstrumented; these flags instrument the
+/// native consumer that crosses the FFI boundary, so heap and lifetime errors
+/// in C/C++ ownership code are reported. MSVC has no equivalent flag set and
+/// is left untouched.
+fn sanitizer_arguments(sanitizers: Option<&str>) -> Vec<OsString> {
+    let Some(sanitizers) = sanitizers else {
+        return Vec::new();
+    };
+    if cfg!(windows) {
+        return Vec::new();
+    }
+
+    vec![
+        format!("-fsanitize={sanitizers}").into(),
+        "-fno-sanitize-recover=all".into(),
+        "-fno-omit-frame-pointer".into(),
+        "-g".into(),
+    ]
 }
 
 /// Path of a compiled test binary. MSVC appends `.exe`; the harness passes the
@@ -370,6 +396,25 @@ mod tests {
 
         let allowed = reference_gnu(Language::C, true, false);
         assert!(!allowed.iter().any(|argument| argument == "-Werror"));
+    }
+
+    #[test]
+    fn sanitizer_arguments_are_empty_when_not_requested() {
+        assert!(sanitizer_arguments(None).is_empty());
+    }
+
+    #[test]
+    fn sanitizer_arguments_instrument_gnu_consumers() {
+        let arguments = as_strings(sanitizer_arguments(Some("address,undefined")));
+
+        if cfg!(windows) {
+            assert!(arguments.is_empty());
+            return;
+        }
+        assert!(arguments.contains(&"-fsanitize=address,undefined".to_string()));
+        assert!(arguments.contains(&"-fno-sanitize-recover=all".to_string()));
+        assert!(arguments.contains(&"-fno-omit-frame-pointer".to_string()));
+        assert!(arguments.contains(&"-g".to_string()));
     }
 
     #[test]

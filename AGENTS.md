@@ -34,6 +34,7 @@ lint: `cargo clippy --all-targets -- -D warnings`
 test: `cargo test`
 test C/C++ compilation: `cargo test --test compile_and_run_test -- --ignored`
 check C/C++ headers: `bash .github/scripts/verify-cxx-headers.sh` (defaults to gcc:g++ and clang:clang++; pass `gcc14-gcc:gcc14-g++` style pairs to test other local toolchains)
+sanitizer C/C++ consumers: `LANCE_C_SANITIZERS=address,undefined ASAN_OPTIONS=detect_leaks=1 cargo test --test compile_and_run_test -- --ignored test_c_compilation_and_execution` (Linux; any native consumer test works)
 
 ## Key Patterns
 - Opaque handles with `lance_*_open`/`lance_*_close` lifecycle.
