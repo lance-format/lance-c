@@ -40516,8 +40516,27 @@ fn test_scalar_segment_stable_row_ids_and_deletes() {
         ds.delete("id = 2").await.unwrap();
         assert_eq!(ds.load_indices().await.unwrap().len(), 2);
     });
-    let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
     assert_eq!(ids, vec![3]);
+    // The segment result is address-domain, and these stable row ids are not row
+    // addresses. Installing its candidates must translate them rather than fall
+    // back to an unindexed scan.
+    assert!(
+        stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1),
+        "{:?}",
+        stats.metrics
+    );
+    assert!(
+        !stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segment_fallbacks" && *value != 0),
+        "{:?}",
+        stats.metrics
+    );
 }
 
 #[test]

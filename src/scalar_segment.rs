@@ -12,6 +12,7 @@ use datafusion::common::tree_node::TreeNode;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use lance::Dataset;
+use lance::dataset::rowids::row_addrs_to_row_ids;
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance::io::exec::utils::IndexMetrics;
@@ -21,7 +22,7 @@ use lance_datafusion::utils::MetricsExt;
 use lance_index::IndexType;
 use lance_index::scalar::expression::{ScalarIndexExpr, ScalarIndexLoader, create_filter_plan};
 use lance_index::scalar::{MetricsCollector, ScalarIndex};
-use lance_select::NullableIndexExprResult;
+use lance_select::{MaskDomain, NullableIndexExprResult, RowAddrMask, RowAddrTreeMap};
 use uuid::Uuid;
 
 pub(crate) struct PreparedScalarSegment {
@@ -122,14 +123,45 @@ impl ScalarIndexLoader for SegmentIndexLoader<'_> {
         Ok(self.index.clone())
     }
 
-    async fn row_addr_result_to_row_ids(
+    async fn row_id_result_to_row_addrs(
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
-        // v14 BTree segments report physical row addresses. Delegate the
-        // stable-row-id translation to Lance so the mask stays in `_rowid`
-        // space before boolean composition and scanner installation.
-        self.dataset.row_addr_result_to_row_ids(result).await
+        // Legacy segments report stable row ids. Delegate the remap to Lance so a
+        // mixed expression combines masks in one domain; the dataset owns the
+        // row-id index the segment itself does not have.
+        self.dataset.row_id_result_to_row_addrs(result).await
+    }
+}
+
+/// Translate an address-domain candidate mask into the dataset's `_rowid` space.
+///
+/// The scanner's row-id prefilter documents a `_rowid`-keyed mask, which is the
+/// stable row id rather than the physical address once a dataset enables stable
+/// row ids. Lance resolves the listed addresses (an id-to-address lookup in
+/// reverse); `None` means the mask selects whole fragments instead of listed
+/// rows, which leaves nothing to resolve.
+async fn row_id_candidates(dataset: &Dataset, mask: RowAddrMask) -> Result<Option<RowAddrMask>> {
+    async fn translated(
+        dataset: &Dataset,
+        addresses: &RowAddrTreeMap,
+    ) -> Result<Option<RowAddrTreeMap>> {
+        let Some(addresses) = addresses.row_addrs() else {
+            return Ok(None);
+        };
+        let row_ids = row_addrs_to_row_ids(dataset, addresses.map(|addr| Some(u64::from(addr))));
+        Ok(Some(RowAddrTreeMap::from_iter(
+            row_ids.await?.into_iter().flatten(),
+        )))
+    }
+
+    match mask {
+        RowAddrMask::AllowList(addresses) => Ok(translated(dataset, &addresses)
+            .await?
+            .map(RowAddrMask::AllowList)),
+        RowAddrMask::BlockList(addresses) => Ok(translated(dataset, &addresses)
+            .await?
+            .map(RowAddrMask::BlockList)),
     }
 }
 
@@ -399,7 +431,21 @@ impl PreparedScalarSegment {
         if !result.is_exact() {
             return Ok(Some("inexact_result"));
         }
-        if let Some(rows) = result.upper.max_len() {
+        // `with_row_id_prefilter` documents a `_rowid`-keyed mask, so an
+        // address-domain result needs the dataset's address-to-id translation on a
+        // stable-row-id dataset. Lance's own pipeline consumes addresses directly,
+        // so evaluation no longer performs this translation.
+        let row_address_domain = result.domain == MaskDomain::RowAddress;
+        let mut candidates = result.upper;
+        if row_address_domain && self.dataset.manifest().uses_stable_row_ids() {
+            let Some(mask) = row_id_candidates(self.dataset.as_ref(), candidates).await? else {
+                // A whole-fragment selection has no listed addresses to resolve;
+                // the scoped scan re-applies the complete filter instead.
+                return Ok(Some("row_address_mask"));
+            };
+            candidates = mask;
+        }
+        if let Some(rows) = candidates.max_len() {
             stats
                 .all_counts
                 .insert("scalar_segment_candidate_rows".into(), rows as usize);
@@ -413,7 +459,7 @@ impl PreparedScalarSegment {
         // Do not truncate candidates at LIMIT. The reader evaluates the complete
         // filter before applying its existing limit/offset operators. Its explicit
         // fragment domain also bounds complement masks produced by NOT.
-        reader.with_row_id_prefilter(result.upper);
+        reader.with_row_id_prefilter(candidates);
         Ok(None)
     }
 }
