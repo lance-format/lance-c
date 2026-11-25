@@ -46621,6 +46621,139 @@ fn assert_tokenize_error(text: &[u8], params_json: Option<&str>) {
     assert!(!take_last_error_message().is_empty());
 }
 
+/// Each IVF_RQ segment build draws a random rotation unless the caller
+/// supplies a model, so independently built physical segments cannot be
+/// merged. Lance v15.0.0-rc.1 names the differing field in that error; C
+/// callers see the message through `lance_dataset_merge_index_segments`.
+#[test]
+fn test_merge_ivf_rq_reports_mismatched_rotation() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    let column = c_str("embedding");
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    // Shared IVF centroids leave the random per-build RQ rotation as the only
+    // difference between the two physical segments.
+    let mut centroids = FFI_ArrowArray::empty();
+    let mut centroids_schema = FFI_ArrowSchema::empty();
+    assert_eq!(
+        unsafe {
+            lance_index_train_ivf_model(
+                dataset,
+                column.as_ptr(),
+                2,
+                LanceMetricType::L2 as i32,
+                ptr::null(),
+                0,
+                &mut centroids,
+                &mut centroids_schema,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfRq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let index_uuid = [0x5a_u8; 16];
+    let name = c_str("rq_rotation_segment");
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for (position, fragment_id) in fragment_ids.into_iter().enumerate() {
+        // Each physical segment carries a distinct UUID; the logical index
+        // UUID is shared through every byte except the last one.
+        let mut physical_uuid = index_uuid;
+        physical_uuid[15] = (position + 1) as u8;
+        let fragment = fragment_id as u32;
+        let options = LanceIndexSegmentBuildOptions {
+            fragment_ids: &fragment,
+            fragment_count: 1,
+            index_uuid: physical_uuid.as_ptr(),
+            ivf_centroids: &mut centroids,
+            ivf_centroids_schema: &centroids_schema,
+            pq_codebook: ptr::null_mut(),
+            pq_codebook_schema: ptr::null(),
+            mode: LanceIndexSegmentBuildMode::Precomputed as i32,
+        };
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                name.as_ptr(),
+                &params,
+                &options,
+            )
+        };
+        assert!(!builder.is_null(), "{}", take_last_error_message());
+        let mut bytes = ptr::null_mut();
+        let mut len = 0_usize;
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len)
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        segments.push((bytes, len));
+        unsafe { lance_index_segment_builder_free(builder) };
+    }
+
+    let pointers = segments
+        .iter()
+        .map(|(bytes, _)| *bytes as *const u8)
+        .collect::<Vec<_>>();
+    let lengths = segments.iter().map(|(_, len)| *len).collect::<Vec<_>>();
+    let mut merged = ptr::null_mut();
+    let mut merged_len = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_dataset_merge_index_segments(
+                dataset,
+                pointers.as_ptr(),
+                lengths.as_ptr(),
+                pointers.len(),
+                &mut merged,
+                &mut merged_len,
+            )
+        },
+        -1
+    );
+    assert!(merged.is_null());
+    assert_eq!(merged_len, usize::MAX);
+    let code = lance_last_error_code();
+    let message = take_last_error_message();
+    assert_eq!(code, LanceErrorCode::IndexError, "{message}");
+    assert!(message.contains("fast_rotation_signs differ"), "{message}");
+    assert!(
+        message.contains("built with the same RQ rotation model"),
+        "{message}"
+    );
+
+    for (bytes, _) in segments {
+        unsafe { lance_free_bytes(bytes) };
+    }
+    if let Some(release) = centroids.release {
+        unsafe { release(&mut centroids) };
+    }
+    unsafe { lance_dataset_close(dataset) };
+}
+
 #[test]
 fn diagnostics_fts_tokenize_matches_native_text_profile() {
     let text = "the Cats and Dogs";
