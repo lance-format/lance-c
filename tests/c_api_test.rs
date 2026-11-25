@@ -10250,6 +10250,26 @@ fn test_dataset_restore_null_dataset_rejected() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 }
 
+#[test]
+fn test_dataset_restore_rejects_mem_wal() {
+    let (_tmp, uri) = mw_create_dataset();
+    let ds = mw_open(&uri);
+    let target = unsafe { lance_dataset_version(ds) };
+    assert_eq!(mw_initialize(ds, MW_SHARDING_UNSHARDED, None, 0), 0);
+    let current = unsafe { lance_dataset_version(ds) };
+    assert!(current > target, "MemWAL initialization must commit");
+
+    // Restore cannot roll back MemWAL shard state, so a MemWAL on either
+    // version is refused rather than publishing a mismatched table.
+    let restored = unsafe { lance_dataset_restore(ds, target) };
+    assert!(restored.is_null(), "restore must be refused");
+    assert_eq!(lance_last_error_code(), LanceErrorCode::NotSupported);
+    let message = take_last_error_message();
+    assert!(message.contains("MemWAL"), "{message}");
+    assert_eq!(unsafe { lance_dataset_version(ds) }, current);
+    unsafe { lance_dataset_close(ds) };
+}
+
 // ---------------------------------------------------------------------------
 // Index lifecycle tests (Phase 2)
 // ---------------------------------------------------------------------------
