@@ -273,9 +273,28 @@ int main(int argc, char** argv) {
           "namespace dataset URI must not be the table ID");
     CHECK(strstr(resolved, "numbers") != NULL,
           "namespace dataset URI must identify the resolved table");
+    uint64_t read_version = lance_dataset_version(opened);
+    CHECK(read_version > 0, "namespace dataset version");
     lance_dataset_close(opened);
     CHECK(strstr(resolved, "numbers") != NULL,
           "namespace dataset URI must outlive the dataset handle");
+
+    /* Commit a native transaction through the namespace URI entry point on the
+       same caller stack. This is the sibling of the namespace write path and
+       must not depend on a larger Windows main-thread stack. */
+    LanceOperation* delete = lance_operation_delete_new(NULL, 0, NULL, 0, "id < 0");
+    CHECK(delete != NULL, "namespace URI commit delete operation");
+    LanceTransaction* transaction = lance_transaction_new(read_version, delete, NULL);
+    CHECK(transaction != NULL, "namespace URI commit transaction");
+    LanceDataset* committed = NULL;
+    int32_t commit_rc = lance_transaction_commit_namespace_uri(
+        ns, table_id, resolved, transaction, NULL, NULL, NULL, &committed);
+    CHECK(commit_rc == 0, "namespace URI commit");
+    CHECK(committed != NULL, "namespace URI commit dataset");
+    CHECK(lance_dataset_count_rows(committed) == 3, "namespace URI commit rows");
+    lance_dataset_close(committed);
+    lance_transaction_close(transaction);
+    lance_operation_close(delete);
     lance_free_string(resolved);
     CHECK(lance_dataset_uri(NULL) == NULL, "NULL dataset URI");
     CHECK(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,

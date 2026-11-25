@@ -1011,7 +1011,7 @@ unsafe fn transaction_commit_namespace_uri_inner(
             session,
         )?
     };
-    let dataset = block_on(builder.execute(transaction))?;
+    let dataset = block_on_with_large_stack(builder.execute(transaction))?;
     unsafe {
         ptr::write(
             out_dataset,
