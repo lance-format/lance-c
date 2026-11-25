@@ -14487,6 +14487,97 @@ fn test_create_scalar_index_label_list() {
 }
 
 #[test]
+fn test_label_list_index_ignores_hidden_children_of_null_lists() {
+    use arrow_array::builder::{Int32Builder, ListBuilder};
+
+    // A null list parent can still span child slots. Writing this fixture with
+    // the 2.0 file format preserves the hidden child; the stable format would
+    // normalize it to offsets [0, 0, 1].
+    let mut lists = ListBuilder::new(Int32Builder::new());
+    lists.values().append_value(7);
+    lists.append(false);
+    lists.values().append_value(42);
+    lists.append(true);
+    let lists: ListArray = lists.finish();
+    assert_eq!(lists.value_offsets(), &[0, 1, 2]);
+    assert!(lists.is_null(0));
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "tags",
+        lists.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(lists)]).unwrap();
+    let uri = c_str("memory://label_list_hidden_child_2_0");
+    let version = c_str("2.0");
+    let params = LanceWriteParams {
+        max_rows_per_file: 0,
+        max_rows_per_group: 0,
+        max_bytes_per_file: 0,
+        data_storage_version: version.as_ptr(),
+        enable_stable_row_ids: false,
+    };
+    let ffi_schema = schema_to_ffi(&schema);
+    let mut stream = batch_to_ffi_stream(batch);
+    let mut dataset = ptr::null_mut();
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            &params,
+            ptr::null(),
+            &mut dataset,
+        )
+    };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    assert!(!dataset.is_null());
+
+    let tags_column = c_str("tags");
+    let columns = [tags_column.as_ptr(), ptr::null()];
+    let scanner = unsafe { lance_scanner_new(dataset, columns.as_ptr(), ptr::null()) };
+    assert!(!scanner.is_null(), "{}", take_last_error_message());
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let rc = unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+    let (_, batches) = c_stream_batches(stream);
+    let tags = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(tags.value_offsets(), &[0, 1, 2]);
+    assert!(tags.is_null(0), "the parent row must remain a null list");
+    unsafe { lance_scanner_close(scanner) };
+
+    let column = c_str("tags");
+    let name = c_str("tags_idx");
+    let rc = unsafe {
+        lance_dataset_create_scalar_index(
+            dataset,
+            column.as_ptr(),
+            name.as_ptr(),
+            LanceScalarIndexType::LabelList as i32,
+            ptr::null(),
+            false,
+        )
+    };
+    assert_eq!(rc, 0, "{}", take_last_error_message());
+
+    let statistics =
+        take_json_value(unsafe { lance_dataset_index_statistics_json(dataset, name.as_ptr()) });
+    // Only the visible 42 may create a bitmap. The hidden 7 under the null
+    // parent must not; the null list is recorded separately from the values.
+    assert_eq!(
+        statistics["indices"][0]["num_bitmaps"].as_u64(),
+        Some(1),
+        "{statistics}"
+    );
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
 fn test_drop_index() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
