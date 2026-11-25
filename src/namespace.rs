@@ -53,7 +53,7 @@ use crate::commit::{commit_builder_from_ffi_with_handler, dataset_handle};
 use crate::dataset::LanceDataset;
 use crate::error::{LanceErrorCode, ffi_guard_with, swallow_unwind};
 use crate::helpers::parse_c_string;
-use crate::runtime::block_on;
+use crate::runtime::{block_on, block_on_with_large_stack};
 use crate::session::LanceSession;
 use crate::storage_options::LanceStorageOptionsProvider;
 use crate::writer::{LanceWriteMode, LanceWriteOptions, write_params_from_ffi};
@@ -904,7 +904,7 @@ unsafe fn dataset_write_namespace_inner(
 
     let branch = unsafe { parse_c_string(branch)? };
     let dataset = if let Some(branch) = branch {
-        block_on(Dataset::write_into_namespace_on_branch(
+        block_on_with_large_stack(Dataset::write_into_namespace_on_branch(
             reader,
             namespace.trait_object(),
             table_id,
@@ -912,7 +912,7 @@ unsafe fn dataset_write_namespace_inner(
             Some(write_params),
         ))?
     } else {
-        block_on(Dataset::write_into_namespace(
+        block_on_with_large_stack(Dataset::write_into_namespace(
             reader,
             namespace.trait_object(),
             table_id,
