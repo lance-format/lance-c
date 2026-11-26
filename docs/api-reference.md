@@ -1,6 +1,6 @@
 # Generated C/C++ API reference
 
-The public headers carry Doxygen documentation, and [`Doxyfile`](../Doxyfile) renders it as searchable HTML. The configuration reads the public C headers under `include/lance/` (the exact list is the `INPUT` entries in `Doxyfile`), the C++ umbrella `include/lance/lance.hpp`, and the shared C++ declaration header `include/lance/detail/declarations.hpp`; it does not scan the Rust sources or any other directory.
+The public headers carry Doxygen documentation, and [`Doxyfile`](https://github.com/lance-format/lance-c/blob/main/Doxyfile) renders it as searchable HTML. The configuration reads the public C headers under `include/lance/` (the exact list is the `INPUT` entries in `Doxyfile`), the C++ umbrella `include/lance/lance.hpp`, and the shared C++ declaration header `include/lance/detail/declarations.hpp`; it does not scan the Rust sources or any other directory. The published render is available at <https://lance-format.github.io/lance-c/>.
 
 ## Render locally
 
@@ -32,4 +32,4 @@ The job does not require a Rust toolchain and takes seconds after checkout.
 
 ## Publication
 
-The rendered HTML is published to GitHub Pages at <https://lance-format.github.io/lance-c/> by [`.github/workflows/docs.yml`](../.github/workflows/docs.yml) on pushes to `main` that touch the public headers, `Doxyfile`, or Doxygen scripts, and can also be triggered manually via `workflow_dispatch`.
+The rendered HTML is published to GitHub Pages at <https://lance-format.github.io/lance-c/> by [`.github/workflows/docs.yml`](https://github.com/lance-format/lance-c/blob/main/.github/workflows/docs.yml) on pushes to `main` that touch the public headers, `Doxyfile`, or Doxygen scripts, and can also be triggered manually via `workflow_dispatch`.

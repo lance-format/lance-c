@@ -56,10 +56,10 @@ The C API follows the same sequence with `lance_file_session_open_*`,
 ### C11 caller notes
 
 The complete C11 example is `test_blob_writer_publication` in the
-[native transaction consumer](../tests/cpp/test_transaction.c). It finishes the
+[native transaction consumer](https://github.com/lance-format/lance-c/blob/main/tests/cpp/test_transaction.c). It finishes the
 raw writer before creating the `DataFile`, then constructs the replacement
 operation and commits through the existing transaction APIs. The
-[C++20 consumer](../tests/cpp/test_transaction.cpp) follows the same workflow.
+[C++20 consumer](https://github.com/lance-format/lance-c/blob/main/tests/cpp/test_transaction.cpp) follows the same workflow.
 
 `lance_batch_from_arrow` consumes the top-level array, including the prepared
 descriptor child; do not close or release that child again. The top-level
@@ -134,8 +134,8 @@ instead of replacing an existing one:
 not manifest writers. Native commit owns fragment-ID assignment, schema
 coverage, conflict handling and manifest publication. The C11 example is
 `test_blob_writer_append` in the
-[native transaction consumer](../tests/cpp/test_transaction.c); the
-[C++20 consumer](../tests/cpp/test_transaction.cpp) implements the same flow.
+[native transaction consumer](https://github.com/lance-format/lance-c/blob/main/tests/cpp/test_transaction.c); the
+[C++20 consumer](https://github.com/lance-format/lance-c/blob/main/tests/cpp/test_transaction.cpp) implements the same flow.
 
 ### Standalone raw-reader limitation
 

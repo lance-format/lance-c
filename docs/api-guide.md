@@ -1,8 +1,41 @@
 # C and C++ API guide
 
-See the [quickstart](../README.md#quickstart) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](../include/lance/lance.h) documents the ownership and error contract of each function; see [Generated C/C++ API reference](api-reference.md) to render the headers as searchable HTML.
+See the [quickstart](quickstart.md) for installation and a first read. The core sections below cover writing, scanning, search, mutation, indices, cloud storage, and errors. Later sections cover specialized APIs. The [C header](https://github.com/lance-format/lance-c/blob/main/include/lance/lance.h) documents the ownership and error contract of each function; see [Generated C/C++ API reference](api-reference.md) to render the headers as searchable HTML.
 
 The core workflows use public calls present in the current source and were exercised against a published stable release. The [latest stable release](https://github.com/lance-format/lance-c/releases/latest) provides supported downloads, and the [releases page](https://github.com/lance-format/lance-c/releases) records the changes in each release. A package may not contain entry points added after its release: check the installed header before using one.
+
+## Contents
+
+- [Write Arrow batches](#write-arrow-batches)
+- [Scan, filter, project and take](#scan-filter-project-and-take)
+- [Vector and full-text search](#vector-and-full-text-search)
+- [Mutations and indices](#mutations-and-indices)
+- [Cloud object storage and credentials](#cloud-object-storage-and-credentials)
+- [Runnable write/index/query example](#runnable-writeindexquery-example)
+- [Errors and panic recovery](#errors-and-panic-recovery)
+- [Header inclusion](#header-inclusion)
+- [Binding version](#binding-version)
+- [Dataset metadata](#dataset-metadata)
+- [Dataset configuration, bases and files](#dataset-configuration-bases-and-files)
+- [Dataset maintenance](#dataset-maintenance)
+- [Scanner ordering](#scanner-ordering)
+- [Scanner projection and scoring columns](#scanner-projection-and-scoring-columns)
+- [Segment-scoped array label filters](#segment-scoped-array-label-filters)
+- [Runtime BTree segment selection](#runtime-btree-segment-selection)
+- [Distance-bounded vector search](#distance-bounded-vector-search)
+- [Multi-vector search](#multi-vector-search)
+- [Batch nearest-neighbor search](#batch-nearest-neighbor-search)
+- [Owned native write options](#owned-native-write-options)
+- [Native transactions](#native-transactions)
+- [Share metadata and index caches](#share-metadata-and-index-caches)
+- [Thread safety](#thread-safety)
+- [Vector index build options](#vector-index-build-options)
+- [Prewarm an index synchronously](#prewarm-an-index-synchronously)
+- [Open at a specific version](#open-at-a-specific-version)
+- [Deep clone a dataset](#deep-clone-a-dataset)
+- [Diagnostic logging](#diagnostic-logging)
+- [Tokio runtime worker threads](#tokio-runtime-worker-threads)
+- [Process lifetime and embedding](#process-lifetime-and-embedding)
 
 ## Write Arrow batches
 
@@ -465,13 +498,16 @@ try {
 directly: it returns normally when `lance_last_error_code()` is `LANCE_OK` and
 throws `lance::Error` otherwise.
 
-A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in [error.h](../include/lance/error.h) for the complete boundary.
+A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LANCE_ERR_PANIC`. A scanner is poisoned after that: close it and build a fresh scanner instead of retrying it. A dataset handle remains usable, and a mutation that panics before commit leaves the last committed snapshot intact. C++ callers receive `lance::Error` with `code == LANCE_ERR_PANIC`. Panics during close/free are logged and cleanup may leak by design. The contract does not cover a double panic, a panic in a destructor during unwinding, stack overflow, or allocation failure, and callbacks passed into the library must not unwind. See the panic section in [error.h](https://github.com/lance-format/lance-c/blob/main/include/lance/error.h) for the complete boundary.
 
 ## Header inclusion
 
 `<lance/lance.h>` is the umbrella C header and keeps the complete 0.2 public
-ABI. C callers that use only the dataset read path can include the focused
-domain headers instead:
+ABI. The `v0.2.0` release archive ships only the umbrella `lance.h` and the C++
+`lance.hpp`; include `<lance/lance.h>` with that package. The split domain
+headers below are part of the current source and newer packages. With those,
+C callers that use only the dataset read path can include the focused domain
+headers instead:
 
 - `<lance/dataset.h>` — dataset open and close, snapshots, metadata and version history
 - `<lance/scanner.h>` — scanner configuration, planning and iteration
@@ -1220,7 +1256,7 @@ approximate and may change as cache maintenance runs.
 ## Thread safety
 
 The C pointer is a lifetime token, not a lock, and a `const` qualifier does not
-by itself permit concurrent calls. The [umbrella header](../include/lance/lance.h)
+by itself permit concurrent calls. The [umbrella header](https://github.com/lance-format/lance-c/blob/main/include/lance/lance.h)
 defines the complete contract; the main cases are:
 
 - `LanceDataset` handles are shareable. Snapshot reads and in-place mutations
@@ -1493,7 +1529,7 @@ later valid call can still enable it.
 `lance-c` creates one process-wide, multi-thread Tokio runtime lazily on the
 first runtime-backed call. It does not add a binding-specific worker-count API
 or environment variable. The Tokio release locked in the checkout's
-[Cargo.lock](../Cargo.lock) reads `TOKIO_WORKER_THREADS` when that runtime is
+[Cargo.lock](https://github.com/lance-format/lance-c/blob/main/Cargo.lock) reads `TOKIO_WORKER_THREADS` when that runtime is
 built because `lance-c` does not call `Builder::worker_threads`.
 
 - When unset, Tokio uses `std::thread::available_parallelism()`, the parallelism
