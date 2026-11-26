@@ -4,8 +4,8 @@
 # Doxygen configuration for the public lance-c headers.
 #
 # This renders the public C headers in include/lance/, the C++ umbrella and the
-# shared C++ declaration header into HTML under build/doxygen/html. It does not
-# publish the result.
+# shared C++ declaration header into HTML under build/doxygen/html. Pushes to
+# main publish the rendered HTML to GitHub Pages via .github/workflows/docs.yml.
 #
 # CI runs .github/scripts/check-doxygen.sh, which renders this configuration
 # with warnings treated as errors. Doxygen 1.12.0 is pinned by

@@ -32,4 +32,4 @@ The job does not require a Rust toolchain and takes seconds after checkout.
 
 ## Publication
 
-The rendered HTML is a build artifact. CI validates it but does not publish or upload it. Hosting the reference is a separate decision.
+The rendered HTML is published to GitHub Pages at <https://lance-format.github.io/lance-c/> by [`.github/workflows/docs.yml`](../.github/workflows/docs.yml) on pushes to `main` that touch the public headers, `Doxyfile`, or Doxygen scripts, and can also be triggered manually via `workflow_dispatch`.
