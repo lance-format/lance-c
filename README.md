@@ -70,7 +70,7 @@ Add `--static` and link `liblance_c.a` explicitly when using the static archive;
 ## Documentation
 
 - [C and C++ API guide](docs/api-guide.md) for scans, vector search, writes, transactions, dataset maintenance, [opt-in diagnostic logging](docs/api-guide.md#diagnostic-logging), [Tokio worker-thread configuration](docs/api-guide.md#tokio-runtime-worker-threads), and [process lifetime during embedding](docs/api-guide.md#process-lifetime-and-embedding).
-- [Generated API reference](docs/api-reference.md) for the Doxygen HTML render and the documentation checks CI runs.
+- [API reference](https://lance-format.github.io/lance-c/) for the hosted Doxygen HTML reference (see [Generated API reference](docs/api-reference.md) for local rendering and CI checks).
 - [Segment-scoped scalar scans](docs/scalar-segment-scans.md) and [publishing blob data](docs/blob-writer-dataset-publication.md) for specialized workflows.
 - [Building and packaging](docs/building-and-packaging.md) for platform toolchains, source builds, and releases.
 
