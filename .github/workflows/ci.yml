@@ -270,7 +270,7 @@ jobs:
       - name: Enable long paths for Lance dependency checkout
         shell: pwsh
         run: git config --global core.longpaths true
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           # Corrosion writes dependencies under the CMake build tree.
@@ -356,7 +356,7 @@ jobs:
       - name: Enable long paths for Lance dependency checkout
         shell: pwsh
         run: git config --global core.longpaths true
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Assert native Windows ARM64 toolchain
         shell: pwsh
         run: pwsh -File .github/scripts/assert-windows-arm64-host.ps1
@@ -489,13 +489,13 @@ jobs:
         run: bash .github/scripts/check-doxygen.sh
 
   msrv:
-    name: MSRV (1.95.0)
+    name: MSRV (1.98.0)
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}

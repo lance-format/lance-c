@@ -103,11 +103,11 @@ On Windows, shared linkage also removes the `/MT` static-CRT requirement for con
 <a id="from-source-via-cargo-rust-developers"></a>
 ## Building from source via Cargo
 
-Source builds of the current tree require **Rust 1.95.0+**, **CMake 3.22+**, and **`protoc`**. Baseline build targets are defined in [`.github/baseline.env`](../.github/baseline.env):
+Source builds of the current tree require **Rust 1.98.0+**, **CMake 3.22+**, and **`protoc`**. Baseline build targets are defined in [`.github/baseline.env`](../.github/baseline.env):
 
 | Component | Target / minimum |
 | --- | --- |
-| Rust | 1.95.0+ |
+| Rust | 1.98.0+ |
 | CMake | 3.22+ |
 | C / C++ | C11 or C++20 |
 | Compiler | GCC / Clang 20; Apple Clang 15; MSVC (ClangCL on Windows ARM64) |
