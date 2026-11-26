@@ -1,6 +1,6 @@
 # Building, Packaging, and Releasing
 
-This document provides platform-specific build instructions, binary packaging contracts, and release procedures for `lance-c`. For the top-level overview and quickstart, see [`README.md`](../README.md).
+This document provides platform-specific build instructions, binary packaging contracts, and release procedures for `lance-c`. For the top-level overview and quickstart, see [`README.md`](https://github.com/lance-format/lance-c/blob/main/README.md) and the [C and C++ quickstart](quickstart.md).
 
 ## Contents
 
@@ -40,7 +40,7 @@ Stable downloads are on the [latest stable release](https://github.com/lance-for
 | Windows `x86_64` | `lance-c-<release-tag>-x86_64-pc-windows-msvc.tar.xz` | Windows x64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 | Windows `ARM64` | `lance-c-<release-tag>-aarch64-pc-windows-msvc.tar.xz` | Windows 11 ARM64, MSVC static CRT (`/MT`, `LanceC_STATIC_CRT=ON`); C++20 for `lance.hpp` |
 
-The table lists the `DT_NEEDED` entries [`verify-linux-staging.sh`](../.github/scripts/verify-linux-staging.sh) allows for each Linux target, not the exact set every archive must contain. The `ld-linux-*` loader is allowed as the program interpreter rather than required, and glibc 2.28 keeps `libpthread` and `libdl` separate; the staging check prints the dependencies it observes. The stable prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
+The table lists the `DT_NEEDED` entries [`verify-linux-staging.sh`](https://github.com/lance-format/lance-c/blob/main/.github/scripts/verify-linux-staging.sh) allows for each Linux target, not the exact set every archive must contain. The `ld-linux-*` loader is allowed as the program interpreter rather than required, and glibc 2.28 keeps `libpthread` and `libdl` separate; the staging check prints the dependencies it observes. The stable prebuilt baseline is these five targets: Linux x86_64 and AArch64 with glibc 2.28+, Apple silicon macOS, and Windows x64 and ARM64 with the static `/MT` CRT. C consumers need C11; the C++ wrapper needs C++20.
 
 The v0.2.0 release was the first stable release of the 0.2.x line and established the ABI baseline described below. It pinned Lance 15.0.0-beta.25 (`f5dbd55d`).
 
@@ -50,7 +50,7 @@ The v0.2.0 release was the first stable release of the 0.2.x line and establishe
 
 The public C ABI is the `lance_*` function set declared by the installed `include/lance/` headers. The 0.2.x line, introduced by v0.2.0, preserves it: releases may add entry points, but must not remove or change an existing one.
 
-- Release and CI builds compare each staged Linux, macOS, and Windows shared library with [`.github/abi-baseline/v0.2.0-exports.txt`](../.github/abi-baseline/v0.2.0-exports.txt), the export names published by the verified `v0.2.0` release. Dropping a published name fails the build even when the declaration and the library are changed together; new exports are allowed and reported. This is an export-name comparison only: it does not detect changed signatures, struct or enum layouts, or changed behavior. The same build still requires the library to match the installed header set exactly, and `tests/support/abi_layout.rs` checks struct sizes, alignments, field offsets and enum values against the current Rust definitions.
+- Release and CI builds compare each staged Linux, macOS, and Windows shared library with [`.github/abi-baseline/v0.2.0-exports.txt`](https://github.com/lance-format/lance-c/blob/main/.github/abi-baseline/v0.2.0-exports.txt), the export names published by the verified `v0.2.0` release. Dropping a published name fails the build even when the declaration and the library are changed together; new exports are allowed and reported. This is an export-name comparison only: it does not detect changed signatures, struct or enum layouts, or changed behavior. The same build still requires the library to match the installed header set exactly, and `tests/support/abi_layout.rs` checks struct sizes, alignments, field offsets and enum values against the current Rust definitions.
 - A dedicated Linux CI job compiles the released `v0.2.0` header and the current header set into DWARF probes and compares their public type definitions and published function signatures with libabigail (`tests/abi/README.md`). It fails on harmful struct, enum or signature changes since `v0.2.0`; new public types and functions are additive. It does not replace the export-name baseline above or the current header-to-Rust checks.
 - `LANCE_API`, `LANCE_DEPRECATED(message)` and `LANCE_NODISCARD` are defined in `include/lance/attributes.h`, which every public declaration header includes. On Windows, declarations are ordinary by default, so one header works with both the static archive and the DLL import library. The installed CMake shared target (`LanceC::lance_c_shared`, or `LanceC::lance_c` with `-DLanceC_LINK=shared`) defines `LANCE_C_SHARED`, which opts into `__declspec(dllimport)`; direct DLL consumers may define it themselves. Static consumers need no macro.
 - The shared-library file names stay unversioned (`liblance_c.so`, `liblance_c.dylib`, `lance_c.dll`) in the 0.2.x line. A versioned SONAME or install name changes a loader contract that published archives and downstream native modules currently pin, so it needs its own migration plan.
@@ -67,7 +67,7 @@ The two Linux archives target glibc 2.28 on x86_64 and AArch64. Source builds li
 
 ## Try the published package
 
-Follow the [quickstart](../README.md#quickstart) to verify the archive and open the sample dataset. For shared linkage, pass `-DLanceC_LINK=shared` to CMake. On macOS arm64, choose the Apple silicon archive and verify its per-archive checksum with `shasum -a 512 -c "$ARCHIVE.sha512"` after downloading both files.
+Follow the [quickstart](quickstart.md) to verify the archive and open the sample dataset. For shared linkage, pass `-DLanceC_LINK=shared` to CMake. On macOS arm64, choose the Apple silicon archive and verify its per-archive checksum with `shasum -a 512 -c "$ARCHIVE.sha512"` after downloading both files.
 
 ## Choosing static or shared linkage
 
@@ -103,7 +103,7 @@ On Windows, shared linkage also removes the `/MT` static-CRT requirement for con
 <a id="from-source-via-cargo-rust-developers"></a>
 ## Building from source via Cargo
 
-Source builds of the current tree require **Rust 1.98.0+**, **CMake 3.22+**, and **`protoc`**. Baseline build targets are defined in [`.github/baseline.env`](../.github/baseline.env):
+Source builds of the current tree require **Rust 1.98.0+**, **CMake 3.22+**, and **`protoc`**. Baseline build targets are defined in [`.github/baseline.env`](https://github.com/lance-format/lance-c/blob/main/.github/baseline.env):
 
 | Component | Target / minimum |
 | --- | --- |
@@ -119,7 +119,7 @@ To build the library directly with Cargo:
 cargo build --release
 ```
 
-This produces `target/release/liblance_c.{so,dylib}` (or `lance_c.dll`) and `target/release/liblance_c.a` (or `lance_c.lib`). Public headers are in [`include/lance/`](../include/lance/).
+This produces `target/release/liblance_c.{so,dylib}` (or `lance_c.dll`) and `target/release/liblance_c.a` (or `lance_c.lib`). Public headers are in [`include/lance/`](https://github.com/lance-format/lance-c/tree/main/include/lance).
 
 <a id="from-source-via-cmake-cc-developers-and-packagers"></a>
 ## Building from source via CMake
@@ -249,7 +249,7 @@ The install prefix contains `lib/lance_c.dll`, its import library `lib/lance_c.d
 <a id="releasing"></a>
 ## Releasing
 
-Pushing a `v*.*.*` tag runs [`release.yml`](../.github/workflows/release.yml), which builds five prebuilt `.tar.xz` archives (Linux `x86_64` and `aarch64` targeting `glibc 2.28`, macOS `arm64`, and Windows `x86_64` and `aarch64`), verifies exports/runtime dependencies/consumers, and attaches the archives and checksums to a GitHub Release. Beta tags (`v*-beta.*`) are published as GitHub pre-releases; stable tags publish a normal release. Generated notes are grouped by [`.github/release.yml`](../.github/release.yml).
+Pushing a `v*.*.*` tag runs [`release.yml`](https://github.com/lance-format/lance-c/blob/main/.github/workflows/release.yml), which builds five prebuilt `.tar.xz` archives (Linux `x86_64` and `aarch64` targeting `glibc 2.28`, macOS `arm64`, and Windows `x86_64` and `aarch64`), verifies exports/runtime dependencies/consumers, and attaches the archives and checksums to a GitHub Release. Beta tags (`v*-beta.*`) are published as GitHub pre-releases; stable tags publish a normal release. Generated notes are grouped by [`.github/release.yml`](https://github.com/lance-format/lance-c/blob/main/.github/release.yml).
 
 <a id="pre-tag-documentation-check"></a>
 ### Pre-tag documentation check
@@ -268,7 +268,7 @@ Run this on `main` before starting the release workflow or tagging manually:
 <a id="recommended-cut-a-release-via-actions-ui"></a>
 ### Recommended: cut a release via Actions UI
 
-[`create-release.yml`](../.github/workflows/create-release.yml) is a `workflow_dispatch` entry point that bumps `Cargo.toml`, commits, tags, pushes, and dispatches `release.yml`:
+[`create-release.yml`](https://github.com/lance-format/lance-c/blob/main/.github/workflows/create-release.yml) is a `workflow_dispatch` entry point that bumps `Cargo.toml`, commits, tags, pushes, and dispatches `release.yml`:
 
 1. Open Actions → **Create Release** → **Run workflow** on `main`.
 2. Choose:
@@ -290,7 +290,7 @@ To cut a release manually without `create-release.yml`:
    LANCE_C_VERSION=X.Y.Z
    TAG="v$LANCE_C_VERSION"
    ```
-2. On `main`, update `version = ...` in [`Cargo.toml`](../Cargo.toml), refresh `Cargo.lock`, and synchronize the public header macros:
+2. On `main`, update `version = ...` in [`Cargo.toml`](https://github.com/lance-format/lance-c/blob/main/Cargo.toml), refresh `Cargo.lock`, and synchronize the public header macros:
    ```bash
    LANCE_C_VERSION=X.Y.Z
    TAG="v$LANCE_C_VERSION"
@@ -311,7 +311,7 @@ To cut a release manually without `create-release.yml`:
    git push origin "$TAG"
    ```
 
-You can also run a dry-run build of [`release.yml`](../.github/workflows/release.yml) via Actions → **Release** → **Run workflow** with a placeholder test version such as `X.Y.Z-dev` (the `publish` job is skipped unless the ref is `refs/tags/v*`).
+You can also run a dry-run build of [`release.yml`](https://github.com/lance-format/lance-c/blob/main/.github/workflows/release.yml) via Actions → **Release** → **Run workflow** with a placeholder test version such as `X.Y.Z-dev` (the `publish` job is skipped unless the ref is `refs/tags/v*`).
 
 <a id="post-publication-check"></a>
 ### Post-publication check

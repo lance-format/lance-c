@@ -10,6 +10,8 @@ Prebuilt packages support Linux x86_64 and AArch64 (glibc 2.28+), macOS arm64, a
 
 On Linux x86_64, use a C++20 compiler and CMake 3.22+ to build this C++ consumer against the prebuilt library. The release archive supplies the compiled library; the C API itself requires C11. A shallow checkout of the same release tag supplies the standalone example and sample dataset; copy the example out before building. You can run this without a Rust toolchain.
 
+The [C and C++ quickstart](docs/quickstart.md) follows the same installed-package flow and adds the C++ write/index/query workflow, the C scan example, and links to the generated API reference. The commands below are the short archive verification path.
+
 ```bash
 mkdir lance-c-quickstart && cd lance-c-quickstart
 
@@ -69,10 +71,15 @@ Add `--static` and link `liblance_c.a` explicitly when using the static archive;
 
 ## Documentation
 
+- [C and C++ quickstart](docs/quickstart.md) for an installed-package C++ write/query example and a C scan example.
 - [C and C++ API guide](docs/api-guide.md) for scans, vector search, writes, transactions, dataset maintenance, [opt-in diagnostic logging](docs/api-guide.md#diagnostic-logging), [Tokio worker-thread configuration](docs/api-guide.md#tokio-runtime-worker-threads), and [process lifetime during embedding](docs/api-guide.md#process-lifetime-and-embedding).
 - [API reference](https://lance-format.github.io/lance-c/) for the hosted Doxygen HTML reference (see [Generated API reference](docs/api-reference.md) for local rendering and CI checks).
 - [Segment-scoped scalar scans](docs/scalar-segment-scans.md) and [publishing blob data](docs/blob-writer-dataset-publication.md) for specialized workflows.
 - [Building and packaging](docs/building-and-packaging.md) for platform toolchains, source builds, and releases.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local build, test, Doxygen and ABI expectations. Published changes are summarized in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
