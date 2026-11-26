@@ -503,8 +503,11 @@ A panic inside Lance or Arrow is caught at the FFI boundary and reported as `LAN
 ## Header inclusion
 
 `<lance/lance.h>` is the umbrella C header and keeps the complete 0.2 public
-ABI. C callers that use only the dataset read path can include the focused
-domain headers instead:
+ABI. The `v0.2.0` release archive ships only the umbrella `lance.h` and the C++
+`lance.hpp`; include `<lance/lance.h>` with that package. The split domain
+headers below are part of the current source and newer packages. With those,
+C callers that use only the dataset read path can include the focused domain
+headers instead:
 
 - `<lance/dataset.h>` — dataset open and close, snapshots, metadata and version history
 - `<lance/scanner.h>` — scanner configuration, planning and iteration

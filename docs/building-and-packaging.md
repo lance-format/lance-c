@@ -96,14 +96,21 @@ target_link_libraries(my_app PRIVATE LanceC::lance_c)
 
 For an embedded build (`add_subdirectory()` or `FetchContent_MakeAvailable()`), set `LANCE_C_LINK` to `shared` before adding the subdirectory; the same `LanceC::` targets are created.
 
-C applications and C++ applications that use only `<lance/lance.h>` link `LanceC::lance_c`. For `<lance/lance.hpp>`, link `LanceC::lance_cpp`; it adds the C++20 compile feature and links `LanceC::lance_c`, so the same linkage selection applies to the wrapper. The [CMake source build section](#from-source-via-cmake-cc-developers-and-packagers) lists the targets and the C++17/C++20 migration.
+C applications and C++ applications that use only `<lance/lance.h>` link `LanceC::lance_c`. The C++ wrapper `<lance/lance.hpp>` is header-only; C++ consumers use the same target and request C++20 explicitly:
+
+```cmake
+target_compile_features(my_app PRIVATE cxx_std_20)
+target_link_libraries(my_app PRIVATE LanceC::lance_c)
+```
+
+The `v0.2.0` package provides `LanceC::lance_c` and its `_static` and `_shared` variants. Newer packages also provide `LanceC::lance_cpp`, which adds the same compile feature. Both work with the explicit snippet above. The [CMake source build section](#from-source-via-cmake-cc-developers-and-packagers) lists the targets available from the current tree and the C++17/C++20 migration.
 
 On Windows, shared linkage also removes the `/MT` static-CRT requirement for consumers; see [Windows linking](#consuming-the-windows-package-and-mt-crt-rules). pkg-config already selects the shared library when both are installed; [Using pkg-config](#using-pkg-config) shows the explicit static invocation.
 
 <a id="from-source-via-cargo-rust-developers"></a>
 ## Building from source via Cargo
 
-Source builds of the current tree require **Rust 1.98.0+**, **CMake 3.22+**, and **`protoc`**. Baseline build targets are defined in [`.github/baseline.env`](https://github.com/lance-format/lance-c/blob/main/.github/baseline.env):
+Source builds of the current tree require **Rust 1.98.0+**, **CMake 3.22+**, and **`protoc`**. The Rust minimum is the `rust-version` value in [`Cargo.toml`](https://github.com/lance-format/lance-c/blob/main/Cargo.toml), and the release platform matrix is defined in [`release.yml`](https://github.com/lance-format/lance-c/blob/main/.github/workflows/release.yml). [`.github/baseline.env`](https://github.com/lance-format/lance-c/blob/main/.github/baseline.env) only sets the macOS deployment target used by the baseline build:
 
 | Component | Target / minimum |
 | --- | --- |
@@ -176,8 +183,8 @@ set `LANCE_C_LINK` for their default linkage.
 Migration: C++ consumers that previously relied on `LanceC::lance_c` to enable
 C++20 should switch to `LanceC::lance_cpp`, or explicitly request
 `target_compile_features(myapp PRIVATE cxx_std_20)` while linking their chosen
-C target. Older release packages without `LanceC::lance_cpp` still need that
-explicit C++ standard.
+C target. Older release packages without `LanceC::lance_cpp` can use that
+explicit C++ standard request instead.
 
 An unversioned `find_package(LanceC CONFIG REQUIRED)` accepts the package in the selected prefix. Pass a version number only to require a specific minor release line; `SameMinorVersion` compatibility rejects a `0.1` request against a `0.2` package.
 

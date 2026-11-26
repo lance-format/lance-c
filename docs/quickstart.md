@@ -24,14 +24,15 @@ tar -xJf "$ARCHIVE" -C install
 
 On macOS arm64, set `ARCHIVE=lance-c-$TAG-aarch64-apple-darwin.tar.xz`, download its `.sha512` file, and verify it with `shasum -a 512 -c "$ARCHIVE.sha512"`. See [published prebuilt archives](https://github.com/lance-format/lance-c/blob/main/docs/building-and-packaging.md#published-prebuilt-archives) for the other targets, pkg-config usage, and the Windows `/MT` rules.
 
-For a CMake project, point `CMAKE_PREFIX_PATH` at the unpacked prefix and link the C++ target:
+For a CMake project, point `CMAKE_PREFIX_PATH` at the unpacked prefix, request C++20 for the wrapper, and link the C target:
 
 ```cmake
 find_package(LanceC CONFIG REQUIRED)
-target_link_libraries(my_app PRIVATE LanceC::lance_cpp)
+target_compile_features(my_app PRIVATE cxx_std_20)
+target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
-`LanceC::lance_cpp` adds the C++20 requirement and links `LanceC::lance_c`. Applications that use only `<lance/lance.h>` link `LanceC::lance_c` and need C11 only. CMake selects the static library by default; pass `-DLanceC_LINK=shared` to link the shared library.
+`LanceC::lance_c` links the C library and selects static or shared linkage through `LanceC_LINK`. The `v0.2.0` release archive provides this target and its `_static` and `_shared` variants; newer packages also provide `LanceC::lance_cpp`, which adds the same C++20 requirement. Applications that use only `<lance/lance.h>` need C11 and do not request C++20. CMake selects the static library by default; pass `-DLanceC_LINK=shared` to link the shared library.
 
 ## Write, index, and query from C++
 
@@ -70,7 +71,7 @@ rows: 512, version: 2
 
 ## Read from C
 
-C callers include `<lance/lance.h>` or the focused domain headers, and link `LanceC::lance_c`. The tag's C example opens a dataset, exports a scanner as an `ArrowArrayStream`, reads every batch, and releases the batches, stream, scanner and dataset on every path:
+C callers include `<lance/lance.h>`, the umbrella header, and link `LanceC::lance_c`. The `v0.2.0` release archive ships this header; newer packages and the current source also split the read path into domain headers, described in the [API guide](https://github.com/lance-format/lance-c/blob/main/docs/api-guide.md#header-inclusion). The tag's C example opens a dataset, exports a scanner as an `ArrowArrayStream`, reads every batch, and releases the batches, stream, scanner and dataset on every path:
 
 ```bash
 cp -R source/examples/c-scan c-scan

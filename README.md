@@ -52,8 +52,18 @@ target_link_libraries(my_app PRIVATE LanceC::lance_c)
 ```
 
 C and C++ applications using `<lance/lance.h>` link `LanceC::lance_c`.
-For the C++20 wrapper `<lance/lance.hpp>`, link `LanceC::lance_cpp` instead;
-it selects the required C++ standard and links the C library.
+For the header-only C++20 wrapper `<lance/lance.hpp>`, use the same target and
+request the language level explicitly:
+
+```cmake
+target_compile_features(my_app PRIVATE cxx_std_20)
+target_link_libraries(my_app PRIVATE LanceC::lance_c)
+```
+
+The `v0.2.0` release archive provides `LanceC::lance_c` and its `_static` and
+`_shared` variants, and ships the umbrella `lance.h` and `lance.hpp`. Newer
+packages also provide `LanceC::lance_cpp`, which adds the same C++20
+requirement, and the split domain headers. The explicit snippet works with both.
 
 CMake selects the static library by default. Configure with `-DLanceC_LINK=shared` to link the shared library, which exports only the `lance_*` C ABI and hides its embedded native symbols from those exports. Prefer it when the host itself links a library that exports the same native symbol names, such as `ZSTD_*` or `LZ4_*`. See [choosing static or shared linkage](docs/building-and-packaging.md#choosing-static-or-shared-linkage). On Windows, static consumers must use the Release `/MT` runtime. See [Windows linking instructions](docs/building-and-packaging.md#consuming-the-windows-package-and-mt-crt-rules). The public C ABI is checked against the published export baseline; see [ABI compatibility](docs/building-and-packaging.md#abi-compatibility).
 
@@ -67,7 +77,7 @@ cc my_app.c $(pkg-config --cflags --libs lance-c) -o my_app
 Add `--static` and link `liblance_c.a` explicitly when using the static archive; see [pkg-config usage](docs/building-and-packaging.md#using-pkg-config).
 
 - **C++** — Include [lance/lance.hpp](include/lance/lance.hpp). Open a dataset with `lance::Dataset::open(uri)`, call `count_rows()` or create a scanner with `scan()`. Handles own their resources and failures throw `lance::Error`. The [CMake consumer](examples/cmake-consumer/main.cpp) is a complete program; the same directory also has a [write/index/query workflow](examples/cmake-consumer/workflow.cpp).
-- **C** — Include [lance/lance.h](include/lance/lance.h). The [C11 scan example](examples/c-scan/) opens a dataset, iterates all Arrow batches, prints errors, and releases the batches, stream, and Lance handles. Set `LANCE_C_PREFIX` to the unpacked archive when building it with Make.
+- **C** — Include [lance/lance.h](include/lance/lance.h), the umbrella header. The [C11 scan example](examples/c-scan/) opens a dataset, iterates all Arrow batches, prints errors, and releases the batches, stream, and Lance handles. Set `LANCE_C_PREFIX` to the unpacked archive when building it with Make.
 
 ## Documentation
 

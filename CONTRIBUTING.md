@@ -16,7 +16,7 @@ Read [AGENTS.md](https://github.com/lance-format/lance-c/blob/main/AGENTS.md) be
 - Linux x86_64 for the pinned Doxygen installer. Other hosts can install Doxygen 1.12.0 and pass `DOXYGEN_BIN` instead.
 - Optional: `abigail-tools` for the ABI type check, and sanitizer runtimes for the native consumer tests.
 
-The baseline toolchain and platform matrix is defined in [`.github/baseline.env`](https://github.com/lance-format/lance-c/blob/main/.github/baseline.env) and documented in [Building, Packaging, and Releasing](https://github.com/lance-format/lance-c/blob/main/docs/building-and-packaging.md).
+The Rust minimum is the `rust-version` value in [`Cargo.toml`](https://github.com/lance-format/lance-c/blob/main/Cargo.toml) (currently 1.98.0). The release platform matrix is defined in [`.github/workflows/release.yml`](https://github.com/lance-format/lance-c/blob/main/.github/workflows/release.yml); [`.github/baseline.env`](https://github.com/lance-format/lance-c/blob/main/.github/baseline.env) only sets the macOS deployment target. The full build contract is documented in [Building, Packaging, and Releasing](https://github.com/lance-format/lance-c/blob/main/docs/building-and-packaging.md).
 
 ## Build
 

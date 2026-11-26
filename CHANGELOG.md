@@ -12,13 +12,13 @@ Published previews: [beta.1](https://github.com/lance-format/lance-c/releases/ta
 
 ### 0.2.0
 
-The first stable release, published on 2026-11-20, after the [v0.2.0-beta.1 preview](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1). It established the 0.2.x C ABI and the `v0.2.0` export baseline, and published prebuilt archives for Linux x86_64 and AArch64 (glibc 2.28+), macOS arm64, and Windows x64 and ARM64 with the static `/MT` CRT. The release added the binding version macros, the C++20 wrapper surface, opt-in diagnostic logging, and the installed-package consumer checks.
+The first stable release, published on 2026-11-20, after the [v0.2.0-beta.1 preview](https://github.com/lance-format/lance-c/releases/tag/v0.2.0-beta.1). It established the 0.2.x C ABI and the `v0.2.0` export baseline, and published prebuilt archives for Linux x86_64 and AArch64 (glibc 2.28+), macOS arm64, and Windows x64 and ARM64 with the static `/MT` CRT. The release completed C++20 wrapper coverage for the remaining C exports and added the binding version macros, opt-in diagnostic logging, and the installed-package consumer checks.
 
 See the [v0.2.0 release notes](https://github.com/lance-format/lance-c/releases/tag/v0.2.0) and the [ABI compatibility](https://github.com/lance-format/lance-c/blob/main/docs/building-and-packaging.md#abi-compatibility) section for the contract that later releases preserve.
 
 ## 0.1.x
 
-The 0.1.x preview line (`v0.1.2` through `v0.1.9`) was the pre-stable development line. Its releases, archives and notes remain available on the [releases page](https://github.com/lance-format/lance-c/releases?q=v0.1), starting with [v0.1.2](https://github.com/lance-format/lance-c/releases/tag/v0.1.2) and ending with [v0.1.9](https://github.com/lance-format/lance-c/releases/tag/v0.1.9). The stable 0.2.0 release supersedes this line.
+The 0.1.x development line (`v0.1.2` through `v0.1.9`) preceded the stable 0.2.0 baseline. These were development releases, not 0.2.0 previews; `v0.1.9` is a normal, non-prerelease tag. The header-only C++ RAII wrapper was already present in the early tags, and 0.2.0 completed wrapper coverage for the remaining C exports. The releases, archives and notes remain available on the [releases page](https://github.com/lance-format/lance-c/releases?q=v0.1), starting with [v0.1.2](https://github.com/lance-format/lance-c/releases/tag/v0.1.2) and ending with [v0.1.9](https://github.com/lance-format/lance-c/releases/tag/v0.1.9).
 
 ## Reporting a change
 
