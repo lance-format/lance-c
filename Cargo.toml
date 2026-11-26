@@ -26,7 +26,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # transitively via lance-index.
 async-trait = "0.1"
 bytes = "1"
-# Keep every Lance crate on the upstream v15.1.0-beta.2 release commit.
+# Keep every Lance crate on the upstream v16.0.0-beta.2 release commit.
 lance = { git = "https://github.com/lancedb/lance.git", rev = "9eb4b09226b252f0d3d58448aa5f435147bcef13", features = ["substrait"] }
 # Direct to reuse the native Binary/LargeBinary/BinaryView/FixedSizeBinary iterator.
 lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "9eb4b09226b252f0d3d58448aa5f435147bcef13" }
