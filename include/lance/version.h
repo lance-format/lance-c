@@ -24,9 +24,9 @@ extern "C" {
 #define LANCE_C_VERSION_MINOR 2
 #define LANCE_C_VERSION_PATCH 1
 /* Pre-release suffix without the leading '-'; empty for a stable release. */
-#define LANCE_C_VERSION_PRE "beta.7"
+#define LANCE_C_VERSION_PRE "beta.8"
 /* Full Cargo package version, including any pre-release or build suffix. */
-#define LANCE_C_VERSION_STRING "0.2.1-beta.7"
+#define LANCE_C_VERSION_STRING "0.2.1-beta.8"
 #define LANCE_C_VERSION_ENCODE(major, minor, patch) \
     (((major) * 1000000) + ((minor) * 1000) + (patch))
 /* Numeric form for #if comparisons. The pre-release suffix is not encoded, so

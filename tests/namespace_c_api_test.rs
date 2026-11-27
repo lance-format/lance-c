@@ -363,6 +363,22 @@ fn directory_lifecycle_dataset_versions_metrics_and_dispatch() {
     );
     assert_eq!(count.json().as_deref(), Some("3"));
 
+    let mut page_token = None;
+    for (expected_version, expected_token) in [(1, Some("1")), (2, Some("2")), (3, None)] {
+        let request = serde_json::json!({
+            "id": ["workspace", "numbers"],
+            "limit": 1,
+            "page_token": page_token,
+        });
+        let page = assert_call_ok(namespace, "list_table_versions", &request.to_string());
+        let page: serde_json::Value = serde_json::from_str(&page.json().unwrap()).unwrap();
+        let versions = page["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["version"], expected_version);
+        assert_eq!(page["page_token"].as_str(), expected_token);
+        page_token = page["page_token"].as_str().map(str::to_owned);
+    }
+
     let table_id_c = c_string(table_id);
     let opened = unsafe {
         lance_dataset_open_namespace(namespace, table_id_c.as_ptr(), ptr::null(), 0, ptr::null())
