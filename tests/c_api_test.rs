@@ -10391,6 +10391,126 @@ fn test_scanner_set_use_scalar_index_controls_filter_planning() {
 }
 
 #[test]
+fn test_scanner_combines_nullable_bitmap_and_label_list_filters() {
+    use arrow_array::{ListArray, types::Int32Type};
+    use lance::dataset::WriteParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("combined_filters");
+    let rows = [
+        (Some(10), Some(vec![Some(7)])),
+        (Some(20), Some(vec![])),
+        (Some(30), Some(vec![Some(7)])),
+        (None, Some(vec![Some(7)])),
+        (Some(20), None),
+        (Some(10), Some(vec![Some(7), None])),
+        (Some(30), Some(vec![Some(9)])),
+        (None, Some(vec![])),
+        (Some(30), None),
+    ];
+    let scores = Int32Array::from_iter(rows.iter().map(|(score, _)| *score));
+    let tags =
+        ListArray::from_iter_primitive::<Int32Type, _, _>(rows.into_iter().map(|(_, tags)| tags));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("score", DataType::Int32, true),
+        Field::new("tags", tags.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..9)),
+            Arc::new(scores),
+            Arc::new(tags),
+        ],
+    )
+    .unwrap();
+    lance_c::runtime::block_on(async {
+        Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new([Ok(batch)], schema),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    });
+
+    let uri = c_str(uri.to_str().unwrap());
+    let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null(), "{}", take_last_error_message());
+    for (column, kind) in [
+        ("score", LanceScalarIndexType::Bitmap),
+        ("tags", LanceScalarIndexType::LabelList),
+    ] {
+        let column = c_str(column);
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_scalar_index(
+                    dataset,
+                    column.as_ptr(),
+                    ptr::null(),
+                    kind as i32,
+                    ptr::null(),
+                    false,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+    }
+
+    // The first two ranges select the same bitmap keys. The third selects a
+    // different range using the same index cache.
+    for (filter, expected) in [
+        (
+            "score BETWEEN 10 AND 20 AND array_has_any(tags, [CAST(7 AS INT)])",
+            vec![0, 5],
+        ),
+        (
+            "(score BETWEEN 9 AND 29) OR array_has_any(tags, [CAST(7 AS INT)])",
+            vec![0, 1, 2, 3, 4, 5],
+        ),
+        (
+            "score BETWEEN 20 AND 30 AND array_has_any(tags, [CAST(7 AS INT)])",
+            vec![2],
+        ),
+        (
+            "NOT ((score BETWEEN 9 AND 29) OR array_has_any(tags, [CAST(7 AS INT)]))",
+            vec![6],
+        ),
+    ] {
+        let sql = c_str(filter);
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), sql.as_ptr()) };
+        assert!(!scanner.is_null(), "{}", take_last_error_message());
+        let mut stats = CapturedScanStatistics::default();
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_statistics_callback(
+                    scanner,
+                    Some(capture_scan_statistics),
+                    (&mut stats as *mut CapturedScanStatistics).cast(),
+                )
+            },
+            0
+        );
+        let mut ids = scan_ordering_ids(scanner);
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "{filter}");
+        assert_eq!(stats.calls, 1);
+        assert!(
+            stats.index_comparisons > 0,
+            "{filter}: expected an indexed range search"
+        );
+        unsafe { lance_scanner_close(scanner) };
+    }
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
 fn test_scalar_index_segment_build_is_fragment_scoped_and_uncommitted() {
     let (_tmp, uri) = create_many_small_fragments(2);
     let uri_c = c_str(&uri);
